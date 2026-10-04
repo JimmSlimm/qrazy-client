@@ -4,8 +4,10 @@
 !package.json
 !package-lock.json
 !LICENSE
-!push.bat
 !src/
 !src/**
 src/native/bin/
 *.log
+src/distribute.cjs
+src/release.cjs
+src/package-windows.py
