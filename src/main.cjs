@@ -11,6 +11,8 @@ if (adminArgument) {
     await require('./admin-update.cjs').runAdminUpdate(adminArgument.slice('--qrazy-admin-update='.length), path.dirname(path.dirname(process.execPath)), app.getVersion());
     app.exit(0);
   }).catch(() => app.exit(1));
+} else if (require('./windows-launch.cjs').redirectThroughLauncher(app, process, packagedClient)) {
+  // Restarting through the native launcher before graphics initialization.
 } else {
 const { DEV_MODE, GAME_URL, isGameURL, permissionAllowed, isFullscreenShortcut } = require('./policy.cjs');
 const { RawMouse } = require('./raw-mouse.cjs');
@@ -115,7 +117,8 @@ app.whenReady().then(async () => {
     callback(permissionAllowed(permission, details.requestingUrl)));
   gameSession.on('will-download', event => event.preventDefault());
   const windowState = new WindowState(app.getPath('userData'), screen.getAllDisplays());
-  win = new BrowserWindow({ title: DEV_MODE ? 'Qrazy — Local development' : 'Qrazy', ...windowState.bounds,
+  const clientTitle = `Qrazy v${app.getVersion()}${DEV_MODE ? ' — Local development (localhost:5173)' : ''}`;
+  win = new BrowserWindow({ title: clientTitle, ...windowState.bounds,
     minWidth: 640, minHeight: 480, backgroundColor: '#111827', autoHideMenuBar: true,
     icon: path.join(__dirname, process.platform === 'linux' ? 'assets/qrazy.png' : 'assets/qrazy.ico'),
     webPreferences: {
@@ -130,8 +133,8 @@ app.whenReady().then(async () => {
   if (windowState.maximized) win.maximize();
   if (windowState.fullscreen) win.setFullScreen(true);
   windowState.track(win);
-  if (DEV_MODE) win.webContents.on('page-title-updated', event => {
-    event.preventDefault(); win.setTitle('Qrazy — Local development (localhost:5173)');
+  win.webContents.on('page-title-updated', event => {
+    event.preventDefault(); win.setTitle(clientTitle);
   });
   game = win;
   const updateRoot = process.platform === 'win32' ? path.dirname(path.dirname(process.execPath)) : path.dirname(process.execPath);
@@ -230,6 +233,13 @@ app.whenReady().then(async () => {
   ipcMain.handle('client:graphics-get', event => {
     if (!trustedGame(event)) throw new Error('Graphics status is available only to the official game');
     return graphics;
+  });
+  ipcMain.handle('client:graphics-copy', async (event, renderer) => {
+    if (!trustedGame(event) || !win.isFocused() || win.isMinimized()) throw new Error('Open Qrazy to copy diagnostics');
+    const report = await require('./graphics-diagnostics.cjs').graphicsReport(app, renderer);
+    if (!trustedGame(event) || !win.isFocused() || win.isMinimized()) throw new Error('Open Qrazy to copy diagnostics');
+    clipboard.writeText(report);
+    return true;
   });
   ipcMain.handle('client:game-status', (event, value) => {
     if (!trustedGame(event)) throw new Error('Game status is available only to the official game');

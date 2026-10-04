@@ -270,6 +270,18 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
       if (state.phase !== 'checking') updateAction(updateDialog, 'Check again', checkClientUpdates);
       updateAction(updateDialog, 'Close', () => { updatesOpen = false; renderUpdates(); });
     } else updateDialog.hidden = true;
+    if (!updateDialog.hidden) updateAction(updateDialog, 'Copy graphics diagnostic', async () => {
+      let renderer = 'WebGL2 unavailable';
+      const gl = document.createElement('canvas').getContext('webgl2', { powerPreference: 'high-performance', antialias: true });
+      if (gl) {
+        const debug = gl.getExtension('WEBGL_debug_renderer_info');
+        renderer = debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+        gl.getExtension('WEBGL_lose_context')?.loseContext();
+      }
+      await ipcRenderer.invoke('client:graphics-copy', renderer);
+      updateSummary.hidden = false;
+      updateSummary.textContent = 'Graphics diagnostic copied. Paste it into your support message. It includes executable paths, which may contain your Windows username.';
+    });
   }
   async function checkClientUpdates() {
     // Show feedback immediately and consume the IPC reply as well as events.

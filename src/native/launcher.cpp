@@ -54,11 +54,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   std::vector<wchar_t> buffer(32768);
   const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
   if (!length || length >= buffer.size()) return 1;
-  const std::wstring self(buffer.data(), length);
+  std::wstring self(buffer.data(), length);
+  const DWORD longLength = GetLongPathNameW(self.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
+  if (longLength && longLength < buffer.size()) self.assign(buffer.data(), longLength);
   const std::wstring folder = self.substr(0, self.find_last_of(L"\\/"));
   const std::wstring runtime = folder + L"\\runtime";
   const std::wstring executable = runtime + L"\\electron.exe";
+  PreferHighPerformanceGpu(self);
   PreferHighPerformanceGpu(executable);
+  // Additional NVIDIA Optimus launch hint used by Electron games. Set it
+  // before process creation so Electron and its GPU child inherit it.
+  SetEnvironmentVariableW(L"SHIM_MCCOMPAT", L"0x800000001");
+  // Scope this marker to the launched runtime. Direct/pinned runtime starts
+  // redirect through us so GPU setup happens before their process is created.
+  if (!SetEnvironmentVariableW(L"QRAZY_CLIENT_RUNTIME", executable.c_str())) return 1;
   std::wstring command = L"\"" + executable + L"\"";
   STARTUPINFOW startup{}; startup.cb = sizeof(startup);
   PROCESS_INFORMATION process{};

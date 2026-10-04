@@ -1,6 +1,6 @@
 {
   "name": "qrazy-client",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "private": true,
   "description": "Windows and Linux desktop client for Qrazy",
   "main": "src/main.cjs",
