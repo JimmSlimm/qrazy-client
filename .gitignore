@@ -1,0 +1,11 @@
+# Publish only the files needed to build, run and license the client.
+*
+!.gitignore
+!package.json
+!package-lock.json
+!LICENSE
+!push.bat
+!src/
+!src/**
+src/native/bin/
+*.log

@@ -1,0 +1,66 @@
+Qrazy Linux x64 portable client
+
+Extract the entire tar.gz with tar -xzf, keep the folder together, and run
+./Qrazy from Qrazy-linux-x64. The package includes Electron, client code,
+native input helper, Electron/Chromium licenses and client MIT license.
+Players do not need Node, npm, a compiler or a separate Electron installation.
+Do not run as root. Do not add --no-sandbox or change /dev/input permissions.
+
+Native backend scope: Xorg (X11), XInput2 >= 2.1, relative devices exposing
+Rel X and Rel Y valuators. Wayland and XWayland native input are unsupported.
+The Linux client uses Electron's X11 window backend. In Wayland sessions with
+XWayland installed, the game's browser pointer-lock fallback may be available.
+That fallback is NOT this native input backend. No native Wayland claim.
+An Xorg session is required for the native feature; no desktop environment
+or distribution has been real-device verified on the Windows development host.
+
+Capture requires trusted main-frame gameplay request, focus and Chromium
+pointer lock for confinement. XI2 raw_values supply untransformed deltas;
+browser pointer movement is ignored by the existing game's native adapter.
+Mouse buttons remain Chromium events. Escape, focus loss, minimize, navigation,
+fatal overlay and shutdown release capture. Device topology change or helper
+failure stops capture; retry re-probes the devices. Absolute tablets, emulated
+touch motion and unknown relative axis layouts are excluded.
+Chromium's pointer-lock user-activation and Escape re-lock cooldown rules apply
+to Linux confinement; capture() returns false on refusal and a click/retry may
+be needed. Windows keeps its existing native confinement behavior.
+
+XI2 values are driver-native units, not a claim of exact physical counts on
+every device. Desktop acceleration transforms are bypassed where the driver
+supplies untransformed values. Device DPI, driver preprocessing and in-game
+sensitivity still affect movement. Compare sensitivity/acceleration on hardware.
+Timestamps are helper receipt CLOCK_MONOTONIC milliseconds, not device times
+or X server timestamps. The existing seven-round-trip minimum-RTT midpoint
+calibration maps them to renderer performance.now(); delivery bounds the offset
+and preserves nondecreasing sample order. No latency/performance claim.
+
+System requirements: Linux x86-64 desktop with system libX11/libXi, Electron's
+GTK/NSS/ALSA/graphics dependencies and working drivers. SYSTEM-REQUIREMENTS.txt
+lists actual packaged ELF symbol requirements and library names. The minimum
+distro release has not been established by runtime testing. A tar.gz does not
+make glibc, libstdc++, graphics drivers or system libraries portable. Start with
+a current supported distro and check the recorded ELF requirements.
+Chromium sandbox must work under the distro's user-namespace/security policy.
+This archive does not install a root-owned setuid sandbox. Systems that forbid
+the required unprivileged sandbox mechanism may refuse to launch; do not work
+around that by disabling the sandbox.
+
+Source builders need Node >=22.12, npm, C++17 compiler, pkg-config, libX11/libXi
+development headers, binutils/readelf and tar. On Linux x64: npm ci, then
+npm run build:linux. Output: dist/Qrazy-linux-x64 and dist/Qrazy-linux-x64.tar.gz.
+No system software installation or publishing is performed by these scripts.
+
+Native Wayland limitation: relative-pointer and pointer-constraints protocols
+need Chromium's wl_pointer and wl_surface on its own Wayland connection.
+Another helper connection cannot refer to those objects. Electron's public
+getNativeWindowHandle Linux X11 Window does not expose that connection/surface.
+A Chromium/Electron integration and maintained runtime fork would be required
+to deliver native samples through this bridge. XWayland XI2 is not assumed to
+provide the same unaccelerated hardware stream; it is deliberately rejected.
+
+Protocol references:
+https://www.x.org/releases/current/doc/inputproto/XI2proto.txt
+https://wayland.freedesktop.org/docs/book/Protocol.html
+https://wayland.app/protocols/relative-pointer-unstable-v1
+https://wayland.app/protocols/pointer-constraints-unstable-v1
+https://www.electronjs.org/docs/latest/api/base-window
