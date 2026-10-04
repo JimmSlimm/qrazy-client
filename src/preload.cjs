@@ -78,7 +78,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
     else if (!data.groups.length) add(columns, 'div', 'No active players.', 'color:#cbd7e7');
     for (const group of data.groups) panel(group.label, group.rows.map(r => [r.name, r.pb || '—', r.sessionBest || '—', r.ping || '—']));
     const spectators = add(box, 'div', '', 'display:flex;gap:16px;align-items:baseline;border-top:1px solid #40516a;padding-top:12px;margin-top:16px');
-    add(spectators, 'div', 'SPECTATORS', 'font-size:14px;font-weight:800;color:#9eafc5');
+    add(spectators, 'div', 'SPECTATORS:', 'font-size:14px;font-weight:800;color:#9eafc5');
     add(spectators, 'div', data.spectators.map(r => r.name).join(' · ') || 'None', 'font-size:16px;overflow-wrap:anywhere');
     const playerCount = data.mode === 'Solo' ? data.groups.reduce((count, group) => count + group.rows.length, 0) + data.spectators.length : data.multiplayer.total;
     add(box, 'div', `${playerCount} ${playerCount === 1 ? 'player' : 'players'} · Release Tab to return${data.legacy ? ' · Category, PB, session-best and WR data need the updated game adapter' : data.mode === 'Solo' ? ' · Session best: local untainted finish, not server-verified' : ' · Session best: hub-reported, not replay-verified'}`, 'font-size:13px;color:#9eafc5;margin-top:12px');
