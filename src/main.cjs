@@ -1,12 +1,13 @@
 const { app, BrowserWindow, WebContentsView, Menu, session, ipcMain, dialog, clipboard, screen, net, shell } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
+const packagedClient = require('./packaged-client.cjs').isPackagedClient(app, process);
 const adminArgument = process.argv.find(argument => argument.startsWith('--qrazy-admin-update='));
 if (adminArgument) {
   // No game window, profile stores or instance lock in the elevated worker.
   app.disableHardwareAcceleration();
   app.whenReady().then(async () => {
-    if (process.platform !== 'win32' || !app.isPackaged) throw new Error('Packaged Windows updater only');
+    if (process.platform !== 'win32' || !packagedClient) throw new Error('Packaged Windows updater only');
     await require('./admin-update.cjs').runAdminUpdate(adminArgument.slice('--qrazy-admin-update='.length), path.dirname(path.dirname(process.execPath)), app.getVersion());
     app.exit(0);
   }).catch(() => app.exit(1));
@@ -25,7 +26,7 @@ const { WebsiteUpdates } = require('./website-updates.cjs');
 const { startInstaller } = require('./update-install.cjs');
 const updateConfig = require('./update-config.cjs');
 // A second packaged instance must not keep files/profile open during replacement.
-const ownsClientInstance = !app.isPackaged || app.requestSingleInstanceLock();
+const ownsClientInstance = !packagedClient || app.requestSingleInstanceLock();
 if (!ownsClientInstance) app.quit();
 // This backend attaches to the public X11 Window handle. Wayland sessions use
 // XWayland browser fallback; they are never advertised as native XI2 capture.
@@ -142,8 +143,8 @@ app.whenReady().then(async () => {
     allUsers: require('./installation.cjs').allUsersInstallation(updateRoot),
     platform: process.platform + '-' + process.arch, config: updateConfig,
     fetch: (url, options) => net.fetch(url, options), notify: state => sendUpdate('client:update-state', state) });
-  if (app.isPackaged && !DEV_MODE) await updater.restorePending();
-  if (!app.isPackaged || DEV_MODE) updater.setState({ phase: 'unconfigured', message: 'Client updates are available in the packaged live client.' });
+  if (packagedClient && !DEV_MODE) await updater.restorePending();
+  if (!packagedClient || DEV_MODE) updater.setState({ phase: 'unconfigured', message: 'Client updates are available in the packaged live client.' });
   websiteUpdates = new WebsiteUpdates({ url: GAME_URL, fetch: (url, options) => net.fetch(url, options),
     notify: state => sendUpdate('client:website-update-state', state) });
   const requireUpdateSender = (event, focused = false) => {
@@ -152,7 +153,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('client:update-get', event => { requireUpdateSender(event); return { ...updater.getState(), gameRefreshNeeded: websiteUpdates.getState().outdated }; });
   ipcMain.handle('client:update-check', event => {
     requireUpdateSender(event);
-    if (!app.isPackaged || DEV_MODE) return updater.getState();
+    if (!packagedClient || DEV_MODE) return updater.getState();
     return updater.check();
   });
   ipcMain.handle('client:update-download', event => { requireUpdateSender(event, true); return updater.download(); });
@@ -162,7 +163,7 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('client:update-install', async event => {
     requireUpdateSender(event, true);
-    if (!app.isPackaged || DEV_MODE) throw new Error('Only a packaged live client can update itself');
+    if (!packagedClient || DEV_MODE) throw new Error('Only a packaged live client can update itself');
     if (installingUpdate) throw new Error('The update is already starting');
     installingUpdate = true;
     // Ensure open asset writes and window settings finish during normal shutdown.
@@ -177,7 +178,7 @@ app.whenReady().then(async () => {
     rawMouse?.release();
     await loadGame(); return true;
   });
-  updateTimer = setTimeout(() => { if (app.isPackaged && !DEV_MODE) updater.check(); }, 10000);
+  updateTimer = setTimeout(() => { if (packagedClient && !DEV_MODE) updater.check(); }, 10000);
   websiteTimer = setInterval(() => websiteUpdates.check(), 5 * 60 * 1000);
   win.on('focus', () => websiteUpdates.check());
   // Installation failures remain visible after the helper restarts the old client.
