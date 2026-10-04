@@ -19,7 +19,7 @@ function compile(sourceName, executableName, windows = false, addon = false) {
   const batch = path.join(output, 'compile.cmd');
   const resourceOutput = path.join(output, 'launcher.res');
   const resourceCommand = windows ? `pushd "${__dirname}"\r\nrc /nologo /fo "${resourceOutput}" "${resource}"\r\nif errorlevel 1 exit /b 1\r\npopd\r\n` : '';
-  fs.writeFileSync(batch, `@echo off\r\ncall "${setup}" >nul\r\nif errorlevel 1 exit /b 1\r\n${resourceCommand}cl /nologo /std:c++17 /EHsc /O2 /MT /W4 ${addon ? '/LD' : ''} "${source}" ${windows ? `"${resourceOutput}"` : ''} /Fo"${path.join(output, sourceName + '.obj')}" /Fe"${exe}" /link user32.lib ${windows ? '/SUBSYSTEM:WINDOWS' : ''}\r\n`);
+  fs.writeFileSync(batch, `@echo off\r\ncall "${setup}" >nul\r\nif errorlevel 1 exit /b 1\r\n${resourceCommand}cl /nologo /std:c++17 /EHsc /O2 /MT /W4 ${addon ? '/LD' : ''} "${source}" ${windows ? `"${resourceOutput}"` : ''} /Fo"${path.join(output, sourceName + '.obj')}" /Fe"${exe}" /link user32.lib ${windows ? 'advapi32.lib /SUBSYSTEM:WINDOWS' : ''}\r\n`);
   execFileSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', 'compile.cmd'], { cwd: output, stdio: 'inherit', windowsHide: true });
   return exe;
 }
