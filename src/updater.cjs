@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 const { promisify } = require('node:util');
 const gunzip = promisify(zlib.gunzip);
+const { DATA_START, rangeRequest, readBundleManifest } = require('./update-bundle.cjs');
 const MAX_BYTES = 1024 * 1024 * 1024;
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 async function hashFile(file) {
@@ -42,7 +43,8 @@ function verifyManifest(envelope, config, platform) {
   if (!crypto.verify(null, bytes, config.publicKey, Buffer.from(envelope.signature, 'base64'))) throw new Error('Update signature is invalid');
   const manifest = JSON.parse(bytes.toString('utf8'));
   versionParts(manifest.version);
-  if (manifest.schema !== 1 || typeof manifest.notes !== 'string' || manifest.notes.length > 8000) throw new Error('Unsupported update manifest');
+  if (![1, 2].includes(manifest.schema) || typeof manifest.notes !== 'string' || manifest.notes.length > 8000) throw new Error('Unsupported update manifest');
+  if (manifest.schema === 2 && (!manifest.bundle || manifest.bundle.dataStart !== DATA_START || !Number.isSafeInteger(manifest.bundle.dataSize) || manifest.bundle.dataSize < 1 || manifest.bundle.dataSize > 2 * MAX_BYTES || typeof manifest.bundle.url !== 'string')) throw new Error('Invalid update package inventory');
   const files = manifest.platforms?.[platform];
   if (!Array.isArray(files) || !files.length || files.length > 4096) throw new Error('No update for this platform');
   let total = 0; const names = new Set();
@@ -53,6 +55,7 @@ function verifyManifest(envelope, config, platform) {
     for (const field of ['sha256', 'downloadSha256']) if (!/^[a-f0-9]{64}$/.test(file[field])) throw new Error('Invalid update hash');
     const url = new URL(file.url);
     if (!file.url.startsWith(config.assetPrefix) || url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !/^[a-zA-Z0-9._/-]+$/.test(url.pathname)) throw new Error('Untrusted update URL');
+    if (manifest.schema === 2 && (file.url !== manifest.bundle.url || !Number.isSafeInteger(file.offset) || file.offset < 0 || file.offset + file.downloadSize > manifest.bundle.dataSize)) throw new Error('Invalid update package range');
     if (![0o644, 0o755].includes(file.mode)) throw new Error('Invalid update permissions');
     total += file.size;
   }
@@ -61,7 +64,7 @@ function verifyManifest(envelope, config, platform) {
   if (required.some(name => !names.has(name))) throw new Error('Incomplete update runtime');
   if (platform === 'linux-x64' && files.some(file => ['Qrazy', 'chrome-sandbox', 'chrome_crashpad_handler', 'resources/qrazy-input-x11'].includes(file.path) && file.mode !== 0o755)) throw new Error('Linux executables must be executable');
   for (const name of names) if ([...names].some(other => other.startsWith(name + '/'))) throw new Error('Conflicting update paths');
-  return { version: manifest.version, notes: manifest.notes, files };
+  return { version: manifest.version, notes: manifest.notes, files, ...(manifest.schema === 2 ? { bundle: manifest.bundle } : {}) };
 }
 async function noLinks(root, relative = '') {
   let current = path.resolve(root);
@@ -88,8 +91,8 @@ async function readBounded(response, limit, progress = () => {}) {
   return Buffer.concat(chunks);
 }
 class Updater {
-  constructor({ root, directory, version, platform, config, fetch, allUsers = false, notify = () => {} }) {
-    Object.assign(this, { root, directory, version, platform, config, fetch, allUsers, notify });
+  constructor({ root, directory, version, platform, config, fetch, requestRange = rangeRequest, allUsers = false, notify = () => {} }) {
+    Object.assign(this, { root, directory, version, platform, config, fetch, requestRange, allUsers, notify });
     this.state = { phase: config.publicKey ? 'idle' : 'unconfigured', installedVersion: version, message: config.publicKey ? '' : 'Updates are being prepared for the first release.' };
     this.busy = false;
   }
@@ -134,9 +137,10 @@ class Updater {
     if (!this.config.publicKey) return this.getState();
     this.busy = true; this.setState({ phase: 'checking', message: 'Checking for client updates…' });
     try {
-      const bytes = await this.request(this.config.manifestURL, 4 * 1024 * 1024, undefined, 15000);
-      const envelope = JSON.parse(bytes);
+      const bundle = this.config.bundleURL ? await readBundleManifest(this.config.bundleURL, this.requestRange) : null;
+      const envelope = bundle ? bundle.envelope : JSON.parse(await this.request(this.config.manifestURL, 4 * 1024 * 1024, undefined, 15000));
       const release = verifyManifest(envelope, this.config, this.platform);
+      if (bundle && (!release.bundle || bundle.total !== release.bundle.dataStart + release.bundle.dataSize)) throw new Error('Update package size differs from signed inventory');
       if (!newer(release.version, this.version)) return this.setState({ phase: 'current', message: 'Your client is up to date.' });
       this.release = release;
       this.envelope = envelope;
@@ -176,11 +180,18 @@ class Updater {
           await fs.copyFile(source, target, require('node:fs').constants.COPYFILE_EXCL);
           if ((await fs.stat(target)).size !== file.size || await hashFile(target) !== file.sha256) throw new Error('Existing file changed; check for updates again');
         } else {
-          const compressed = await this.request(file.url, file.downloadSize, size => {
+          const progress = size => {
             if (Date.now() - lastProgress < 150) return;
             lastProgress = Date.now();
             this.setState({ ...previous, phase: 'downloading', downloadedBytes: downloaded + size, message: 'Downloading client update…' });
-          });
+          };
+          let compressed;
+          if (this.release.bundle) {
+            const start = this.release.bundle.dataStart + file.offset;
+            const result = await this.requestRange(file.url, start, start + file.downloadSize - 1, progress);
+            if (result.total !== this.release.bundle.dataStart + this.release.bundle.dataSize) throw new Error('Update package changed during download');
+            compressed = result.bytes;
+          } else compressed = await this.request(file.url, file.downloadSize, progress);
           if (compressed.length !== file.downloadSize || await hashBytes(compressed) !== file.downloadSha256) throw new Error('Downloaded file failed verification');
           const bytes = await gunzip(compressed, { maxOutputLength: file.size });
           if (bytes.length !== file.size || await hashBytes(bytes) !== file.sha256) throw new Error('Update file failed verification');
