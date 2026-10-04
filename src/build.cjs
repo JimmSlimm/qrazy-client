@@ -28,6 +28,14 @@ async function build() {
     ignore: [/^\/(?!src(?:\/|$)|package\.json$|package-lock\.json$|LICENSE$)/, /^\/src\/native\/bin(?:\/|$)/]
   });
   for (const output of outputs) {
+    if (platform === 'win32') {
+      // Packager embeds the client version and ASAR hash in this executable.
+      // Keep the stock runtime stable across client-only releases instead.
+      const electronPackage = require.resolve('electron/package.json');
+      const electronVersion = require(electronPackage).version;
+      if (electronVersion !== require('../package.json').devDependencies.electron) throw new Error('Installed Electron does not match the pinned runtime version');
+      await fs.copyFile(path.join(path.dirname(electronPackage), 'dist/electron.exe'), path.join(output, 'Qrazy.exe'));
+    }
     await flipFuses(path.join(output, platform === 'win32' ? 'Qrazy.exe' : 'Qrazy'), {
       version: FuseVersion.V1,
       [F.RunAsNode]: false,

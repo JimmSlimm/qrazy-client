@@ -1,6 +1,6 @@
 // Runs only inside the installed application after explicit UAC approval.
 // Never execute a script or trust file hashes supplied by a user's update plan.
-const fs = require('node:fs/promises');
+const fs = require('./update-files.cjs').promises;
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { verifyManifest, newer, noLinks, hashFile } = require('./updater.cjs');
@@ -42,7 +42,7 @@ async function prepareAdminUpdate(planPath, root, version, options = {}) {
   const protectedPlan = path.join(job, 'plan.json');
   const helper = path.join(job, 'helper.ps1');
   await fs.writeFile(protectedPlan, JSON.stringify(plan), { flag: 'wx' });
-  await fs.writeFile(helper, await fs.readFile(path.join(__dirname, 'update-helper.ps1')), { flag: 'wx' });
+  await fs.writeFile(helper, await require('node:fs/promises').readFile(path.join(__dirname, 'update-helper.ps1')), { flag: 'wx' });
   return { plan, protectedPlan, helper };
 }
 async function runAdminUpdate(planPath, root, version) {

@@ -1,4 +1,5 @@
 const https = require('node:https');
+const crypto = require('node:crypto');
 const HEADER_SIZE = 16;
 const DATA_START = 4 * 1024 * 1024;
 const MAGIC = Buffer.from('QRAZYUP2');
@@ -21,7 +22,8 @@ function rangeRequest(url, start, end, progress = () => {}, timeout = 120000) {
       // GitHub redirects first. Send Range only to its asset server; suffix
       // ranges and ranges on the redirect endpoint are not consistently supported.
       const ranged = target.hostname !== 'github.com';
-      active = https.get(target, { headers: { 'User-Agent': 'Qrazy', ...(ranged ? { Range: `bytes=${start}-${end}` } : {}) } }, response => {
+      if (!ranged && target.pathname.includes('/releases/latest/download/')) target.searchParams.set('_qrazy_check', crypto.randomUUID());
+      active = https.get(target, { headers: { 'User-Agent': 'Qrazy', 'Cache-Control': 'no-cache', ...(ranged ? { Range: `bytes=${start}-${end}` } : {}) } }, response => {
         if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
           response.destroy();
           try { visit(new URL(response.headers.location, target).href, count + 1); } catch (error) { fail(error); }

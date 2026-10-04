@@ -1,4 +1,5 @@
-const fs = require('node:fs/promises');
+const physicalFiles = require('./update-files.cjs');
+const fs = physicalFiles.promises;
 const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
@@ -9,7 +10,7 @@ const MAX_BYTES = 1024 * 1024 * 1024;
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 async function hashFile(file) {
   const digest = crypto.createHash('sha256');
-  for await (const chunk of require('node:fs').createReadStream(file)) digest.update(chunk);
+  for await (const chunk of physicalFiles.createReadStream(file)) digest.update(chunk);
   return digest.digest('hex');
 }
 async function hashBytes(bytes) {
@@ -214,14 +215,17 @@ class Updater {
   }
   async prepareInstall(pid, parentPid) {
     if (this.busy || this.state.phase !== 'ready' || !this.stage) throw new Error('Download and verify an update first');
-    await noLinks(this.root); await noLinks(this.stage);
-    for (const file of this.release.files) {
-      const target = await noLinks(this.stage, file.path);
-      if (await hashFile(target) !== file.sha256) {
-        await fs.unlink(path.join(this.directory, 'pending.json')).catch(() => {});
-        this.setState({ phase: 'error', message: 'The staged update changed. Check for updates and download it again.' });
-        throw new Error('Staged update changed; download it again');
+    try {
+      await noLinks(this.root); await noLinks(this.stage);
+      for (const file of this.release.files) {
+        const target = await noLinks(this.stage, file.path);
+        if ((await fs.stat(target)).size !== file.size || await hashFile(target) !== file.sha256) throw new Error('Staged update changed');
       }
+    } catch (error) {
+      await fs.unlink(path.join(this.directory, 'pending.json')).catch(() => {});
+      const message = 'The staged update changed or could not be read. Check for updates and download it again.';
+      this.setState({ phase: 'error', message });
+      throw new Error(message, { cause: error });
     }
     await fs.mkdir(this.directory, { recursive: true });
     const token = crypto.randomBytes(12).toString('hex');
