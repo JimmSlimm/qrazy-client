@@ -5,7 +5,7 @@
 
 // Windows graphics preferences belong to the rendering executable, not its
 // launcher. Register this copy before Electron creates any graphics devices.
-// Preserve explicit GPU choices, but upgrade Windows' automatic/default entry.
+// Request high performance even when Windows saved a power-saving preference.
 // Other graphics settings in the same value must remain intact.
 static void PreferHighPerformanceGpu(const std::wstring& executable) {
   HKEY key = nullptr;
@@ -28,8 +28,8 @@ static void PreferHighPerformanceGpu(const std::wstring& executable) {
         const size_t end = preference.find(L';', start);
         const std::wstring field = preference.substr(start, end == std::wstring::npos ? end : end - start);
         if (field.compare(0, 14, L"GpuPreference=") == 0) {
-          if (field == L"GpuPreference=0") preference.replace(start, field.size(), L"GpuPreference=2");
-          // Preserve explicit choices and unknown future preference values.
+          if (field == L"GpuPreference=0" || field == L"GpuPreference=1") preference.replace(start, field.size(), L"GpuPreference=2");
+          // Preserve high performance and unknown future preference values.
           else writable = false;
           break;
         }
