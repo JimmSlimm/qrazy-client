@@ -18,14 +18,16 @@ function Assert-NoLink([string]$Target) {
   }
 }
 function Report([string]$Phase, [string]$Message) {
-  @{ phase=$Phase; message=$Message; backup=$backup; root=$root } | ConvertTo-Json | Set-Content -LiteralPath $plan.result -Encoding UTF8
+  @{ phase=$Phase; message=$Message; backup=$backup; root=$root; version=$plan.version } | ConvertTo-Json | Set-Content -LiteralPath $plan.result -Encoding UTF8
 }
 $moved = $false
 $installed = $false
+$ready = $false
 try {
   Assert-NoLink $root
   Assert-NoLink $stage
   if (Test-Path -LiteralPath $backup) { throw 'Recovery folder already exists' }
+  if ($plan.helperReady) { [Console]::Out.WriteLine('READY'); [Console]::Out.Flush(); $ready = $true }
   # Wait only for this client. Never terminate it or unrelated parent processes.
   $client = Get-Process -Id $plan.pid -ErrorAction SilentlyContinue
   if ($client) { Wait-Process -Id $plan.pid -Timeout 120 -ErrorAction Stop }
@@ -63,6 +65,7 @@ try {
       Move-Item -LiteralPath $backup -Destination $root; $moved = $false
     }
     Report 'error' ('Update could not complete: ' + $failure + '. Your profile was not changed.')
-    if (!$plan.noRestart -and !$installed -and (Test-Path -LiteralPath (Join-Path $root 'Qrazy.exe'))) { Start-Process -FilePath (Join-Path $root 'Qrazy.exe') -WorkingDirectory $root -WindowStyle Normal }
+    if ($plan.helperReady -and !$ready) { [Console]::Out.WriteLine('ERROR: ' + $failure); [Console]::Out.Flush() }
+    if ((!$plan.helperReady -or $ready) -and !$plan.noRestart -and !$installed -and (Test-Path -LiteralPath (Join-Path $root 'Qrazy.exe'))) { Start-Process -FilePath (Join-Path $root 'Qrazy.exe') -WorkingDirectory $root -WindowStyle Normal }
   } catch { Report 'error' ('Recovery needs manual attention. Previous client: ' + $backup + '. ' + $failure) }
 }

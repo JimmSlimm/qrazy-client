@@ -186,7 +186,7 @@ app.whenReady().then(async () => {
     const resultPath = path.join(updateDirectory, 'result.json');
     const result = JSON.parse(fs.readFileSync(resultPath, 'utf8').replace(/^\uFEFF/, ''));
     if (result.root && path.resolve(result.root) === path.resolve(updateRoot)) {
-      updater.setState({ ...updater.getState(), phase: result.phase === 'error' ? (updater.getState().phase === 'ready' ? 'ready' : 'error') : 'current', message: String(result.message).slice(0, 1000) });
+      updater.setState({ ...updater.getState(), phase: result.phase === 'error' ? (updater.getState().phase === 'ready' ? 'ready' : 'error') : 'current', message: String(result.message).slice(0, 1000), installError: result.phase === 'error' ? String(result.message).slice(0, 1000) : '' });
       fs.unlinkSync(resultPath);
     }
   } catch { /* First launch has no helper result. */ }

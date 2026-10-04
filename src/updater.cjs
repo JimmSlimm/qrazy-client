@@ -230,7 +230,7 @@ class Updater {
     await fs.mkdir(this.directory, { recursive: true });
     const token = crypto.randomBytes(12).toString('hex');
     const backup = path.join(path.dirname(this.root), '.qrazy-previous-' + token);
-    const plan = { root: this.root, stage: this.stage, backup, version: this.release.version, pid, parentPid, files: this.release.files.map(({ path, sha256 }) => ({ path, sha256 })), result: path.join(this.directory, 'result.json'), ...(this.allUsers ? { envelope: this.envelope, jobToken: token } : {}) };
+    const plan = { root: this.root, stage: this.stage, backup, version: this.release.version, pid, parentPid, files: this.release.files.map(({ path, sha256 }) => ({ path, sha256 })), result: path.join(this.directory, 'result.json'), ...(process.platform === 'win32' ? { helperReady: true } : {}), ...(this.allUsers ? { envelope: this.envelope, jobToken: token } : {}) };
     const planPath = path.join(this.directory, 'plan-' + token + '.json');
     await fs.writeFile(planPath, JSON.stringify(plan), { mode: 0o600, flag: 'wx' });
     return { plan, planPath };

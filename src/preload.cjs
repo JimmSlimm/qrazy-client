@@ -253,6 +253,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
         updateSummary.textContent = state.phase === 'downloading' ? `Downloading ${Math.round((state.downloadedBytes || 0) / Math.max(1, bytes) * 100)}% · ${size}` : state.message;
       }
       if (state.phase === 'ready') {
+        if (state.installError) { updateSummary.hidden = false; updateSummary.textContent = state.installError; }
         updateNode('p', 'The download has been verified. Close and update restarts Qrazy and ends your current run.', updateDialog);
         if (state.requiresAdmin) updateNode('p', 'This client is installed for everyone. Windows will ask for administrator approval before Qrazy closes.', updateDialog);
         updateAction(updateDialog, 'Close and update', async () => { const result = await updates.install(); if (result?.message) { updateSummary.hidden = false; updateSummary.textContent = result.message; } });

@@ -2,7 +2,6 @@
 // Never execute a script or trust file hashes supplied by a user's update plan.
 const fs = require('./update-files.cjs').promises;
 const path = require('node:path');
-const { spawn } = require('node:child_process');
 const { verifyManifest, newer, noLinks, hashFile } = require('./updater.cjs');
 const config = require('./update-config.cjs');
 const { allUsersInstallation } = require('./installation.cjs');
@@ -38,7 +37,7 @@ async function prepareAdminUpdate(planPath, root, version, options = {}) {
   }
   const plan = { root: path.resolve(root), stage, backup: path.join(parent, '.qrazy-previous-' + request.jobToken),
     version: release.version, pid: request.pid, parentPid: request.parentPid, workerPid: process.pid,
-    files: release.files.map(({ path, sha256 }) => ({ path, sha256 })), result: path.join(job, 'result.json'), allUsers: true, noRestart: true };
+    files: release.files.map(({ path, sha256 }) => ({ path, sha256 })), result: path.join(job, 'result.json'), allUsers: true, noRestart: true, helperReady: true };
   const protectedPlan = path.join(job, 'plan.json');
   const helper = path.join(job, 'helper.ps1');
   await fs.writeFile(protectedPlan, JSON.stringify(plan), { flag: 'wx' });
@@ -48,8 +47,7 @@ async function prepareAdminUpdate(planPath, root, version, options = {}) {
 async function runAdminUpdate(planPath, root, version) {
   const prepared = await prepareAdminUpdate(planPath, root, version);
   const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe');
-  const child = spawn(executable, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', prepared.helper, '-PlanPath', prepared.protectedPlan], { detached: true, stdio: 'ignore', windowsHide: true, cwd: path.dirname(prepared.helper), env: { ...process.env, PSModulePath: path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/Modules') } });
-  await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+  const child = await require('./update-install.cjs').startWindowsHelper(executable, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', prepared.helper, '-PlanPath', prepared.protectedPlan], path.dirname(prepared.helper));
   child.unref();
 }
 module.exports = { prepareAdminUpdate, runAdminUpdate };
