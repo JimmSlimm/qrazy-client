@@ -179,6 +179,10 @@ app.whenReady().then(async () => {
     if (!trustedGame(event) || (focused && (!win.isFocused() || win.isMinimized()))) throw new Error('Updates require the official game in the current client window');
   };
   const changelog = new (require('./changelog.cjs').Changelog)(app.getPath('userData'), app.getVersion());
+  ipcMain.handle('client:quit', event => {
+    requireUpdateSender(event, true);
+    app.quit();
+  });
   ipcMain.handle('client:changelog-get', event => { requireUpdateSender(event); return changelog.getState(); });
   ipcMain.handle('client:changelog-read', event => { requireUpdateSender(event, true); return changelog.markRead(); });
   ipcMain.handle('client:update-get', event => { requireUpdateSender(event); return { ...updater.getState(), gameRefreshNeeded: websiteUpdates.getState().outdated }; });

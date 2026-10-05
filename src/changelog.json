@@ -1,6 +1,18 @@
 {
   "releases": [
     {
+      "version": "0.3.11",
+      "date": "2026-10-05",
+      "added": [
+        "A QUIT button in the game menu closes the client."
+      ],
+      "changed": [
+        "The Tab overlay highlights the world-record category for you or the player you are watching, with a YOU or WATCHING badge.",
+        "The Tab overlay displays smaller colored clan tags beside player names, with an underline for official clans."
+      ],
+      "fixed": []
+    },
+    {
       "version": "0.3.10",
       "date": "2026-10-05",
       "added": [

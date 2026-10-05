@@ -40,8 +40,8 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
     const add = (parent, tag, text, style = '') => {
       const node = document.createElement(tag); node.textContent = text; node.style.cssText = style; parent.append(node); return node;
     };
-    const coloredName = (parent, row) => {
-      const parts = (row.coloredName || row.name).split(/\^([0-9])/);
+    const coloredText = (parent, text) => {
+      const parts = text.split(/\^([0-9])/);
       const colors = ['#000','#f00','#0f0','#ff0','#00f','#0ff','#f0f','#fff','#000'];
       let color = '';
       if (parts[0]) add(parent, 'span', parts[0]);
@@ -49,6 +49,17 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
         if (parts[i] !== '9') color = colors[Number(parts[i])];
         if (parts[i + 1]) add(parent, 'span', parts[i + 1], `color:${color || 'inherit'}`);
       }
+    };
+    const coloredName = (parent, row) => {
+      if (!row.clanTag) { coloredText(parent, row.coloredName || row.name); return; }
+      // One inline run lets layout measure and truncate tag + space + name together.
+      const run = add(parent, 'span', '', 'display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap');
+      const tag = add(run, 'span', '', `opacity:0.85;${row.clanOfficial ? 'text-decoration-line:underline;text-decoration-color:#eef3f4;text-decoration-thickness:1px;text-underline-offset:2px;' : ''}`);
+      const small = add(tag, 'span', '', 'font-size:0.78em;vertical-align:baseline');
+      coloredText(small, row.clanTag);
+      add(tag, 'span', ' ');
+      // Separate color parsing resets the name to its inherited default color.
+      coloredText(run, row.coloredBaseName || row.name);
     };
     const comparison = (parent, text) => {
       if (!text) return;
@@ -59,7 +70,13 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
     const records = add(box, 'div', '', 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px');
     for (const physics of ['pql','vql']) for (const category of ['w','s']) {
       const record = data.records.find(r => r.physics === physics && r.category === category);
-      const card = add(records, 'div', '', 'background:#152238;border-radius:6px;padding:10px 12px;min-width:0');
+      const active = data.activeRecord?.physics === physics && data.activeRecord?.category === category;
+      const card = add(records, 'div', '', `background:${active ? '#34301e' : '#152238'};border:2px solid ${active ? '#fbbf24' : 'transparent'};border-radius:6px;padding:10px 12px;min-width:0`);
+      if (active) {
+        const label = data.activeRecord.source === 'pov' ? 'WATCHING' : 'YOU';
+        card.setAttribute('aria-label', `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : 'STRAFE'} world record — ${label}`);
+        add(card, 'div', label, 'font-size:12px;font-weight:900;letter-spacing:1px;color:#0b1424;background:#fbbf24;border-radius:3px;padding:2px 7px;display:inline-block;margin-bottom:6px');
+      }
       add(card, 'div', `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : 'STRAFE'} · WR`, 'font-size:13px;font-weight:750;color:#fbbf24');
       const recordTime = record?.state === 'ready' ? record.time || 'No record' : record?.state === 'loading' ? 'Loading…' : 'Unavailable';
       const time = add(card, 'div', '', 'font-size:20px;font-weight:700;font-variant-numeric:tabular-nums');
@@ -102,7 +119,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
     const spectatorNames = add(spectators, 'div', '', 'display:flex;flex-wrap:wrap;gap:8px;font-size:16px;min-width:0');
     if (!data.spectators.length) spectatorNames.textContent = 'None';
     for (const row of data.spectators) {
-      const chip = add(spectatorNames, 'span', '', 'background:#19263a;border:1px solid #52637b;border-radius:5px;padding:3px 10px;overflow-wrap:anywhere');
+      const chip = add(spectatorNames, 'span', '', `background:#19263a;border:1px solid #52637b;border-radius:5px;padding:3px 10px;overflow-wrap:anywhere;${row.clanTag ? 'min-width:0;max-width:100%;box-sizing:border-box;' : ''}`);
       coloredName(chip, row);
     }
     const playerCount = data.mode === 'Solo' ? data.groups.reduce((count, group) => count + group.rows.length, 0) + data.spectators.length : data.multiplayer.total;
@@ -119,7 +136,8 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
           value.leaderboard.rows.length > 10 || value.multiplayer.rows.length > 10) throw new TypeError('Invalid information snapshot');
       const rows = value.leaderboard.rows.map(r => ({rank: infoText(r.rank, 12), name: infoText(r.name, 64), time: infoText(r.time, 48)}));
       const players = value.multiplayer.rows.map(r => ({name: infoText(r.name, 64), status: infoText(r.status, 32), detail: infoText(r.detail, 64), ping: infoText(r.ping, 16)}));
-      const player = r => ({coloredName: infoText(r.coloredName, 192), pbWrComparison: infoText(r.pbWrComparison, 32), sessionWrComparison: infoText(r.sessionWrComparison, 32), name: infoText(r.name, 96), pb: infoText(r.pb, 48), sessionBest: infoText(r.sessionBest, 48), ping: infoText(r.ping, 16)});
+      const clan = r => ({clanTag: infoText(r.clanTag, 192), clanOfficial: r.clanOfficial === true, coloredBaseName: infoText(r.coloredBaseName, 192)});
+      const player = r => ({...clan(r), coloredName: infoText(r.coloredName, 192), pbWrComparison: infoText(r.pbWrComparison, 32), sessionWrComparison: infoText(r.sessionWrComparison, 32), name: infoText(r.name, 96), pb: infoText(r.pb, 48), sessionBest: infoText(r.sessionBest, 48), ping: infoText(r.ping, 16)});
       const legacy = !Array.isArray(value.multiplayer.groups);
       let groups, spectators;
       if (legacy) {
@@ -140,9 +158,13 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
       if (value.records !== undefined && (!Array.isArray(value.records) || value.records.length > 4)) throw new TypeError('Invalid records');
       const records = (value.records || []).map(r => {
         if (!['pql','vql'].includes(r.physics) || !['w','s'].includes(r.category) || !states.includes(r.state)) throw new TypeError('Invalid record board');
-        return {physics:r.physics, category:r.category, state:r.state, name:infoText(r.name, 96), coloredName:infoText(r.coloredName, 192), time:infoText(r.time, 48)};
+        return {...clan(r), physics:r.physics, category:r.category, state:r.state, name:infoText(r.name, 96), coloredName:infoText(r.coloredName, 192), time:infoText(r.time, 48)};
       });
-      informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), category: infoText(value.category, 32),
+      // Only explicit game-owned POV context can select a board. Missing/invalid data clears it.
+      const active = value.activeRecord;
+      const activeRecord = active && ['pql','vql'].includes(active.physics) && ['w','s'].includes(active.category) && ['self','pov'].includes(active.source)
+        ? {physics: active.physics, category: active.category, source: active.source} : null;
+      informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), category: infoText(value.category, 32), activeRecord,
         groups, spectators, records, legacy,
         leaderboard: {state: value.leaderboard.state, rows}, multiplayer: {state: value.multiplayer.state, rows: players,
           total: Number.isSafeInteger(value.multiplayer.total) && value.multiplayer.total >= players.length ? value.multiplayer.total : players.length}};
@@ -352,6 +374,19 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
   window.addEventListener('DOMContentLoaded', async () => {
     const menu = document.getElementById('overlay');
     if (menu) {
+      const menuMain = menu.querySelector('main');
+      if (menuMain) {
+        const quitButton = document.createElement('button');
+        quitButton.type = 'button'; quitButton.textContent = 'QUIT';
+        quitButton.id = 'client-quit';
+        quitButton.style.cssText = 'font:600 16px system-ui;padding:10px 24px;margin:12px 0;border:1px solid #adbac0;border-radius:6px;background:#172237;color:#fff;cursor:pointer;width:auto;letter-spacing:normal';
+        quitButton.addEventListener('click', event => {
+          event.preventDefault(); event.stopPropagation();
+          if (event.isTrusted) ipcRenderer.invoke('client:quit').catch(() => {});
+        });
+        const settings = menuMain.querySelector('.settings');
+        menuMain.insertBefore(quitButton, settings);
+      }
       // Older website builds can still show their browser update popup.
       // Keep the desktop notice as the single refresh prompt, even if the
       // website subsequently removes the popup's hidden attribute.
@@ -388,6 +423,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
   });
   contextBridge.exposeInMainWorld('qrazyDesktop', {
     version: 1,
+    quit: () => ipcRenderer.invoke('client:quit'),
     updates,
     information,
     status: { version: 1, report: value => ipcRenderer.invoke('client:game-status', value) },
