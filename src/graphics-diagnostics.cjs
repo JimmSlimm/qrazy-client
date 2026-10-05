@@ -39,9 +39,7 @@ async function graphicsReport(app, webglRenderer) {
     `Active GPU(s): ${gpu?.gpuDevice?.filter(device => device.active).map(device => device.deviceString || `${device.vendorId}:${device.deviceId}`).join(', ') || 'Unavailable'}`,
     `Chromium renderer: ${gpu?.auxAttributes?.glRenderer || 'Unavailable'}`,
     `WebGL probe renderer: ${typeof webglRenderer === 'string' ? webglRenderer.slice(0, 1024) : 'Unavailable'}`,
-    `GPU features: ${JSON.stringify(app.getGPUFeatureStatus())}`,
-    'WebGL probe uses a separate context; this is not an FPS measurement.',
-    'Local report only. Executable paths may contain your Windows username.'
+    `GPU features: ${JSON.stringify(app.getGPUFeatureStatus())}`
   ].join('\n');
 }
 module.exports = { windowsPreference, graphicsReport };

@@ -14,7 +14,7 @@ if (adminArgument) {
 } else if (require('./windows-launch.cjs').redirectThroughLauncher(app, process, packagedClient)) {
   // Restarting through the native launcher before graphics initialization.
 } else {
-const { DEV_MODE, GAME_URL, isGameURL, permissionAllowed, isFullscreenShortcut } = require('./policy.cjs');
+const { DEV_MODE, GAME_URL, isGameURL, isExternalWebURL, permissionAllowed, isFullscreenShortcut } = require('./policy.cjs');
 const { RawMouse } = require('./raw-mouse.cjs');
 const { VSyncPreference } = require('./vsync.cjs');
 const { MaxFpsPreference } = require('./max-fps.cjs');
@@ -25,6 +25,7 @@ const { WindowState } = require('./window-state.cjs');
 const { linuxCapability } = require('./linux-input.cjs');
 const { Updater } = require('./updater.cjs');
 const { WebsiteUpdates } = require('./website-updates.cjs');
+const { ServerRetry, retryableConnection } = require('./server-retry.cjs');
 const { startInstaller } = require('./update-install.cjs');
 const updateConfig = require('./update-config.cjs');
 // A second packaged instance must not keep files/profile open during replacement.
@@ -44,6 +45,9 @@ let gameErrorShowing = false, gameErrorDetails = '';
 let graphics = graphicsState();
 let updater, websiteUpdates, updateTimer, websiteTimer;
 let installingUpdate = false;
+let hasLoadedGame = false;
+const serverRetry = new ServerRetry({ retry: () => loadGame(), show: (...args) => showStatus(...args),
+  expire: () => { if (loading) { ++attempt; loading = false; clearTimeout(timeout); game.webContents.stop(); } } });
 app.on('gpu-info-update', () => {
   graphics = graphicsState(app.getGPUFeatureStatus());
   if (game && !game.isDestroyed() && isGameURL(game.webContents.getURL()))
@@ -53,30 +57,37 @@ function trustedGame(event) {
   return game && !game.isDestroyed() && event.sender === game.webContents &&
     event.senderFrame === game.webContents.mainFrame && isGameURL(event.senderFrame.url);
 }
-function showStatus(message, retry, details = '', retryLabel = 'Retry') {
+function showStatus(message, retry, details = '', retryLabel = 'Retry', diagnostic = '', progress = '') {
   if (!win || win.isDestroyed()) return;
   rawMouse?.release();
   win.contentView.addChildView(status);
   syncBounds();
-  status.webContents.send('client:status', { message, retry, details, retryLabel });
+  status.webContents.send('client:status', { message, retry, details, retryLabel, diagnostic, progress });
 }
 function syncBounds() {
   const [width, height] = win.getContentSize();
   status.setBounds({ x: 0, y: 0, width, height });
 }
 function fail(message) {
+  serverRetry.stop();
   loading = false; clearTimeout(timeout); showStatus(message, true);
+}
+function connectionFailure(description) {
+  if (!DEV_MODE && !hasLoadedGame && retryableConnection(description)) {
+    loading = false; clearTimeout(timeout);
+    serverRetry.failure(description);
+  } else fail(DEV_MODE ? 'Unable to load the local development server. Start it on localhost:5173 and retry.' : 'Unable to load Qrazy. Check your internet connection and retry.');
 }
 async function loadGame() {
   if (loading) return;
   loading = true;
   gameErrorShowing = false; gameErrorDetails = '';
   const token = ++attempt;
-  showStatus(DEV_MODE ? 'Connecting to local development server (localhost:5173)…' : 'Connecting to Qrazy…', false);
+  if (!serverRetry.deadline) showStatus(DEV_MODE ? 'Connecting to local development server (localhost:5173)…' : 'Connecting to Qrazy…', false);
   timeout = setTimeout(() => {
     if (token !== attempt || !loading) return;
     ++attempt; game.webContents.stop();
-    fail(DEV_MODE ? 'Local development server is taking too long to respond. Start it on localhost:5173 and retry.' : 'Qrazy is taking too long to respond. Check your internet connection and retry.');
+    connectionFailure('ERR_TIMED_OUT');
   }, 15000);
   try {
     // HTTP cache only: keep cookies, local storage, profiles and disk assets.
@@ -84,17 +95,31 @@ async function loadGame() {
     await game.webContents.loadURL(GAME_URL);
     if (token !== attempt || win.isDestroyed()) return;
     loading = false; clearTimeout(timeout);
+    hasLoadedGame = true; serverRetry.stop();
     if (!gameErrorShowing) win.contentView.removeChildView(status);
     game.webContents.send('client:minimized', win.isMinimized());
     game.webContents.focus();
-  } catch {
-    if (token === attempt) fail(DEV_MODE ? 'Unable to load the local development server. Start it on localhost:5173 and retry.' : 'Unable to load Qrazy. Check your internet connection and retry.');
+  } catch (error) {
+    if (token === attempt) connectionFailure(error.message || String(error));
   }
 }
 function secure(contents, status = false) {
-  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  const openWebLink = url => {
+    if (!status && isGameURL(contents.getURL()) && isExternalWebURL(url))
+      shell.openExternal(url).catch(error => console.warn('Unable to open web link:', error.message));
+  };
+  contents.setWindowOpenHandler(({ url }) => {
+    // Website links open in the user's browser without a privileged client window.
+    openWebLink(url);
+    return { action: 'deny' };
+  });
   contents.on('will-attach-webview', event => event.preventDefault());
-  contents.on('will-navigate', (event, url) => { if (status || !isGameURL(url)) event.preventDefault(); });
+  contents.on('will-navigate', (event, url) => {
+    if (status || !isGameURL(url)) {
+      event.preventDefault();
+      openWebLink(url);
+    }
+  });
   contents.on('will-redirect', (event, url) => { if (status || !isGameURL(url)) event.preventDefault(); });
   contents.on('will-frame-navigate', event => {
     if (status || !isGameURL(event.url)) event.preventDefault();
@@ -153,6 +178,9 @@ app.whenReady().then(async () => {
   const requireUpdateSender = (event, focused = false) => {
     if (!trustedGame(event) || (focused && (!win.isFocused() || win.isMinimized()))) throw new Error('Updates require the official game in the current client window');
   };
+  const changelog = new (require('./changelog.cjs').Changelog)(app.getPath('userData'), app.getVersion());
+  ipcMain.handle('client:changelog-get', event => { requireUpdateSender(event); return changelog.getState(); });
+  ipcMain.handle('client:changelog-read', event => { requireUpdateSender(event, true); return changelog.markRead(); });
   ipcMain.handle('client:update-get', event => { requireUpdateSender(event); return { ...updater.getState(), gameRefreshNeeded: websiteUpdates.getState().outdated }; });
   ipcMain.handle('client:update-check', event => {
     requireUpdateSender(event);
@@ -305,7 +333,12 @@ app.whenReady().then(async () => {
   game.webContents.on('did-navigate', (_event, _url, responseCode) => {
     if (responseCode >= 400) {
       ++attempt;
-      fail(`The Qrazy server returned HTTP ${responseCode}. Please try again shortly.`);
+      loading = false; clearTimeout(timeout);
+      if (!DEV_MODE && [502, 503, 504].includes(responseCode)) serverRetry.failure(`HTTP ${responseCode}`);
+      else {
+        serverRetry.stop();
+        showStatus(`Server problem (code ${responseCode})`, true, '', 'Retry now', `HTTP ${responseCode}`);
+      }
     }
   });
   win.on('resize', syncBounds);
@@ -318,16 +351,23 @@ app.whenReady().then(async () => {
     game.webContents.send('client:minimized', false);
   });
   game.webContents.on('render-process-gone', () => fail('The game stopped unexpectedly. Retry to reload it.'));
-  game.webContents.on('did-fail-load', (_event, code, _description, _url, mainFrame) => {
-    if (mainFrame && !loading && code !== -3) fail('The game page could not load. Check your internet connection and retry.');
+  game.webContents.on('did-fail-load', (_event, code, description, _url, mainFrame) => {
+    if (mainFrame && code !== -3) {
+      ++attempt;
+      connectionFailure(description);
+    }
   });
   ipcMain.on('client:retry', event => {
-    if (event.sender === status.webContents && event.senderFrame === status.webContents.mainFrame) loadGame();
+    if (event.sender === status.webContents && event.senderFrame === status.webContents.mainFrame && !loading) {
+      if (serverRetry.timer !== null) { serverRetry.run(); serverRetry.tick(); }
+      else { serverRetry.stop(); loadGame(); }
+    }
   });
   win.on('closed', () => {
     rawMouse.close();
     assets.reset().catch(() => {});
     clearTimeout(timeout); ++attempt;
+    serverRetry.stop();
     clearTimeout(updateTimer); clearInterval(websiteTimer);
     if (!status.webContents.isDestroyed()) status.webContents.close();
   });

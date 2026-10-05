@@ -8,7 +8,13 @@ function isGameURL(value) {
 function permissionAllowed(permission, url) {
   return isGameURL(url) && ['pointerLock', 'fullscreen', 'keyboardLock'].includes(permission);
 }
+function isExternalWebURL(value) {
+  try {
+    const url = new URL(value);
+    return ['https:', 'http:'].includes(url.protocol) && !url.username && !url.password;
+  } catch { return false; }
+}
 function isFullscreenShortcut(input) {
   return input.key === 'Enter' && input.alt === true && !input.control && !input.meta && !input.shift;
 }
-module.exports = { DEV_MODE, GAME_URL, isGameURL, permissionAllowed, isFullscreenShortcut };
+module.exports = { DEV_MODE, GAME_URL, isGameURL, isExternalWebURL, permissionAllowed, isFullscreenShortcut };

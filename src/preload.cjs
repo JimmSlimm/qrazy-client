@@ -40,6 +40,20 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
     const add = (parent, tag, text, style = '') => {
       const node = document.createElement(tag); node.textContent = text; node.style.cssText = style; parent.append(node); return node;
     };
+    const coloredName = (parent, row) => {
+      const parts = (row.coloredName || row.name).split(/\^([0-9])/);
+      const colors = ['#000','#f00','#0f0','#ff0','#00f','#0ff','#f0f','#fff','#000'];
+      let color = '';
+      if (parts[0]) add(parent, 'span', parts[0]);
+      for (let i = 1; i < parts.length; i += 2) {
+        if (parts[i] !== '9') color = colors[Number(parts[i])];
+        if (parts[i + 1]) add(parent, 'span', parts[i + 1], `color:${color || 'inherit'}`);
+      }
+    };
+    const comparison = (parent, text) => {
+      if (!text) return;
+      add(parent, 'div', `${text} vs WR`, `font-size:13px;color:${text.startsWith('-') ? '#86efac' : text.startsWith('+') ? '#fca5a5' : '#c3cfdf'}`);
+    };
     add(box, 'div', data.map || 'No current map', 'font-size:28px;font-weight:800;color:#fbbf24;overflow-wrap:anywhere');
     add(box, 'div', `${data.mode || '—'} - Physics: ${data.physics || '—'} - Mode: ${data.category || '—'} - Session: ${data.sessionTime || '—'}`, 'color:#c3cfdf;margin:4px 0 18px');
     const records = add(box, 'div', '', 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px');
@@ -58,7 +72,8 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
         mark.setAttribute('title', 'Unverified record');
         add(time, 'span', recordTime.slice(question.index + question[0].length));
       } else time.textContent = recordTime;
-      add(card, 'div', record?.state === 'ready' ? record.name : 'Awaiting game data', 'font-size:14px;color:#b8c8dc;overflow-wrap:anywhere');
+      const name = add(card, 'div', '', 'font-size:14px;color:#b8c8dc;overflow-wrap:anywhere');
+      if (record?.state === 'ready') coloredName(name, record); else name.textContent = 'Awaiting game data';
     }
     const columns = add(box, 'div', '', 'display:grid;gap:14px');
     function panel(title, rows) {
@@ -67,26 +82,36 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
       const table = add(section, 'table', '', 'width:100%;border-collapse:collapse;font-size:17px;table-layout:fixed');
       const head = document.createElement('thead'); table.append(head);
       const tr = document.createElement('tr'); head.append(tr);
-      ['Player','PB','Session best','Ping'].forEach((h, i) => add(tr, 'th', h, `width:${[52,19,19,10][i]}%;text-align:${i ? 'right' : 'left'};color:#9eafc5;font-size:14px;padding:6px 12px;border-bottom:1px solid #40516a`));
+      ['Player','PB','Session best','Ping'].forEach((h, i) => add(tr, 'th', h, `width:${[46,22,22,10][i]}%;text-align:${i ? 'right' : 'left'};color:#9eafc5;font-size:14px;padding:6px 12px;border-bottom:1px solid #40516a`));
       const body = document.createElement('tbody'); table.append(body);
       rows.forEach(row => {
         const tr = document.createElement('tr'); body.append(tr);
-        row.forEach((cell, i) => add(tr, 'td', cell, `text-align:${i ? 'right' : 'left'};padding:8px 12px;border-bottom:1px solid #26354b;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;${i ? 'white-space:nowrap' : ''}`));
+        [row.name, row.pb || '\u2014', row.sessionBest || '\u2014', row.ping || '\u2014'].forEach((cell, i) => {
+          const td = add(tr, 'td', i === 0 ? '' : cell, `text-align:${i ? 'right' : 'left'};padding:8px 12px;border-bottom:1px solid #26354b;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;${i ? 'white-space:nowrap' : ''}`);
+          if (i === 0) coloredName(td, row);
+          if (i === 1 && row.pb && row.pb !== '\u2014') comparison(td, row.pbWrComparison);
+          if (i === 2 && row.sessionBest && row.sessionBest !== '\u2014') comparison(td, row.sessionWrComparison);
+        });
       });
     }
     if (data.multiplayer.state === 'disconnected' && data.mode !== 'Solo') add(columns, 'div', 'Not connected to multiplayer.', 'padding:14px;background:#152238;border-radius:6px;color:#cbd7e7');
     else if (!data.groups.length) add(columns, 'div', 'No active players.', 'color:#cbd7e7');
-    for (const group of data.groups) panel(group.label, group.rows.map(r => [r.name, r.pb || '—', r.sessionBest || '—', r.ping || '—']));
+    for (const group of data.groups) panel(group.label, group.rows);
     const spectators = add(box, 'div', '', 'display:flex;gap:16px;align-items:baseline;border-top:1px solid #40516a;padding-top:12px;margin-top:16px');
     add(spectators, 'div', 'SPECTATORS:', 'font-size:14px;font-weight:800;color:#9eafc5');
-    add(spectators, 'div', data.spectators.map(r => r.name).join(' · ') || 'None', 'font-size:16px;overflow-wrap:anywhere');
+    const spectatorNames = add(spectators, 'div', '', 'display:flex;flex-wrap:wrap;gap:8px;font-size:16px;min-width:0');
+    if (!data.spectators.length) spectatorNames.textContent = 'None';
+    for (const row of data.spectators) {
+      const chip = add(spectatorNames, 'span', '', 'background:#19263a;border:1px solid #52637b;border-radius:5px;padding:3px 10px;overflow-wrap:anywhere');
+      coloredName(chip, row);
+    }
     const playerCount = data.mode === 'Solo' ? data.groups.reduce((count, group) => count + group.rows.length, 0) + data.spectators.length : data.multiplayer.total;
     add(box, 'div', `${playerCount} ${playerCount === 1 ? 'player' : 'players'} · Release Tab to return${data.legacy ? ' · Category, PB, session-best and WR data need the updated game adapter' : data.mode === 'Solo' ? ' · Session best: local untainted finish, not server-verified' : ' · Session best: hub-reported, not replay-verified'}`, 'font-size:13px;color:#9eafc5;margin-top:12px');
     document.body.append(box); informationBox = box;
   }
   const information = {
     version: 1,
-    layoutVersion: 2,
+    layoutVersion: 3,
     report(value) {
       const states = ['loading', 'ready', 'unavailable', 'disconnected'];
       if (!value || !states.includes(value.leaderboard?.state) || !states.includes(value.multiplayer?.state) ||
@@ -94,7 +119,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
           value.leaderboard.rows.length > 10 || value.multiplayer.rows.length > 10) throw new TypeError('Invalid information snapshot');
       const rows = value.leaderboard.rows.map(r => ({rank: infoText(r.rank, 12), name: infoText(r.name, 64), time: infoText(r.time, 48)}));
       const players = value.multiplayer.rows.map(r => ({name: infoText(r.name, 64), status: infoText(r.status, 32), detail: infoText(r.detail, 64), ping: infoText(r.ping, 16)}));
-      const player = r => ({name: infoText(r.name, 96), pb: infoText(r.pb, 48), sessionBest: infoText(r.sessionBest, 48), ping: infoText(r.ping, 16)});
+      const player = r => ({coloredName: infoText(r.coloredName, 192), pbWrComparison: infoText(r.pbWrComparison, 32), sessionWrComparison: infoText(r.sessionWrComparison, 32), name: infoText(r.name, 96), pb: infoText(r.pb, 48), sessionBest: infoText(r.sessionBest, 48), ping: infoText(r.ping, 16)});
       const legacy = !Array.isArray(value.multiplayer.groups);
       let groups, spectators;
       if (legacy) {
@@ -115,7 +140,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
       if (value.records !== undefined && (!Array.isArray(value.records) || value.records.length > 4)) throw new TypeError('Invalid records');
       const records = (value.records || []).map(r => {
         if (!['pql','vql'].includes(r.physics) || !['w','s'].includes(r.category) || !states.includes(r.state)) throw new TypeError('Invalid record board');
-        return {physics:r.physics, category:r.category, state:r.state, name:infoText(r.name, 96), time:infoText(r.time, 48)};
+        return {physics:r.physics, category:r.category, state:r.state, name:infoText(r.name, 96), coloredName:infoText(r.coloredName, 192), time:infoText(r.time, 48)};
       });
       informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), category: infoText(value.category, 32),
         groups, spectators, records, legacy,
@@ -192,6 +217,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
   let clientUpdateState = { phase: 'idle' }, websiteUpdateState = { outdated: false };
   let updatePanel, updateSummary, updateButton, refreshReminder, updateDialog;
   let updatesOpen = false;
+  let changelogOpen = false, changelogState = { releases: [], pending: {}, unread: false };
   let dismissedClientVersion = null, dismissedWebsite = false;
   const combinedUpdateState = () => ({ ...clientUpdateState, gameRefreshNeeded: websiteUpdateState.outdated });
   const emitUpdate = () => {
@@ -230,6 +256,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
     const bytes = state.downloadBytes || 0;
     const size = bytes < 1024 * 1024 ? `${Math.ceil(bytes / 1024)} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
     updateButton.textContent = state.phase === 'ready' ? 'Update ready' : ['available', 'downloading'].includes(state.phase) ? 'Update available' : 'Client updates';
+    if (changelogState.unread) updateButton.textContent += ' • New notes';
     updateButton.style.color = ['available', 'ready', 'downloading'].includes(state.phase) ? '#fbbf24' : '#adbac0';
     updateButton.disabled = false;
     refreshReminder.hidden = !websiteUpdateState.outdated;
@@ -237,7 +264,31 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
     updateDialog.replaceChildren();
     updateSummary = updateNode('p', '', updateDialog); updateSummary.hidden = true;
     updateSummary.setAttribute('role', 'status'); updateSummary.setAttribute('aria-live', 'polite');
-    if (websiteUpdateState.outdated && !dismissedWebsite) {
+    if (changelogOpen) {
+      updateDialog.hidden = false;
+      updateNode('h2', 'Client changelog', updateDialog);
+      updateNode('p', `Installed version ${changelogState.installedVersion || state.installedVersion || ''}`, updateDialog);
+      const showEntry = (entry, title) => {
+        const section = updateNode('section', '', updateDialog);
+        section.style.cssText = 'border-top:1px solid #334155;margin-top:18px;padding-top:12px';
+        updateNode('h3', title, section);
+        if (entry.date) updateNode('p', entry.date, section);
+        for (const key of ['added', 'changed', 'fixed']) {
+          if (!entry[key]?.length) continue;
+          updateNode('h4', key[0].toUpperCase() + key.slice(1), section);
+          const list = updateNode('ul', '', section);
+          list.style.cssText = 'padding-left:24px;list-style:disc;text-align:left';
+          for (const text of entry[key]) updateNode('li', text, list);
+        }
+      };
+      if (['added', 'changed', 'fixed'].some(key => changelogState.pending?.[key]?.length))
+        showEntry(changelogState.pending, 'Next release · Unreleased');
+      for (const entry of changelogState.releases)
+        showEntry(entry, `Version ${entry.version}${entry.version === changelogState.installedVersion ? ' · Installed' : ''}`);
+      if (!changelogState.releases.length) updateNode('p', 'Release history will appear here as new client releases are published.', updateDialog);
+      updateAction(updateDialog, 'Back to updates', () => { changelogOpen = false; updatesOpen = true; renderUpdates(); });
+      updateAction(updateDialog, 'Close', () => { changelogOpen = false; updatesOpen = false; renderUpdates(); });
+    } else if (websiteUpdateState.outdated && !dismissedWebsite) {
       updateDialog.hidden = false;
       updateNode('h2', 'New game version available', updateDialog);
       updateNode('p', 'Refreshing is usually nearly instant. Until you refresh, some features may not work correctly and runs may be rejected. Refreshing ends the current run and reconnects multiplayer.', updateDialog);
@@ -247,7 +298,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
       updateDialog.hidden = false;
       updateNode('h2', 'Qrazy client update available', updateDialog);
       updateNode('p', `Version ${state.version} · Download ${size}. Your saved login, settings and downloaded assets will be kept.`, updateDialog);
-      if (state.notes) updateNode('p', state.notes, updateDialog);
+      if (state.notes) { const notes = updateNode('p', state.notes, updateDialog); notes.style.whiteSpace = 'pre-wrap'; }
       if (state.phase === 'downloading' || (state.phase === 'available' && state.message && state.message !== 'Qrazy client update available')) {
         updateSummary.hidden = false;
         updateSummary.textContent = state.phase === 'downloading' ? `Downloading ${Math.round((state.downloadedBytes || 0) / Math.max(1, bytes) * 100)}% · ${size}` : state.message;
@@ -270,7 +321,13 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
       if (state.phase !== 'checking') updateAction(updateDialog, 'Check again', checkClientUpdates);
       updateAction(updateDialog, 'Close', () => { updatesOpen = false; renderUpdates(); });
     } else updateDialog.hidden = true;
-    if (!updateDialog.hidden) updateAction(updateDialog, 'Copy graphics diagnostic', async () => {
+    if (!updateDialog.hidden && !changelogOpen) updateAction(updateDialog, changelogState.unread ? 'Changelog • New' : 'Changelog', async () => {
+      changelogState = await ipcRenderer.invoke('client:changelog-get');
+      changelogOpen = true; renderUpdates();
+      try { changelogState = await ipcRenderer.invoke('client:changelog-read'); renderUpdates(); }
+      catch { /* Keep notes readable even if saving read state fails. */ }
+    });
+    if (!updateDialog.hidden && !changelogOpen) updateAction(updateDialog, 'Copy graphics diagnostic', async () => {
       let renderer = 'WebGL2 unavailable';
       const gl = document.createElement('canvas').getContext('webgl2', { powerPreference: 'high-performance', antialias: true });
       if (gl) {
@@ -295,11 +352,18 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
   window.addEventListener('DOMContentLoaded', async () => {
     const menu = document.getElementById('overlay');
     if (menu) {
+      // Older website builds can still show their browser update popup.
+      // Keep the desktop notice as the single refresh prompt, even if the
+      // website subsequently removes the popup's hidden attribute.
+      const websiteUpdateStyle = document.createElement('style');
+      websiteUpdateStyle.textContent = '#overlay #update-popup { display: none !important; }';
+      (document.head || document.documentElement).append(websiteUpdateStyle);
       updatePanel = document.createElement('section');
       updatePanel.setAttribute('aria-label', 'Qrazy updates');
       updatePanel.style.cssText = 'position:absolute;bottom:20px;right:28px;display:flex;align-items:center;gap:14px;font:14px/1.45 system-ui;z-index:100;letter-spacing:normal';
       menu.append(updatePanel);
       updateButton = updateAction(updatePanel, 'Client updates', () => {
+        changelogOpen = false;
         updatesOpen = true;
         if (['available', 'ready', 'downloading'].includes(clientUpdateState.phase)) { dismissedClientVersion = null; renderUpdates(); return; }
         return checkClientUpdates();
@@ -315,6 +379,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
     }
     try {
       clientUpdateState = await updates.getState();
+      changelogState = await ipcRenderer.invoke('client:changelog-get');
       websiteUpdateState = await ipcRenderer.invoke('client:website-update-get'); emitUpdate();
       // This is the game's embedded deployment identity, not a fetched guess.
       const commit = document.documentElement.dataset.build;

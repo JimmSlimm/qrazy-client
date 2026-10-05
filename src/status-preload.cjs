@@ -8,4 +8,6 @@ ipcRenderer.on('client:status', (_event, state) => {
   document.getElementById('retry').hidden = !state.retry;
   document.getElementById('retry').textContent = state.retryLabel || 'Retry';
   document.getElementById('copy').hidden = !state.details;
+  document.getElementById('diagnostic').textContent = state.diagnostic || '';
+  document.getElementById('progress').textContent = state.progress || '';
 });

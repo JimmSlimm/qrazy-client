@@ -12,6 +12,8 @@ h1 { font-size: 48px; margin: 0 0 24px; }
 p { line-height: 1.6; }
 button { font: inherit; padding: 12px 32px; border: 0; border-radius: 6px; background: #38bdf8; color: #082f49; cursor: pointer; }
 button:focus-visible { outline: 3px solid white; outline-offset: 4px; }
+#diagnostic { position: fixed; bottom: 12px; left: 24px; right: 24px; color: #9ca3af; font-size: 12px; overflow-wrap: anywhere; }
+#progress { color: #cbd5e1; font-size: 16px; }
 </style>
-<main><h1>Qrazy</h1><p id="message" role="status" aria-live="polite">Connecting to Qrazy…</p><button id="retry" hidden>Retry</button><button id="copy" hidden>Copy technical details</button></main>
+<main><h1>Qrazy</h1><p id="message" role="status" aria-live="polite">Connecting to Qrazy…</p><p id="progress"></p><button id="retry" hidden>Retry</button><button id="copy" hidden>Copy technical details</button></main><p id="diagnostic"></p>
 </html>

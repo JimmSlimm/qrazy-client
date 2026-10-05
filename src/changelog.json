@@ -1,0 +1,24 @@
+{
+  "releases": [
+    {
+      "version": "0.3.10",
+      "date": "2026-10-05",
+      "added": [
+        "Read the client changelog from Client updates, including offline release history and an indicator for unread release notes.",
+        "Automatic retries with a countdown and Retry now button when the server is temporarily unavailable."
+      ],
+      "changed": [
+        "The Tab overlay shows spectators as separate labels and supports colored names and time differences versus the world record when supplied by the game."
+      ],
+      "fixed": [
+        "Website links now open in your default browser instead of being blocked by the client.",
+        "Removed the duplicate game update popup so the client shows a single refresh notice."
+      ]
+    }
+  ],
+  "pending": {
+    "added": [],
+    "changed": [],
+    "fixed": []
+  }
+}
