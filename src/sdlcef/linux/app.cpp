@@ -26,6 +26,7 @@
 #include "include/cef_load_handler.h"
 #include "include/cef_download_handler.h"
 #include "include/cef_dialog_handler.h"
+#include "include/cef_context_menu_handler.h"
 #include "desktop_worker.h"
 #include "server_retry.h"
 #include "include/cef_app.h"
@@ -45,6 +46,7 @@ double copy_ms = 0, swap_ms = 0;
 std::string bridge_source;
 std::string close_action;
 std::string installed_title="Qrazy";
+bool amd_mesa_renderer = false;
 QrazyWindows::ServerRetry server_retry;
 uint64_t connect_started=0;
 int render_rate = 0;
@@ -107,7 +109,7 @@ class Native final : public CefV8Handler {
     if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 3 || !args[2]->IsString() || args[2]->GetStringValue().length()>1500000 ||
         !args[0]->IsString() || !args[1]->IsInt()) { exception = "Unauthorized native bridge call"; return true; }
     const auto op = args[0]->GetStringValue().ToString();
-    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog") {
+    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog") {
       exception = "Unknown native operation"; return true;
     }
     auto message = CefProcessMessage::Create("qrazy-command-v1");
@@ -121,22 +123,51 @@ class Native final : public CefV8Handler {
   IMPLEMENT_REFCOUNTING(Native);
 };
 
-class App final : public CefApp, public CefRenderProcessHandler {
+class App final : public CefApp, public CefRenderProcessHandler, public CefBrowserProcessHandler {
   struct Binding { CefRefPtr<CefV8Context> context; CefRefPtr<CefV8Value> dispatch; };
   std::map<int, Binding> bindings;
  public:
   CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override { return this; }
-  void OnBeforeCommandLineProcessing(const CefString&, CefRefPtr<CefCommandLine> line) override {
+  CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
+  void OnBeforeChildProcessLaunch(CefRefPtr<CefCommandLine> line) override {
+    if (line->GetSwitchValue("type") != "gpu-process") return;
+    // Log only this fixed set of graphics controls, never the full command line.
+    // Hardware captures confirm disable-angle-features already reaches the child.
+    std::fprintf(stderr, "QRAZY GPU-child angle=%s disabled-angle-features=%s software-disabled=%d sandbox-fatal=%s\n",
+      line->GetSwitchValue("use-angle").ToString().c_str(),
+      line->GetSwitchValue("disable-angle-features").ToString().c_str(),
+      line->HasSwitch("disable-software-rasterizer"),
+      line->GetSwitchValue("gpu-sandbox-failures-fatal").ToString().c_str());
+  }
+  void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> line) override {
     // Deliberately no user-controlled switches in the browser process launch path.
     // Extensions are outside this game's trust boundary, including distro auto-installed ones.
     line->AppendSwitch("disable-extensions");
     line->AppendSwitchWithValue("ozone-platform", "wayland");
-    line->AppendSwitchWithValue("use-angle", "gl-egl");
+    // Select in the browser after SDL identifies the driver. GPU children must
+    // retain the inherited selection rather than overwrite it with their default.
+    if (process_type.empty()) {
+      line->AppendSwitchWithValue("use-angle", amd_mesa_renderer ? "vulkan" : "gl-egl");
+      line->AppendSwitch("disable-software-rasterizer");
+      if (amd_mesa_renderer) {
+        // VA-API warming can create radeonsi command/shader workers before
+        // sandbox initialization even when ANGLE itself uses Vulkan.
+        line->AppendSwitch("disable-accelerated-video-decode");
+        line->AppendSwitch("disable-accelerated-video-encode");
+        // These select synchronous cleanup work. Pinned ANGLE still creates its
+        // cleanup thread unconditionally; this is not a sandbox-startup fix.
+        line->AppendSwitchWithValue("disable-angle-features", "asyncGarbageCleanup,asyncCommandBufferReset");
+      }
+    }
     line->AppendSwitchWithValue("class", "qrazy-sdl-cef");
     line->AppendSwitchWithValue("enable-logging", "stderr");
-    // Initialize Mesa before sealing the GPU sandbox; failure is always fatal.
-    // Disk-cache workers are disabled below, so they cannot race this step.
-    line->AppendSwitchWithValue("gpu-sandbox-failures-fatal", "yes");
+    // Linux compatibility workaround: Mesa/ANGLE starts graphics worker threads
+    // before Chromium's GPU sandbox, causing "Current process is not mono-threaded"
+    // and repeated GPU-process crashes on the reported Radeon/Wayland system.
+    // Disable ONLY GPU-process isolation; renderer sandboxes and hardware rendering
+    // remain enabled. This reduces GPU-process containment and needs hardware retesting.
+    if (process_type.empty() || process_type == "gpu-process")
+      line->AppendSwitch("disable-gpu-sandbox");
   }
   void OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) override {
     if (!frame->IsMain() || !Trusted(frame->GetURL())) return;
@@ -250,7 +281,7 @@ class Texture {
 };
 
 class Client final : public DesktopPolicy::RecoveryState, public CefClient, public CefRenderHandler, public CefLifeSpanHandler,
-                     public CefRequestHandler, public CefDisplayHandler, public CefLoadHandler, public CefDownloadHandler, public CefDialogHandler {
+                     public CefRequestHandler, public CefDisplayHandler, public CefLoadHandler, public CefDownloadHandler, public CefDialogHandler,public CefContextMenuHandler {
  public:
   CefRefPtr<CefBrowser> browser;
   Texture view;
@@ -376,14 +407,29 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     if (hidden_check) browser->GetHost()->SetAudioMuted(true);
     else browser->GetHost()->SetFocus(SDL_GetKeyboardFocus() == window);
     server_retry.Start(SDL_GetTicks());server_retry.Attempt(SDL_GetTicks());connect_started=SDL_GetTicks();
-    std::fprintf(stderr, "QRAZY browser-created sandbox requested=true\n");
+    std::fprintf(stderr, "QRAZY browser-created renderer-sandbox requested=true GPU-sandbox disabled=true\n");
   }
   void OnBeforeClose(CefRefPtr<CefBrowser>) override { Release("close"); browser = nullptr; closed = true; }
-  bool OnBeforePopup(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, int, const CefString&, const CefString&, cef_window_open_disposition_t,
-      bool, const CefPopupFeatures&, CefWindowInfo&, CefRefPtr<CefClient>&, CefBrowserSettings&, CefRefPtr<CefDictionaryValue>&, bool*) override { return true; }
-  bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool, bool) override {
+  CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
+  void OnBeforeContextMenu(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame>,CefRefPtr<CefContextMenuParams> params,CefRefPtr<CefMenuModel> model) override {
+    model->Clear();
+    if(!captured && !params->GetSelectionText().empty())model->AddItem(MENU_ID_COPY,"Copy");
+  }
+  void OpenWebLink(CefRefPtr<CefFrame> frame,const CefString& url,bool gesture) {
+    if(!gesture || captured || closing || !frame || !frame->IsMain() || !Trusted(frame->GetURL()))return;
+    CefURLParts parts;
+    if(!CefParseURL(url,parts) || CefString(&parts.host).empty() ||
+       !CefString(&parts.username).empty() || !CefString(&parts.password).empty())return;
+    auto scheme=CefString(&parts.scheme).ToString();
+    if(scheme=="https" || scheme=="http")SDL_OpenURL(url.ToString().c_str());
+  }
+  bool OnBeforePopup(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,int,const CefString& url,const CefString&,
+      cef_window_open_disposition_t,bool gesture,const CefPopupFeatures&,CefWindowInfo&,CefRefPtr<CefClient>&,CefBrowserSettings&,CefRefPtr<CefDictionaryValue>&,bool*) override {
+    OpenWebLink(frame,url,gesture);return true;
+  }
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool gesture, bool) override {
     if (frame->IsMain()) {
-      if(!Trusted(request->GetURL())){Fail("NAVIGATION REFUSED");return true;}
+      if(!Trusted(request->GetURL())){OpenWebLink(frame,request->GetURL(),gesture);return true;}
       Release("navigation");desktop_worker.Reset();selection.clear();popup_visible=false;BeginLoad();
       if(browser){browser->GetHost()->ImeCancelComposition();browser->GetHost()->SetAudioMuted(true);}composing=false;
       return false;
@@ -463,6 +509,9 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
         (stage!="server"&&stage!="map"&&stage!="assets"&&stage!="graphics"&&stage!="game")||
         (recovery!="none"&&recovery!="reload")||(recovery=="reload"&&phase!="error")||data_payload->GetString("message").length()>500||data_payload->GetString("details").length()>2000||data_payload->GetString("code").length()>80)return true;
       if(phase=="error")Release("game-error");
+    } else if(op=="refresh-game") {
+      bool ok=browser&&!closing&&!loading&&!hidden_check&&SDL_GetKeyboardFocus()==window;result->SetBool("ok",ok);
+      if(ok){Release("refresh");desktop_worker.Reset();BeginLoad();connect_started=SDL_GetTicks();server_retry.Start(connect_started);server_retry.Attempt(connect_started);popup_visible=false;selection.clear();composing=false;browser->GetHost()->ImeCancelComposition();browser->GetHost()->SetAudioMuted(true);browser->ReloadIgnoreCache();}
     } else if(op=="retry") { Retry(); }
     else if(op=="clipboard-write") {
       auto text=data_payload?data_payload->GetString("text").ToString():std::string();
@@ -477,7 +526,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
       d->SetString("glVersion",reinterpret_cast<const char*>(glGetString(GL_VERSION)));d->SetInt("cefTargetFps",render_rate);
       int interval=0;d->SetInt("swapInterval",SDL_GL_GetSwapInterval(&interval)?interval:-1);d->SetDouble("displayScale",SDL_GetWindowDisplayScale(window));
       int w,h;SDL_GetWindowSizeInPixels(window,&w,&h);d->SetInt("pixelWidth",w);d->SetInt("pixelHeight",h);
-      d->SetBool("sandboxRequested",true);d->SetBool("gpuSandboxFailuresFatal",true);d->SetBool("mesaDiskCachesDisabled",true);
+      d->SetBool("sandboxRequested",true);d->SetBool("gpuSandboxDisabled",true);d->SetBool("gpuSandboxFailuresFatal",false);d->SetBool("mesaDiskCachesDisabled",true);
       d->SetString("verification","Sandbox configuration, not a live per-thread audit. Presentation, input latency and physical GPU performance unverified.");result->SetDictionary("data",d);
     } else if(op=="config-import"||op=="config-export") {
       bool allowed=!hidden_check&&!captured&&!closing&&!recovering&&!loading&&SDL_GetKeyboardFocus()==window&&!dialog_active.exchange(true);
@@ -731,6 +780,9 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     std::fprintf(stderr, "QRAZY SDL swap interval=%d (presentation timing unmeasured)\n", interval);
   }
   std::fprintf(stderr, "QRAZY SDL=%s version=%d hidden=%d renderer=%s\n", SDL_GetCurrentVideoDriver(), SDL_GetVersion(), hidden_check, glGetString(GL_RENDERER));
+  const auto renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+  amd_mesa_renderer = renderer && std::strstr(renderer, "radeonsi");
+  std::fprintf(stderr, "QRAZY graphics-candidate=gpu-sandbox-workaround-seq7 CEF-angle=%s GPU-sandbox=disabled renderer-sandbox=enabled software-rasterizer=disabled AMD-video-acceleration=%s AMD-ANGLE-async-cleanup=%s\n", amd_mesa_renderer ? "vulkan" : "gl-egl", amd_mesa_renderer ? "disabled" : "default", amd_mesa_renderer ? "disabled" : "default");
   CefSettings settings; settings.windowless_rendering_enabled = true; settings.no_sandbox = false; settings.command_line_args_disabled = true;
   CefString(&settings.root_cache_path) = prototype_profile.string();
   CefString(&settings.cache_path) = prototype_profile.string();

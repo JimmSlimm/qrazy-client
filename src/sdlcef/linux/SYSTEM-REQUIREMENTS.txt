@@ -11,6 +11,8 @@ Required external runtime: /usr/bin/python3 version 3.11 or newer (stdlib only).
 CEF, SDL3 and the isolated Node updater are bundled, with original licenses.
 System libraries/drivers are not bundled: GTK3/GLib, ATK/AT-SPI, NSS/NSPR, DBus,
 fontconfig, ALSA, system EGL/GLES/Wayland graphics stack and compatible GPU driver.
+Mesa radeonsi (AMD Radeon) additionally requires its hardware Vulkan driver
+(vulkan-radeon on Arch/CachyOS) for Chromium's ANGLE Vulkan rendering backend.
 XDG desktop portals are needed for native cfg dialogs. A working desktop
 credential service/keyring is needed for saved-login protection; do not disable
 it or select plaintext credential storage. Namespace-based Chromium sandbox

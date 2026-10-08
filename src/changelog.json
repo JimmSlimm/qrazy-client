@@ -1,6 +1,21 @@
 {
   "releases": [
     {
+      "version": "0.4.1",
+      "date": "2026-10-09",
+      "added": [
+        "Right-click selected text to open a menu with a Copy option."
+      ],
+      "changed": [
+        "Game update notices offer Refresh game or Keep playing, with a reminder in the menu."
+      ],
+      "fixed": [
+        "Fixed a Windows client crash when opening maps and other dropdowns, including during multiplayer.",
+        "Prevented a Windows client crash when the game page has not finished drawing its first frame.",
+        "Website links now open in your default browser instead of being blocked by the SDL3/CEF client."
+      ]
+    },
+    {
       "version": "0.3.11",
       "date": "2026-10-05",
       "added": [

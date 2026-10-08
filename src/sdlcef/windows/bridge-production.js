@@ -209,6 +209,60 @@
     if (checked.phase!=='ready'&&!checked.message)throw new TypeError('Expected status message');
     await rpc('status',checked);showStatus(checked);
   }
+
+  // Match the game's complete desktop-updates v1 contract. Site deployments
+  // are independent of signed native client releases.
+  let loadedBuild = null, siteOutdated = false, siteBusy = false, siteDismissed = false, siteNotice;
+  const updateListeners = new Set();
+  const validBuild = value => typeof value === 'string' && /^[a-f0-9]{7,40}$/.test(value);
+  const combinedState = state => ({...state, gameRefreshNeeded:siteOutdated});
+  function renderSiteUpdate() {
+    const menu = document.getElementById('overlay');
+    if (!menu || !siteOutdated) return;
+    siteNotice?.remove();
+    const box = document.createElement('section');
+    box.style.cssText = 'position:fixed;bottom:64px;right:16px;max-width:480px;z-index:2147483646;background:#0b1424;color:#edf2fa;border:2px solid #fbbf24;border-radius:10px;padding:20px;font:16px/1.5 system-ui;box-shadow:0 8px 40px #000b';
+    const title = document.createElement('strong');title.textContent = siteDismissed ? 'Refresh needed' : 'New game version available';title.style.color='#fbbf24';box.append(title);
+    if (!siteDismissed) { const text=document.createElement('p');text.textContent='Until you refresh, some features may not work correctly and runs may be rejected. Refreshing ends the current run and reconnects multiplayer.';box.append(text); }
+    const action = (label, fn) => { const b=document.createElement('button');b.type='button';b.textContent=label;b.style.cssText='width:auto;margin:8px 8px 0 0;padding:10px 14px;font:15px system-ui;letter-spacing:normal';b.onclick=async event=>{event.preventDefault();event.stopPropagation();if(!event.isTrusted||b.disabled)return;b.disabled=true;try{await fn();}catch{b.disabled=false;b.textContent='Retry refresh';}};box.append(b); };
+    action('Refresh game',()=>updates.refreshGame());
+    if (!siteDismissed) action('Keep playing',()=>{siteDismissed=true;renderSiteUpdate();});
+    menu.append(box);siteNotice=box;
+  }
+  async function checkSiteUpdate() {
+    if (!loadedBuild || siteBusy || siteOutdated) return;
+    siteBusy=true;
+    try {
+      const response=await fetch('https://qrazy-game.onrender.com/build.json',{cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if (!response.ok) return;
+      const reader=response.body.getReader();let size=0;const chunks=[];
+      try { while(true) { const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>4096)throw new Error('Build response too large');chunks.push(value); } }
+      finally { await reader.cancel(); }
+      const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
+      const build=JSON.parse(new TextDecoder().decode(bytes));
+      if(validBuild(build.commit)&&build.commit!==loadedBuild){siteOutdated=true;renderSiteUpdate();updates.getState().then(state=>emit(updateListeners,state)).catch(()=>{});}
+    } catch { /* Offline or invalid responses never interrupt gameplay. */ }
+    finally { siteBusy=false; }
+  }
+  const updates=Object.freeze({
+    version:1,
+    getState:async()=>combinedState((await rpc('update-state')).data),
+    check:async()=>{await checkSiteUpdate();const state=combinedState((await rpc('update-check')).data);emit(updateListeners,state);return state;},
+    download:async()=>{const state=combinedState((await rpc('update-check')).data);emit(updateListeners,state);return state;},
+    install:()=>rpc('update-install'),
+    refreshGame:async()=>{release();const result=await rpc('refresh-game');if(!result.ok)throw new Error('Unable to refresh game');return true;},
+    reportLoadedBuild:async commit=>{if(validBuild(commit)){if(!loadedBuild)loadedBuild=commit;await checkSiteUpdate();}return {outdated:siteOutdated};},
+    onChange:fn=>subscribe(updateListeners,fn)
+  });
+  const siteTimer=setInterval(checkSiteUpdate,5*60*1000);
+  window.addEventListener('focus',checkSiteUpdate);
+  window.addEventListener('pagehide',()=>clearInterval(siteTimer));
+  document.addEventListener('DOMContentLoaded',()=>{
+    const style=document.createElement('style');style.textContent='#overlay #update-popup{display:none!important}';(document.head||document.documentElement).append(style);
+    updates.reportLoadedBuild(document.documentElement.dataset.build).catch(()=>{});renderSiteUpdate();
+  });
+
+
   function desktopPanel() {
     if (!document.body || document.getElementById('qrazy-prototype-tools')) return;
     // Match the existing Electron menu insertion point; no game data is read.
@@ -292,6 +346,8 @@
     version: 1, prototype: true,
     rawMouseCapability: Object.freeze({ supported: null, backend: 'sdl3-wayland', reason: 'Compositor capture and hardware behaviour require manual verification; capture() reports the SDL request result.' }),
     rawMouse,
+    updates,
+    updates,
     information: Object.freeze(information),
     assets: Object.freeze(assets),
     status: Object.freeze({ version: 1, report: reportStatus }),

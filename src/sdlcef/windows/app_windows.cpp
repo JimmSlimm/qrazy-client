@@ -18,6 +18,7 @@
 #include "include/cef_load_handler.h"
 #include "include/cef_download_handler.h"
 #include "include/cef_dialog_handler.h"
+#include "include/cef_context_menu_handler.h"
 #include "include/cef_sandbox_win.h"
 #include "include/wrapper/cef_helpers.h"
 #include "borrowed_texture.h"
@@ -80,6 +81,7 @@ class Texture {
  public:
   ~Texture(){if(texture_)SDL_DestroyTexture(texture_);}
   bool Initialize(ID3D11Device* device){return copy_.Initialize(device);}
+  bool Ready() const{return texture_!=nullptr;}
   bool Copy(const CefAcceleratedPaintInfo& info) {
     auto r=info.extra.visible_rect;
     if(r.x<0||r.y<0||r.width<=0||r.height<=0||
@@ -100,12 +102,12 @@ class Texture {
 };
 class Client final : public DesktopPolicy::RecoveryState,public CefClient,public CefRenderHandler,
   public CefLifeSpanHandler,public CefRequestHandler,public CefLoadHandler,public CefDisplayHandler,
-  public CefDownloadHandler,public CefDialogHandler {
+  public CefDownloadHandler,public CefDialogHandler,public CefContextMenuHandler {
  public:
   CefRefPtr<CefBrowser> browser;
   Texture view,popup;
   CefRect popup_rect;
-  bool popup_visible=false,dirty=false,composing=false,fatal=false;
+  bool popup_visible=false,popup_ready=false,dirty=false,composing=false,fatal=false;
   bool handoff_waiting=false;
   QrazyWindows::ServerRetry server_retry;
   Uint64 load_started=SDL_GetTicks();
@@ -136,8 +138,23 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   }
   void OnAfterCreated(CefRefPtr<CefBrowser> value) override {browser=value;browser->GetHost()->SetFocus(SDL_GetKeyboardFocus()==window);browser->GetHost()->SetAudioMuted(true);}
   void OnBeforeClose(CefRefPtr<CefBrowser>) override {Release("close");browser=nullptr;closed=true;}
-  bool OnBeforePopup(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame>,int,const CefString&,const CefString&,
-    cef_window_open_disposition_t,bool,const CefPopupFeatures&,CefWindowInfo&,CefRefPtr<CefClient>&,CefBrowserSettings&,CefRefPtr<CefDictionaryValue>&,bool*) override{return true;}
+  CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
+  void OnBeforeContextMenu(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame>,CefRefPtr<CefContextMenuParams> params,CefRefPtr<CefMenuModel> model) override {
+    model->Clear();
+    if(!captured && !params->GetSelectionText().empty())model->AddItem(MENU_ID_COPY,"Copy");
+  }
+  void OpenWebLink(CefRefPtr<CefFrame> frame,const CefString& url,bool gesture) {
+    if(!gesture || captured || closing || !frame || !frame->IsMain() || !Trusted(frame->GetURL()))return;
+    CefURLParts parts;
+    if(!CefParseURL(url,parts) || CefString(&parts.host).empty() ||
+       !CefString(&parts.username).empty() || !CefString(&parts.password).empty())return;
+    auto scheme=CefString(&parts.scheme).ToString();
+    if(scheme=="https" || scheme=="http")SDL_OpenURL(url.ToString().c_str());
+  }
+  bool OnBeforePopup(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,int,const CefString& url,const CefString&,
+      cef_window_open_disposition_t,bool gesture,const CefPopupFeatures&,CefWindowInfo&,CefRefPtr<CefClient>&,CefBrowserSettings&,CefRefPtr<CefDictionaryValue>&,bool*) override {
+    OpenWebLink(frame,url,gesture);return true;
+  }
   bool CanDownload(CefRefPtr<CefBrowser>,const CefString&,const CefString&) override{return false;}
   bool OnBeforeDownload(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem>,const CefString&,CefRefPtr<CefBeforeDownloadCallback>) override{return true;}
   void OnDownloadUpdated(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem>,CefRefPtr<CefDownloadItemCallback> callback) override{callback->Cancel();}
@@ -175,9 +192,9 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     if(x<40||x>260||y<200||y>248)return false;
     if(!server_retry.pending)Retry();return true;
   }
-  bool OnBeforeBrowse(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,CefRefPtr<CefRequest> request,bool,bool) override {
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,CefRefPtr<CefRequest> request,bool gesture,bool) override {
     if(handoff_waiting)return !frame->IsMain()||request->GetURL()!="about:blank";
-    if(!frame->IsMain())return false;if(!Trusted(request->GetURL()))return true;Reset("navigation");BeginLoad();load_started=SDL_GetTicks();return false;
+    if(!frame->IsMain())return false;if(!Trusted(request->GetURL())){OpenWebLink(frame,request->GetURL(),gesture);return true;}Reset("navigation");BeginLoad();load_started=SDL_GetTicks();return false;
   }
   void OnLoadStart(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,TransitionType) override{if(frame->IsMain()&&loading&&!recovering)SDL_SetWindowTitle(window,"Qrazy - connecting");}
   void OnLoadEnd(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,int code) override {
@@ -188,10 +205,12 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   void OnRenderProcessTerminated(CefRefPtr<CefBrowser>,TerminationStatus,int,const CefString&) override{Fail();}
   void OnPaint(CefRefPtr<CefBrowser>,PaintElementType,const RectList&,const void*,int,int) override{fatal=true;closing=true;Release("CPU-paint-rejected");}
   void OnAcceleratedPaint(CefRefPtr<CefBrowser>,PaintElementType type,const RectList&,const CefAcceleratedPaintInfo& info) override {
-    if(!(type==PET_VIEW?view:popup).Copy(info)){fatal=true;closing=true;Release("GPU-copy-failed");}else dirty=true;
+    if(!(type==PET_VIEW?view:popup).Copy(info)){fatal=true;closing=true;Release("GPU-copy-failed");}else{if(type==PET_POPUP)popup_ready=true;dirty=true;}
   }
-  void OnPopupShow(CefRefPtr<CefBrowser>,bool show) override{popup_visible=show;dirty=true;}
-  void OnPopupSize(CefRefPtr<CefBrowser>,const CefRect& rect) override{popup_rect=rect;dirty=true;}
+  // CEF announces a dropdown before its accelerated texture arrives. Wait for
+  // this opening's paint rather than failing on a missing (or stale) texture.
+  void OnPopupShow(CefRefPtr<CefBrowser>,bool show) override{popup_visible=show;popup_ready=false;dirty=true;}
+  void OnPopupSize(CefRefPtr<CefBrowser>,const CefRect& rect) override{if(rect.width!=popup_rect.width||rect.height!=popup_rect.height)popup_ready=false;popup_rect=rect;dirty=true;}
   void FullscreenState(){auto data=Dict();data->SetString("type","fullscreen");data->SetBool("value",!!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN));Send(data);}
   bool OnProcessMessageReceived(CefRefPtr<CefBrowser> b,CefRefPtr<CefFrame> frame,CefProcessId source,CefRefPtr<CefProcessMessage> msg) override {
     if(msg->GetName()!="qrazy-command-v1")return false;
@@ -243,6 +262,11 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       captured=ok;if(ok){SDL_StopTextInput(window);if(!SDL_DisableScreenSaver())std::fprintf(stderr,"PROTOTYPE idle inhibition failed\n");}
       result->SetBool("ok",ok);result->SetInt("generation",++generation);
     }else if(op=="quit"){Release("quit");closing=true;}
+    else if(op=="refresh-game") {
+      bool ok=browser&&!closing&&!fatal&&!handoff_waiting&&!loading&&SDL_GetKeyboardFocus()==window;
+      result->SetBool("ok",ok);
+      if(ok){server_retry.Stop();Reset("refresh");BeginLoad();load_started=SDL_GetTicks();server_retry.Start(load_started);server_retry.Attempt(load_started);browser->ReloadIgnoreCache();}
+    }
     else if(op=="retry")Retry();
     else if(op=="fullscreen-toggle"||op=="fullscreen-state") {
       if(op=="fullscreen-toggle")result->SetBool("ok",SDL_SetWindowFullscreen(window,!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN)));
@@ -417,7 +441,7 @@ int Run(HINSTANCE instance,void* sandbox) {
           }
           SDL_SetRenderScale(renderer,1,1);
           if(client->recovering||client->server_retry.active){SDL_FRect button{40,200,220,48};SDL_SetRenderDrawColor(renderer,52,48,30,255);SDL_RenderFillRect(renderer,&button);SDL_SetRenderDrawColor(renderer,251,191,36,255);SDL_RenderRect(renderer,&button);SDL_SetRenderScale(renderer,2,2);SDL_RenderDebugText(renderer,30,108,"Retry now");SDL_SetRenderScale(renderer,1,1);}
-        }else{if(!client->view.Draw())client->fatal=closing=true;if(client->popup_visible){int w,h,pw,ph;SDL_GetWindowSize(window,&w,&h);SDL_GetWindowSizeInPixels(window,&pw,&ph);CefRect dip;client->GetViewRect(nullptr,dip);SDL_FRect rect{client->popup_rect.x*static_cast<float>(pw)/dip.width,client->popup_rect.y*static_cast<float>(ph)/dip.height,client->popup_rect.width*static_cast<float>(pw)/dip.width,client->popup_rect.height*static_cast<float>(ph)/dip.height};if(!client->popup.Draw(&rect))client->fatal=closing=true;}}
+        }else{if(client->view.Ready()&&!client->view.Draw())client->fatal=closing=true;if(client->popup_visible&&client->popup_ready&&client->popup.Ready()&&client->popup_rect.width>0&&client->popup_rect.height>0){int w,h,pw,ph;SDL_GetWindowSize(window,&w,&h);SDL_GetWindowSizeInPixels(window,&pw,&ph);CefRect dip;client->GetViewRect(nullptr,dip);SDL_FRect rect{client->popup_rect.x*static_cast<float>(pw)/dip.width,client->popup_rect.y*static_cast<float>(ph)/dip.height,client->popup_rect.width*static_cast<float>(pw)/dip.width,client->popup_rect.height*static_cast<float>(ph)/dip.height};if(!client->popup.Draw(&rect))client->fatal=closing=true;}}
         if(!SDL_RenderPresent(renderer))client->fatal=closing=true;
       }
       SDL_Delay(1);
