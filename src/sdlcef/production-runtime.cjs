@@ -18,6 +18,14 @@ function noLinks(file) {
     if(path.dirname(p)===p)break;
   }
 }
+function syncDirectory(directory) {
+  if(process.platform!=='linux')return;
+  const fd=fs.openSync(directory,'r');try{fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
+}
+function move(source,destination) {
+  fs.renameSync(source,destination);syncDirectory(path.dirname(source));
+  if(path.dirname(source)!==path.dirname(destination))syncDirectory(path.dirname(destination));
+}
 function atomic(file,bytes) {
   const temp=file+'.partial';noLinks(file);noLinks(temp);
   // A crash before the atomic rename can leave only this known temporary file.
@@ -25,7 +33,7 @@ function atomic(file,bytes) {
   if(fs.existsSync(temp)){if(!fs.lstatSync(temp).isFile())throw Error('Unsafe metadata temporary');fs.unlinkSync(temp);}
   const fd=fs.openSync(temp,'wx');
   try{fs.writeFileSync(fd,bytes);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}
-  fs.renameSync(temp,file);
+  move(temp,file);
 }
 function urlCheck(value,kind='asset') {
   const u=new URL(value);
@@ -103,7 +111,12 @@ async function extract(archive,destination,manifest) {
       await pipeline(...streams);
       if(bytes!==entry.signed.size||h.digest('hex')!==entry.signed.sha256)throw Error('ZIP checksum mismatch');
       const out=fs.openSync(target,'r+');try{fs.fsyncSync(out);}finally{fs.closeSync(out);}
+      if(process.platform==='linux')fs.chmodSync(target,entry.signed.mode);
+      syncDirectory(path.dirname(target));
     }
+    const directories=[];
+    function collect(dir){for(const name of fs.readdirSync(dir)){const p=path.join(dir,name);if(fs.lstatSync(p).isDirectory())collect(p);}directories.push(dir);}
+    collect(destination);for(const dir of directories)syncDirectory(dir);
   }finally{fs.closeSync(fd);}
 }
 class Runtime {
@@ -161,10 +174,10 @@ class Runtime {
     this.verified(this.current,this.runtime);if(fs.existsSync(this.old))throw Error('Unexpected temporary recovery runtime');
     const current=bounded(this.current),next=bounded(path.join(this.work,'signed.json'));
     atomic(this.journal,Buffer.from(JSON.stringify({schema:'qrazy-single-runtime-transaction-v1',previous:current.toString('base64'),next:next.toString('base64')})));
-    fs.renameSync(this.runtime,this.old);fs.renameSync(this.next,this.runtime);
+    move(this.runtime,this.old);move(this.next,this.runtime);
     this.recover();return {phase:'installed',message:'Update installed. Open Qrazy manually.'};
   }
-  remove(file) {noLinks(file);const allowed=[this.old,this.work];if(!allowed.includes(path.resolve(file)))throw Error('Unsafe update cleanup');fs.rmSync(file,{recursive:true,force:true});}
+  remove(file) {noLinks(file);const allowed=[this.old,this.work];if(!allowed.includes(path.resolve(file)))throw Error('Unsafe update cleanup');fs.rmSync(file,{recursive:true,force:true});syncDirectory(path.dirname(file));}
   recover() {
     if(!fs.existsSync(this.journal))return;
     noLinks(this.old);noLinks(this.next);noLinks(this.runtime);
@@ -175,15 +188,15 @@ class Runtime {
     if(fresh.manifest.sequence<=prev.manifest.sequence||compare(fresh.manifest.version,prev.manifest.version)<=0||![prev.identity,fresh.identity].includes(current.identity))throw Error('Invalid transaction history');
     const matches=(tree,result)=>{try{release.verifyTree(tree,result.manifest,this.policy);return true;}catch{return false;}};
     if(matches(this.runtime,fresh)) {
-      atomic(this.current,next);this.remove(this.old);this.remove(this.work);fs.unlinkSync(this.journal);return;
+      atomic(this.current,next);this.remove(this.old);this.remove(this.work);fs.unlinkSync(this.journal);syncDirectory(this.control);return;
     }
     if(current.identity===fresh.identity)throw Error('Installed update was modified; refusing downgrade');
     if(matches(this.runtime,prev)) {
-      this.remove(this.work);this.remove(this.old);fs.unlinkSync(this.journal);return;
+      this.remove(this.work);this.remove(this.old);fs.unlinkSync(this.journal);syncDirectory(this.control);return;
     }
     if(matches(this.old,prev)) {
-      if(fs.existsSync(this.runtime)) {if(fs.existsSync(this.next))throw Error('Ambiguous interrupted update');fs.renameSync(this.runtime,this.next);}
-      fs.renameSync(this.old,this.runtime);atomic(this.current,previous);this.remove(this.work);fs.unlinkSync(this.journal);return;
+      if(fs.existsSync(this.runtime)) {if(fs.existsSync(this.next))throw Error('Ambiguous interrupted update');move(this.runtime,this.next);}
+      move(this.old,this.runtime);atomic(this.current,previous);this.remove(this.work);fs.unlinkSync(this.journal);syncDirectory(this.control);return;
     }
     throw Error('No authenticated runtime available for transaction recovery');
   }

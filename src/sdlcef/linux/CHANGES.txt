@@ -1,0 +1,11 @@
+Qrazy SDL/CEF 0.4.0
+
+Linux SDL/CEF client with the current Client panel and installed-version title.
+Signed stable updates require explicit installation confirmation and manual reopening.
+Temporary server connection failures retry for up to five minutes, every five
+seconds during the first minute and every ten seconds afterward, with an attempt
+count, countdown and Retry now. Unrelated security failures are not retried.
+Profiles and completed local assets remain separate from the installed runtime.
+Linux process startup follows CEF's fork stack-guard contract. Normal launches
+keep bounded private diagnostics in profile-sdlcef-linux/launch.log; actual
+process failures still produce a short terminal error.

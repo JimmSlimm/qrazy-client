@@ -1,0 +1,42 @@
+Qrazy SDL/CEF Linux x86-64 production release candidate
+
+Architecture: Linux x86-64 only. No ARM64 or 32-bit package.
+Build baseline: Debian 12, glibc >= 2.36, GLIBCXX_3.4.30/CXXABI_1.3.13.
+Native Wayland desktop only; Xorg/X11 sessions are unsupported. Relative-pointer
+and pointer-constraints compositor protocols, EGL/GLES2, DMA-BUF import and
+accelerated CEF offscreen rendering are required. VSync ON is required.
+
+Keep the entire distribution together in a writable local filesystem directory.
+Required external runtime: /usr/bin/python3 version 3.11 or newer (stdlib only).
+CEF, SDL3 and the isolated Node updater are bundled, with original licenses.
+System libraries/drivers are not bundled: GTK3/GLib, ATK/AT-SPI, NSS/NSPR, DBus,
+fontconfig, ALSA, system EGL/GLES/Wayland graphics stack and compatible GPU driver.
+XDG desktop portals are needed for native cfg dialogs. A working desktop
+credential service/keyring is needed for saved-login protection; do not disable
+it or select plaintext credential storage. Namespace-based Chromium sandbox
+must be permitted by the kernel/distro. No setuid helper installation, sandbox
+disabling or security flags are supported.
+
+The retained Arch KDE virgl VM provides build/loader evidence only. This release
+candidate has no clean-system, physical AMD/NVIDIA/Intel or compositor acceptance
+yet. No latency/performance improvement or hardware compatibility is claimed.
+Shader/disk-cache workarounds from the retained Linux implementation remain.
+
+Extract into a NEW directory, never over an existing/running installation.
+Run sh launch.sh from a terminal. The launcher verifies the pinned helpers and
+complete signed runtime before opening. Profiles/assets are private and created
+in profile-sdlcef-linux beside the runtime; preserve this folder. Diagnostic and
+Electron profiles are not imported. Copying or moving an open profile is unsafe.
+Storage: 16 GiB asset limit including metadata/temp/reservations and a 1 GiB free
+reserve. Updates require downloaded ZIP plus a full staged runtime plus reserve.
+
+Stable updates are explicit: Check for updates downloads only signed newer
+version AND sequence packages from the exact Qrazy GitHub repository. Update to
+vVERSION appears only after complete verification. Confirm Close and install;
+installation waits for orderly browser shutdown and cookie flush. Reopen manually.
+Interrupted transactions are authenticated on startup. Successful updates retain
+one installed runtime and remove temporary staging/recovery. Never edit runtime
+files or remove incomplete transaction records; preserve the folder on refusal.
+
+No SDL/CEF release has been published yet. Private candidate checks cannot prove
+public download discovery or successful live future update delivery.

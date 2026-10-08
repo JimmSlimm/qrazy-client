@@ -35,7 +35,7 @@ function validate(m, policy) {
   }
   if (total > 4 * 1024 ** 3 || [...names].some(n => [...names].some(other => other.startsWith(n + '/')))) throw Error('Conflicting or excessive inventory');
   const required = ['bridge.js','icudtl.dat','resources.pak','v8_context_snapshot.bin','locales/en-us.pak','licenses/cef-license.txt','licenses/cef-credits.html','licenses/sdl3-license.txt','licenses/project-license.txt','system-requirements.txt','changes.txt'];
-  required.push(...(m.platform === 'windows-x64' ? ['qrazy.exe','qrazy.dll','libcef.dll','sdl3.dll','chrome_elf.dll','d3dcompiler_47.dll','dxcompiler.dll','dxil.dll','chrome_100_percent.pak','chrome_200_percent.pak','vk_swiftshader.dll','vulkan-1.dll','vk_swiftshader_icd.json'] : ['qrazy-sdl-cef','libcef.so','libsdl3.so.0','libvk_swiftshader.so','libvulkan.so.1','chrome_100_percent.pak','chrome_200_percent.pak']));
+  required.push(...(m.platform === 'windows-x64' ? ['qrazy.exe','qrazy.dll','libcef.dll','sdl3.dll','chrome_elf.dll','d3dcompiler_47.dll','dxcompiler.dll','dxil.dll','chrome_100_percent.pak','chrome_200_percent.pak','vk_swiftshader.dll','vulkan-1.dll','vk_swiftshader_icd.json'] : ['qrazy-sdl-cef','desktop_backend.py','libcef.so','libsdl3.so.0','libvk_swiftshader.so','libvulkan.so.1','chrome_100_percent.pak','chrome_200_percent.pak']));
   if (!required.every(n => names.has(n))) throw Error('Required runtime/licenses missing');
   if (!m.asset || !/^Qrazy-SDLCEF-[A-Za-z0-9_.+-]+\.zip$/.test(m.asset.name) || !m.asset.name.includes(m.platform) || !Number.isSafeInteger(m.asset.size) || m.asset.size < 1 || m.asset.size > 4 * 1024 ** 3 || !/^[a-f0-9]{64}$/.test(m.asset.sha256)) throw Error('Invalid separate payload descriptor');
   return m;
