@@ -17,8 +17,42 @@ class WindowState {
     this.maximized = saved?.maximized === true;
     this.fullscreen = saved?.fullscreen === true;
   }
-  track(win) {
+  track(win, screen) {
     let timer;
+    // Windows can restore fullscreen windows onto the primary monitor. Keep
+    // the last visible placement independently of minimized native bounds.
+    let placement, minimizedPlacement;
+    const rememberPlacement = () => {
+      if (!screen || win.isDestroyed() || win.isMinimized() || minimizedPlacement) return;
+      const bounds = win.getBounds();
+      placement = { bounds, normal: win.getNormalBounds(),
+        displayId: screen.getDisplayMatching(bounds).id,
+        fullscreen: win.isFullScreen(), maximized: win.isFullScreen() ? this.maximized : win.isMaximized() };
+    };
+    rememberPlacement();
+    for (const event of ['move', 'resize', 'maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen'])
+      win.on(event, rememberPlacement);
+    win.on('minimize', () => { minimizedPlacement = placement; });
+    win.on('restore', () => {
+      const previous = minimizedPlacement;
+      if (!previous) return;
+      // Let the native restore finish before correcting its monitor choice.
+      setImmediate(() => {
+        if (win.isDestroyed() || win.isMinimized()) return;
+        const displays = screen.getAllDisplays();
+        const target = displays.find(display => display.id === previous.displayId);
+        if (target && screen.getDisplayMatching(win.getBounds()).id !== target.id) {
+          if (win.isFullScreen()) win.setFullScreen(false);
+          if (win.isMaximized()) win.unmaximize();
+          const bounds = previous.fullscreen || previous.maximized ? previous.normal : previous.bounds;
+          win.setBounds(fitBounds(bounds, [target]));
+          if (previous.maximized) win.maximize();
+          if (previous.fullscreen) win.setFullScreen(true);
+        }
+        minimizedPlacement = undefined;
+        rememberPlacement();
+      });
+    });
     win.on('maximize', () => { if (!win.isFullScreen()) this.maximized = true; });
     win.on('unmaximize', () => { if (!win.isFullScreen()) this.maximized = false; });
     const save = () => {

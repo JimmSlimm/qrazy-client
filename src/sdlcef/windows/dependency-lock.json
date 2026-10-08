@@ -1,0 +1,21 @@
+{
+  "cefVersion": "154.0.34+g14c5a08+chromium-154.0.8037.98",
+  "sdlVersion": "3.4.18",
+  "cef": {
+    "last_modified": "2026-10-05T05:04:27.617000Z",
+    "name": "cef_binary_154.0.34+g14c5a08+chromium-154.0.8037.98_windows64.tar.bz2",
+    "sha1": "8c705a2ef1ce5f7b9655729a2d3de5d033a24d8b",
+    "size": 365396143,
+    "type": "standard",
+    "url": "https://cef-builds.spotifycdn.com/cef_binary_154.0.34+g14c5a08+chromium-154.0.8037.98_windows64.tar.bz2",
+    "sha256": "51ebf99f026c5901bb1c647053a00dc4abebed70fe24f5d9bcfaa0016b3f774b"
+  },
+  "sdl": {
+    "name": "SDL3-devel-3.4.18-VC.zip",
+    "size": 16902234,
+    "url": "https://github.com/libsdl-org/SDL/releases/download/release-3.4.18/SDL3-devel-3.4.18-VC.zip",
+    "publisherDigest": "sha256:78d84602ae616cfe26b33a73b7d3b9b6b56e8a6650e53d92c9c6ca938f747acd",
+    "sha256": "78d84602ae616cfe26b33a73b7d3b9b6b56e8a6650e53d92c9c6ca938f747acd"
+  },
+  "scope": "Publisher HTTPS/integrity metadata and local hashes; not independent release signing"
+}

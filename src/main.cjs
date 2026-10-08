@@ -3,7 +3,27 @@ const path = require('node:path');
 const fs = require('node:fs');
 const packagedClient = require('./packaged-client.cjs').isPackagedClient(app, process);
 const adminArgument = process.argv.find(argument => argument.startsWith('--qrazy-admin-update='));
-if (adminArgument) {
+const authenticationCopy = process.argv.find(argument => argument.startsWith('--qrazy-auth-copy='));
+const recoveryCopy = process.argv.find(argument => argument.startsWith('--qrazy-auth-recover='));
+if (authenticationCopy || recoveryCopy) {
+  // Signed recovery application, no window and no existing browser profile.
+  app.disableHardwareAcceleration();app.enableSandbox();
+  const root=path.resolve(path.dirname(process.execPath),'../../..');
+  try {
+    const argument=authenticationCopy||recoveryCopy;
+    if(process.platform!=='win32'||!packagedClient||path.resolve(argument.slice(argument.indexOf('=')+1)).toLowerCase()!==root.toLowerCase()||
+      path.basename(path.dirname(path.dirname(process.execPath)))!=='auth')throw Error('Invalid authentication copy');
+    for(let p=root;;p=path.dirname(p)){if(fs.lstatSync(p).isSymbolicLink())throw Error('Linked authentication root');if(path.dirname(p)===p)break;}
+    const state=path.join(root,'.qrazy-transition','broker-state');
+    if(fs.existsSync(state)&&fs.lstatSync(state).isSymbolicLink())throw Error('Linked broker state');
+    fs.mkdirSync(state,{recursive:true});app.setPath('userData',state);
+    app.whenReady().then(()=>{
+      const broker=require('./sdlcef/electron-broker.cjs');
+      return (recoveryCopy?broker.runRecovery:broker.runAuthenticationCopy)({app,session,args:process.argv});
+    })
+      .then(()=>app.quit()).catch(()=>app.quit());
+  }catch{app.exit(1);}
+} else if (adminArgument) {
   // No game window, profile stores or instance lock in the elevated worker.
   app.disableHardwareAcceleration();
   app.whenReady().then(async () => {
@@ -31,9 +51,9 @@ const updateConfig = require('./update-config.cjs');
 // A second packaged instance must not keep files/profile open during replacement.
 const ownsClientInstance = !packagedClient || app.requestSingleInstanceLock();
 if (!ownsClientInstance) app.quit();
-// This backend attaches to the public X11 Window handle. Wayland sessions use
-// XWayland browser fallback; they are never advertised as native XI2 capture.
-if (process.platform === 'linux') app.commandLine.appendSwitch('ozone-platform', 'x11');
+if (ownsClientInstance && packagedClient) require('./linux-desktop.cjs').registerLinuxDesktop(app);
+// The launcher selects Ozone before Electron starts. Do not override it here:
+// native XI2 capture remains limited to genuine Xorg sessions.
 // Prefer the discrete GPU without bypassing Chromium's driver safety checks.
 app.commandLine.appendSwitch('force_high_performance_gpu');
 const vsync = new VSyncPreference(app.getPath('userData'), app.commandLine);
@@ -45,6 +65,7 @@ let gameErrorShowing = false, gameErrorDetails = '';
 let graphics = graphicsState();
 let updater, websiteUpdates, updateTimer, websiteTimer;
 let installingUpdate = false;
+let closingForUpdate = false;
 let hasLoadedGame = false;
 const serverRetry = new ServerRetry({ retry: () => loadGame(), show: (...args) => showStatus(...args),
   expire: () => { if (loading) { ++attempt; loading = false; clearTimeout(timeout); game.webContents.stop(); } } });
@@ -60,7 +81,9 @@ function trustedGame(event) {
 function showStatus(message, retry, details = '', retryLabel = 'Retry', diagnostic = '', progress = '') {
   if (!win || win.isDestroyed()) return;
   rawMouse?.release();
-  win.contentView.addChildView(status);
+  // Adding an attached view again asks Electron to restack its native layers.
+  // Status updates only need to update the existing view's contents.
+  if (!win.contentView.children.includes(status)) win.contentView.addChildView(status);
   syncBounds();
   status.webContents.send('client:status', { message, retry, details, retryLabel, diagnostic, progress });
 }
@@ -126,6 +149,11 @@ function secure(contents, status = false) {
   });
   contents.on('before-input-event', (event, input) => {
     contents.setIgnoreMenuShortcuts(true);
+    if (input.key === 'F4' && input.alt && !input.control && !input.meta) {
+      event.preventDefault();
+      if (input.type === 'keyDown' && !input.isAutoRepeat) win.close();
+      return;
+    }
     if (isFullscreenShortcut(input)) {
       event.preventDefault();
       if (input.type === 'keyDown' && !input.isAutoRepeat) win.setFullScreen(!win.isFullScreen());
@@ -140,7 +168,20 @@ app.whenReady().then(async () => {
     permissionAllowed(permission, details?.requestingUrl || origin));
   gameSession.setPermissionRequestHandler((_contents, permission, callback, details) =>
     callback(permissionAllowed(permission, details.requestingUrl)));
-  gameSession.on('will-download', event => event.preventDefault());
+  gameSession.on('will-download', (event, item, contents) => {
+    // Player exports are generated locally by the trusted game as Blob URLs.
+    // Keep arbitrary network downloads and downloads from other views blocked.
+    let allowed = false;
+    try {
+      allowed = contents === game?.webContents && !contents.isDestroyed() &&
+        isGameURL(contents.mainFrame.url) && item.getInitiatorOrigin() === new URL(GAME_URL).origin &&
+        item.getURL().startsWith('blob:') &&
+        new URL(item.getURL()).origin === new URL(GAME_URL).origin;
+    } catch { /* Invalid or detached download source. */ }
+    if (!allowed) { event.preventDefault(); return; }
+    item.setSaveDialogOptions({ title: 'Save Qrazy export',
+      defaultPath: path.join(app.getPath('downloads'), path.basename(item.getFilename())) });
+  });
   const windowState = new WindowState(app.getPath('userData'), screen.getAllDisplays());
   const clientTitle = `Qrazy v${app.getVersion()}${DEV_MODE ? ' — Local development (localhost:5173)' : ''}`;
   win = new BrowserWindow({ title: clientTitle, ...windowState.bounds,
@@ -157,19 +198,27 @@ app.whenReady().then(async () => {
   win.setMenu(null);
   if (windowState.maximized) win.maximize();
   if (windowState.fullscreen) win.setFullScreen(true);
-  windowState.track(win);
+  windowState.track(win, process.platform === 'win32' ? screen : undefined);
   win.webContents.on('page-title-updated', event => {
     event.preventDefault(); win.setTitle(clientTitle);
   });
   game = win;
-  const updateRoot = process.platform === 'win32' ? path.dirname(path.dirname(process.execPath)) : path.dirname(process.execPath);
+  // Desktop close requests must remain usable during active gameplay. In
+  // Electron, preventing this event overrides the page's beforeunload veto.
+  let closeRequested = false;
+  win.on('close', () => { closeRequested = true; });
+  game.webContents.on('will-prevent-unload', event => {
+    if (closeRequested) event.preventDefault();
+  });
+  const appImage = process.platform === 'linux' && process.env.APPIMAGE ? path.resolve(process.env.APPIMAGE) : null;
+  const updateRoot = appImage ? path.dirname(appImage) : process.platform === 'win32' ? path.dirname(path.dirname(process.execPath)) : path.dirname(process.execPath);
   const updateDirectory = path.join(app.getPath('userData'), 'updates-v1');
   const sendUpdate = (channel, state) => {
     if (!win.isDestroyed() && isGameURL(game.webContents.getURL())) game.webContents.send(channel, state);
   };
   updater = new Updater({ root: updateRoot, directory: updateDirectory, version: app.getVersion(),
     allUsers: require('./installation.cjs').allUsersInstallation(updateRoot),
-    platform: process.platform + '-' + process.arch, config: updateConfig,
+    appImage, platform: appImage ? 'linux-appimage-' + process.arch : process.platform + '-' + process.arch, config: updateConfig,
     fetch: (url, options) => net.fetch(url, options), notify: state => sendUpdate('client:update-state', state) });
   if (packagedClient && !DEV_MODE) await updater.restorePending();
   if (!packagedClient || DEV_MODE) updater.setState({ phase: 'unconfigured', message: 'Client updates are available in the packaged live client.' });
@@ -189,6 +238,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('client:update-check', event => {
     requireUpdateSender(event);
     if (!packagedClient || DEV_MODE) return updater.getState();
+    if (updater.getState().transitionFailure) return updater.getState();
     return updater.check();
   });
   ipcMain.handle('client:update-download', event => { requireUpdateSender(event, true); return updater.download(); });
@@ -202,7 +252,16 @@ app.whenReady().then(async () => {
     if (installingUpdate) throw new Error('The update is already starting');
     installingUpdate = true;
     // Ensure open asset writes and window settings finish during normal shutdown.
-    try { await startInstaller(updater); } catch (error) { installingUpdate = false; return { ...updater.getState(), message: error.message }; }
+    try {
+      if (process.platform === 'win32' && !await require('./sdlcef/electron-close.cjs').confirmClose({
+        dialog, window: win, session: game.webContents.session, drain: () => {
+          closingForUpdate = true;
+          rawMouse.release();
+          return assets.reset();
+        }
+      })) { installingUpdate = false; return updater.getState(); }
+      await startInstaller(updater);
+    } catch (error) { installingUpdate = false; closingForUpdate = false; return { ...updater.getState(), message: error.message }; }
     app.quit(); return { phase: 'installing' };
   });
   ipcMain.handle('client:website-update-get', event => { requireUpdateSender(event); return websiteUpdates.getState(); });
@@ -213,7 +272,11 @@ app.whenReady().then(async () => {
     rawMouse?.release();
     await loadGame(); return true;
   });
-  updateTimer = setTimeout(() => { if (packagedClient && !DEV_MODE) updater.check(); }, 10000);
+  updateTimer = setTimeout(() => {
+    // The signed intermediate continues its already selected update. A legacy
+    // discovery check must not overwrite a transition failure with "up to date".
+    if (packagedClient && !DEV_MODE && !fs.existsSync(path.join(process.resourcesPath,'qrazy-transition.json'))) updater.check();
+  }, 10000);
   websiteTimer = setInterval(() => websiteUpdates.check(), 5 * 60 * 1000);
   win.on('focus', () => websiteUpdates.check());
   // Installation failures remain visible after the helper restarts the old client.
@@ -250,7 +313,7 @@ app.whenReady().then(async () => {
     if (!win.isDestroyed()) game.webContents.send('client:raw-state', { captured: false });
   });
   ipcMain.handle('client:raw-capture', async event => {
-    if (!trustedGame(event) || !win.isFocused() || win.isMinimized() || loading || win.contentView.children.includes(status)) return { ok: false };
+    if (!trustedGame(event) || closingForUpdate || !win.isFocused() || win.isMinimized() || loading || win.contentView.children.includes(status)) return { ok: false };
     try { return await rawMouse.capture(); } catch { return { ok: false }; }
   });
   ipcMain.handle('client:raw-clock', async event => {
@@ -260,6 +323,7 @@ app.whenReady().then(async () => {
   ipcMain.on('client:raw-release', event => { if (trustedGame(event)) rawMouse.release(); });
   ipcMain.handle('client:asset', (event, operation, args) => {
     if (!trustedGame(event)) throw new Error('Asset storage is available only to the official game');
+    if (closingForUpdate) throw new Error('Asset storage is closing for installation');
     return assets.call(operation, args);
   });
   ipcMain.handle('client:graphics-get', event => {
@@ -379,6 +443,18 @@ app.whenReady().then(async () => {
   // through Chromium's file URL loader (paths may contain # or other escapes).
   const statusHTML = fs.readFileSync(path.join(__dirname, 'status.html'), 'utf8');
   await status.webContents.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(statusHTML));
+  if(process.platform==='win32'&&packagedClient&&!DEV_MODE&&process.env.QRAZY_TRANSITION_BOOTSTRAP_ROOT&&
+    path.resolve(process.env.QRAZY_TRANSITION_BOOTSTRAP_ROOT).toLowerCase()===path.resolve(updateRoot).toLowerCase()) {
+    try {
+      if(await require('./sdlcef/electron-transition.cjs').continueTransition({app,dialog,window:win,session:gameSession,
+        directory:updateDirectory,root:updateRoot,drain:()=>{closingForUpdate=true;rawMouse.release();return assets.reset();},
+        show:message=>showStatus(message,false)}))return;
+    }catch(error){
+      closingForUpdate=false;
+      const stage=['delivery','staging','authentication-copy','asset-copy','broker-start','first-handoff','confirmation','authorization'].includes(error?.transitionStage)?error.transitionStage:'startup';
+      updater.setState({...updater.getState(),phase:'error',transitionFailure:true,message:`The SDL/CEF transition is paused (${stage}). You can keep playing in Electron; your installation and profiles are kept. Reopen Qrazy to retry.`});
+    }
+  }
   loadGame();
 }).catch(error => {
   dialog.showErrorBox('Unable to start Qrazy', error.message || String(error));

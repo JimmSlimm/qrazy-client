@@ -2,6 +2,9 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#if defined(QRAZY_TRANSITION_BOOTSTRAP)
+#include "transition-bootstrap.h"
+#endif
 
 // Windows graphics preferences belong to the rendering executable, not its
 // launcher. Register this copy before Electron creates any graphics devices.
@@ -51,6 +54,11 @@ static void PreferHighPerformanceGpu(const std::wstring& executable) {
 }
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+#if defined(QRAZY_TRANSITION_BOOTSTRAP)
+  // Do not change the published helper or assume it honours new noRestart
+  // fields. Suppress its attempted runtime launch in the signed replacement.
+  if (!TransitionBootstrap::ManualStart()) return 0;
+#endif
   std::vector<wchar_t> buffer(32768);
   const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
   if (!length || length >= buffer.size()) return 1;
@@ -58,6 +66,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
   const DWORD longLength = GetLongPathNameW(self.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
   if (longLength && longLength < buffer.size()) self.assign(buffer.data(), longLength);
   const std::wstring folder = self.substr(0, self.find_last_of(L"\\/"));
+#if defined(QRAZY_TRANSITION_BOOTSTRAP)
+  const std::wstring lockPath=folder+L"\\install.lock";
+  DWORD attributes=GetFileAttributesW(lockPath.c_str());
+  if(attributes!=INVALID_FILE_ATTRIBUTES&&(attributes&FILE_ATTRIBUTE_REPARSE_POINT))return 1;
+  HANDLE installation=CreateFileW(lockPath.c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_ALWAYS,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+  if(installation==INVALID_HANDLE_VALUE)return 1;
+  struct CloseInstallation {HANDLE value;~CloseInstallation(){CloseHandle(value);}} closeInstallation{installation};
+  if(!SetEnvironmentVariableW(L"QRAZY_TRANSITION_BOOTSTRAP_ROOT",folder.c_str()))return 1;
+#endif
   const std::wstring runtime = folder + L"\\runtime";
   const std::wstring executable = runtime + L"\\electron.exe";
   PreferHighPerformanceGpu(self);

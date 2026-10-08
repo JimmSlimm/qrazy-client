@@ -14,6 +14,7 @@
     "start": "electron .",
     "build": "node src/build.cjs",
     "build:linux": "node src/build.cjs --linux",
+    "build:linux:appimage": "node src/build.cjs --linux --linux-format=appimage",
     "build:installer": "node src/build-installer.cjs"
   },
   "devDependencies": {

@@ -11,3 +11,6 @@ src/native/bin/
 src/distribute.cjs
 src/release.cjs
 src/package-windows.py
+src/sdlcef/**/build*/
+src/sdlcef/**/deps/
+src/sdlcef/**/__pycache__/

@@ -103,9 +103,19 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
       const body = document.createElement('tbody'); table.append(body);
       rows.forEach(row => {
         const tr = document.createElement('tr'); body.append(tr);
+        const watching = data.mode === 'Spectating' && row.watching;
+        const self = ['Multiplayer', 'Solo'].includes(data.mode) && row.you;
+        const highlight = watching ? 'WATCHING' : self ? 'YOU' : null;
+        if (highlight) {
+          tr.style.cssText = 'background:#34301e;box-shadow:inset 3px 0 #fbbf24';
+          tr.setAttribute('aria-label', `${row.name} — ${highlight}`);
+        }
         [row.name, row.pb || '\u2014', row.sessionBest || '\u2014', row.ping || '\u2014'].forEach((cell, i) => {
           const td = add(tr, 'td', i === 0 ? '' : cell, `text-align:${i ? 'right' : 'left'};padding:8px 12px;border-bottom:1px solid #26354b;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;${i ? 'white-space:nowrap' : ''}`);
-          if (i === 0) coloredName(td, row);
+          if (i === 0) {
+            coloredName(td, row);
+            if (highlight) add(td, 'div', highlight, 'font-size:11px;font-weight:900;letter-spacing:1px;color:#0b1424;background:#fbbf24;border-radius:3px;padding:1px 6px;display:inline-block;margin-top:4px');
+          }
           if (i === 1 && row.pb && row.pb !== '\u2014') comparison(td, row.pbWrComparison);
           if (i === 2 && row.sessionBest && row.sessionBest !== '\u2014') comparison(td, row.sessionWrComparison);
         });
@@ -137,7 +147,7 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
       const rows = value.leaderboard.rows.map(r => ({rank: infoText(r.rank, 12), name: infoText(r.name, 64), time: infoText(r.time, 48)}));
       const players = value.multiplayer.rows.map(r => ({name: infoText(r.name, 64), status: infoText(r.status, 32), detail: infoText(r.detail, 64), ping: infoText(r.ping, 16)}));
       const clan = r => ({clanTag: infoText(r.clanTag, 192), clanOfficial: r.clanOfficial === true, coloredBaseName: infoText(r.coloredBaseName, 192)});
-      const player = r => ({...clan(r), coloredName: infoText(r.coloredName, 192), pbWrComparison: infoText(r.pbWrComparison, 32), sessionWrComparison: infoText(r.sessionWrComparison, 32), name: infoText(r.name, 96), pb: infoText(r.pb, 48), sessionBest: infoText(r.sessionBest, 48), ping: infoText(r.ping, 16)});
+      const player = r => ({...clan(r), watching: r.watching === true, you: r.you === true, coloredName: infoText(r.coloredName, 192), pbWrComparison: infoText(r.pbWrComparison, 32), sessionWrComparison: infoText(r.sessionWrComparison, 32), name: infoText(r.name, 96), pb: infoText(r.pb, 48), sessionBest: infoText(r.sessionBest, 48), ping: infoText(r.ping, 16)});
       const legacy = !Array.isArray(value.multiplayer.groups);
       let groups, spectators;
       if (legacy) {

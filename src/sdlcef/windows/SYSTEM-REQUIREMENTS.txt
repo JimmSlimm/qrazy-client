@@ -1,0 +1,15 @@
+Qrazy SDL3/CEF Windows x64 client.
+Requires supported Windows x64, D3D11 hardware/driver and Chromium sandbox.
+Keep the whole distribution together; launch the root Qrazy.exe.
+Persistent profile: profile-sdlcef-windows. Windows transition requires a signed
+intermediate Electron delivery and deployed handoff service; acceptance is pending.
+Completed QAS1 maps/PK3s, sounds, shaders and textures can be verified and copied
+from Electron storage. Existing originals and conflicting files are preserved.
+Asset storage: 16 GiB combined per profile, plus 1 GiB free-space reserve.
+Updates require an explicit Update click, authenticated stable release, confirmation,
+successful shutdown and manual relaunch. One installed runtime; no retained rollback.
+Launcher/helper/trust-root upgrades require a complete distribution replacement.
+During initial transition, Electron recovery remains until authentication and
+cookie flush succeed. Interrupted transitions can restore the previous client.
+No telemetry or automatic update checks. Runtime compatibility and migration
+acceptance must be completed before a player release.

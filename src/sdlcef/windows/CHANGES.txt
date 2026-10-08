@@ -1,0 +1,9 @@
+Windows SDL3/CEF client candidate for review. No player release is declared.
+Native launcher, persistent profile, physical keyboard mapping, maximized startup,
+window/executable icons, bottom-left Quit and singleton Client panel.
+Diagnostics are collapsed. Nominal monitor refresh target is rounded (240 Hz
+monitors target 240); this does not guarantee instantaneous displayed FPS.
+Authenticated stable runtime updates are explicit and require confirmation.
+Windows transition source includes signed full-distribution replacement,
+authenticated in-memory session handoff, verified completed-download copying
+and interrupted-install recovery. Live migration acceptance remains pending.

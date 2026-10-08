@@ -8,6 +8,10 @@ async function build() {
   const electronZip = argument('--electron-zip');
   const elfReader = argument('--elf-reader') || 'readelf';
   const python = argument('--python');
+  const linuxFormat = argument('--linux-format') || 'tar.gz';
+  if (!['tar.gz', 'appimage'].includes(linuxFormat)) throw new Error('Linux format must be tar.gz or appimage');
+  if (platform === 'linux' && linuxFormat === 'appimage' && (!python || !argument('--appimage-runtime') || !argument('--appimage-runtime-sha256') || !argument('--mksquashfs')))
+    throw new Error('AppImage requires --python, --appimage-runtime, --appimage-runtime-sha256 and --mksquashfs.');
   if (!['linux', 'win32'].includes(platform) || process.arch !== 'x64') throw new Error('Build requires Windows x64 or Linux x64.');
   if (platform !== process.platform && !(platform === 'linux' && crossNative && electronZip && python))
     throw new Error('Cross-packaging Linux requires a cross-compiled Linux x64 --native-input, original --electron-zip, --elf-reader and --python for Unix permission preservation. Otherwise build on Linux x64.');
@@ -17,13 +21,24 @@ async function build() {
     if (header.length !== 20 || !header.subarray(0, 4).equals(Buffer.from([127, 69, 76, 70])) || header[4] !== 2 || header[5] !== 1 || header.readUInt16LE(18) !== 62)
       throw new Error('Native input must be a Linux x86-64 ELF binary, never a Windows addon or source placeholder.');
   }
-  const launcher = platform === 'win32' ? require('./native/build.cjs').buildLauncher() : null;
+  const transitionBootstrap = process.argv.includes('--transition-bootstrap');
+  if (transitionBootstrap && platform !== 'win32') throw new Error('Transition bootstrap is Windows-only');
+  const transitionEnvelope=argument('--transition-envelope');
+  if(transitionBootstrap&&!transitionEnvelope)throw new Error('Transition delivery requires the selected signed full-distribution --transition-envelope');
+  if(transitionEnvelope) {
+    if(!transitionBootstrap)throw new Error('Transition envelope requires --transition-bootstrap');
+    const key=await fs.readFile(path.join(__dirname,'sdlcef/release-public.pem'));
+    require('./sdlcef/distribution.cjs').verify(await fs.readFile(transitionEnvelope),key);
+    if(path.basename(transitionEnvelope)!=='qrazy-transition.json')throw new Error('Selected envelope resource must be named qrazy-transition.json');
+  }
+  const launcher = platform === 'win32' ? require('./native/build.cjs').buildLauncher(transitionBootstrap) : null;
+  const handoffBroker = transitionBootstrap ? require('./native/build.cjs').buildHandoffBroker() : null;
   const { packager } = await import('@electron/packager');
   const { flipFuses, FuseVersion, FuseV1Options: F } = await import('@electron/fuses');
   const outputs = await packager({
     dir: path.resolve(__dirname, '..'), name: 'Qrazy', platform, arch: 'x64',
     out: path.resolve(__dirname, '../dist'), overwrite: true, asar: true, prune: true,
-    extraResource: [nativeExe],
+    extraResource: [nativeExe, ...(handoffBroker ? [handoffBroker, path.resolve(transitionEnvelope)] : [])],
     ...(electronZip ? { electronZipDir: path.dirname(path.resolve(electronZip)) } : {}),
     ignore: [/^\/(?!src(?:\/|$)|package\.json$|package-lock\.json$|LICENSE$)/, /^\/src\/native\/bin(?:\/|$)/]
   });
@@ -87,7 +102,13 @@ async function build() {
         '\n\nAlso requires a working desktop, graphics drivers, fonts, and Chromium sandbox support. See LINUX-SUPPORT.txt. No distro has been runtime-certified by this build script.\n');
     }
     await fs.copyFile(path.resolve(__dirname, '../LICENSE'), path.join(output, 'LICENSE'));
-    if (platform === 'linux') {
+    if (platform === 'linux' && linuxFormat === 'appimage') {
+      execFileSync(python, [path.join(__dirname, 'package-appimage.py'), '--root', output,
+        '--runtime', argument('--appimage-runtime'), '--runtime-sha256', argument('--appimage-runtime-sha256'),
+        '--mksquashfs', argument('--mksquashfs'), '--out', path.join(path.dirname(output), 'Qrazy-linux-x64.AppImage'),
+        ...(electronZip ? ['--electron-zip', electronZip] : [])], { stdio: 'inherit', windowsHide: true });
+    }
+    if (platform === 'linux' && linuxFormat === 'tar.gz') {
       const archive = path.join(path.dirname(output), 'Qrazy-linux-x64.tar.gz');
       const temporary = archive + '.tmp';
       if (process.platform === 'linux') execFileSync('tar', ['-czf', temporary, '-C', path.dirname(output), path.basename(output)], { stdio: 'inherit' });

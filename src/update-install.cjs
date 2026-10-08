@@ -3,6 +3,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const quote = value => "'" + value.replace(/'/g, "'\\''") + "'";
 function linuxScript(plan) {
+  if (plan.appImage) return appImageScript(plan);
   const checks = plan.files.map(file => `test "$(sha256sum -- ${quote(path.posix.join(plan.stage, file.path))} | cut -d ' ' -f 1)" = ${quote(file.sha256)} || fail 'Staged update failed verification'`).join('\n');
   return `#!/bin/sh
 set -eu
@@ -21,6 +22,7 @@ fail() {
   if [ "$installed" = 0 ]; then "$root/Qrazy" >/dev/null 2>&1 & fi
   exit 1
 }
+
 count=0
 while kill -0 ${plan.pid} 2>/dev/null; do
   count=$((count + 1)); [ "$count" -lt 120 ] || fail 'Client did not close'; sleep 1
@@ -36,6 +38,45 @@ mv -- "$stage" "$root" || fail 'Could not install update'
 installed=1
 report '{"phase":"installed","message":"Client updated. The previous folder is retained for recovery."}'
 "$root/Qrazy" >/dev/null 2>&1 &
+`;
+}
+function appImageScript(plan) {
+  if (plan.files.length !== 1 || plan.files[0].path !== 'Qrazy-linux-x64.AppImage') throw new Error('Invalid AppImage install inventory');
+  return `#!/bin/sh
+set -eu
+image=${quote(plan.appImage)}
+stage=${quote(plan.stage)}
+next=${quote(path.posix.join(plan.stage, plan.files[0].path))}
+backup=${quote(plan.backup)}
+result=${quote(plan.result)}
+moved=0
+report() { printf '%s\\n' "$1" > "$result"; }
+fail() {
+  if [ "$moved" = 1 ]; then
+    if ! mv -- "$backup" "$image"; then report '{"phase":"error","message":"AppImage recovery needs manual attention. The previous image is retained beside the download."}'; exit 1; fi
+  fi
+  report '{"phase":"error","message":"AppImage update failed. Your previous client and profile have been kept."}'
+  "$image" >/dev/null 2>&1 &
+  exit 1
+}
+count=0
+while kill -0 ${plan.pid} 2>/dev/null; do
+  count=$((count + 1)); [ "$count" -lt 120 ] || fail; sleep 1
+done
+command -v sha256sum >/dev/null || fail
+[ -f "$image" ] && [ ! -L "$image" ] && [ -f "$next" ] && [ ! -L "$next" ] || fail
+[ ! -e "$backup" ] && [ ! -L "$backup" ] || fail
+[ -z "$(find "$stage" -type l -print -quit)" ] || fail
+[ "$(sha256sum -- "$next" | cut -d ' ' -f 1)" = ${quote(plan.files[0].sha256)} ] || fail
+chmod 755 -- "$next" || fail
+mv -- "$image" "$backup" || fail
+moved=1
+mv -- "$next" "$image" || fail
+moved=0
+rmdir -- "$stage" || true
+report '{"phase":"installed","message":"Client updated. The previous AppImage is retained beside it for recovery."}'
+unset APPIMAGE APPDIR ARGV0 OWD
+"$image" >/dev/null 2>&1 &
 `;
 }
 async function startWindowsHelper(executable, args, directory, timeout = 15000) {
@@ -90,9 +131,11 @@ async function startInstaller(updater) {
     const child = await startWindowsHelper(executable, args, updater.directory);
     child.unref(); return;
   }
-  const child = spawn(executable, args, { detached: true, stdio: 'ignore', windowsHide: true, cwd: updater.directory });
+  const helperEnv = { ...process.env };
+  if (plan.appImage) for (const name of ['APPIMAGE', 'APPDIR', 'ARGV0', 'OWD']) delete helperEnv[name];
+  const child = spawn(executable, args, { detached: true, stdio: 'ignore', windowsHide: true, cwd: updater.directory, env: helperEnv });
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   child.unref();
 }
-module.exports = { startInstaller, startWindowsHelper, linuxScript };
+module.exports = { startInstaller, startWindowsHelper, linuxScript, appImageScript };
 

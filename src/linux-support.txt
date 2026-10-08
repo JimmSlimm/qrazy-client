@@ -1,16 +1,28 @@
 Qrazy Linux x64 portable client
 
-Extract the entire tar.gz with tar -xzf, keep the folder together, and run
-./Qrazy from Qrazy-linux-x64. The package includes Electron, client code,
+Recommended download: Qrazy-linux-x64.AppImage. Allow execution in your file
+manager's Properties, or run chmod +x Qrazy-linux-x64.AppImage, then open it.
+AppImage uses FUSE; if unavailable, run ./Qrazy-linux-x64.AppImage
+--appimage-extract-and-run. Qrazy automatically creates a hidden application
+entry for desktop portal identification; it preserves existing custom entries
+and does not create a visible desktop shortcut. To remove the client, delete
+the AppImage; saved profile data remains in your user configuration directory.
+In-client updates replace the AppImage in its writable download folder and
+retain the previous image beside it for recovery. Saved login/settings/assets
+use the same profile. Manual updates can replace the downloaded file too.
+
+Optional archive: extract the entire tar.gz with tar -xzf, keep the folder
+together, and run ./Qrazy from Qrazy-linux-x64. The package includes Electron, client code,
 native input helper, Electron/Chromium licenses and client MIT license.
 Players do not need Node, npm, a compiler or a separate Electron installation.
 Do not run as root. Do not add --no-sandbox or change /dev/input permissions.
 
 Native backend scope: Xorg (X11), XInput2 >= 2.1, relative devices exposing
 Rel X and Rel Y valuators. Wayland and XWayland native input are unsupported.
-The Linux client uses Electron's X11 window backend. In Wayland sessions with
-XWayland installed, the game's browser pointer-lock fallback may be available.
-That fallback is NOT this native input backend. No native Wayland claim.
+The AppImage selects Electron's native Wayland window backend before startup
+in Wayland sessions, and X11 in Xorg sessions. The main process does not override
+that selection. Wayland uses the game's browser pointer-lock input; it is NOT
+the native XI2 input backend. Native Wayland mouse capture remains unsupported.
 An Xorg session is required for the native feature; no desktop environment
 or distribution has been real-device verified on the Windows development host.
 
@@ -37,17 +49,22 @@ and preserves nondecreasing sample order. No latency/performance claim.
 System requirements: Linux x86-64 desktop with system libX11/libXi, Electron's
 GTK/NSS/ALSA/graphics dependencies and working drivers. SYSTEM-REQUIREMENTS.txt
 lists actual packaged ELF symbol requirements and library names. The minimum
-distro release has not been established by runtime testing. A tar.gz does not
+distro release has not been established by runtime testing. Packaging does not
 make glibc, libstdc++, graphics drivers or system libraries portable. Start with
 a current supported distro and check the recorded ELF requirements.
 Chromium sandbox must work under the distro's user-namespace/security policy.
-This archive does not install a root-owned setuid sandbox. Systems that forbid
+Neither format installs a root-owned setuid sandbox. Systems that forbid
 the required unprivileged sandbox mechanism may refuse to launch; do not work
 around that by disabling the sandbox.
 
 Source builders need Node >=22.12, npm, C++17 compiler, pkg-config, libX11/libXi
 development headers, binutils/readelf and tar. On Linux x64: npm ci, then
 npm run build:linux. Output: dist/Qrazy-linux-x64 and dist/Qrazy-linux-x64.tar.gz.
+Archive packaging remains available with --linux-format=tar.gz (the default).
+For AppImage, pass --linux-format=appimage --python=/path/to/python3
+--appimage-runtime=/path/to/runtime-x86_64 --appimage-runtime-sha256=SHA256
+--mksquashfs=/path/to/mksquashfs. Output: dist/Qrazy-linux-x64.AppImage.
+Use an official AppImage type-2 x86-64 runtime and verify/pin its SHA-256.
 No system software installation or publishing is performed by these scripts.
 
 Native Wayland limitation: relative-pointer and pointer-constraints protocols

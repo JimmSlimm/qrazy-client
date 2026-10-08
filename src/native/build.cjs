@@ -1,15 +1,17 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-function compile(sourceName, executableName, windows = false, addon = false) {
+function compile(sourceName, executableName, windows = false, addon = false, transition = false) {
   if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('Native input currently requires Windows x64.');
   const output = path.join(__dirname, 'bin');
   const source = path.join(__dirname, sourceName);
   const exe = path.join(output, executableName);
   const resource = path.join(__dirname, 'launcher.rc');
   const icon = path.join(__dirname, '../assets/qrazy.ico');
-  const inputs = [source, __filename, ...(windows ? [resource, icon] : [])];
-  if (fs.existsSync(exe) && fs.statSync(exe).mtimeMs >= Math.max(...inputs.map(file => fs.statSync(file).mtimeMs))) return exe;
+  const inputs = [source, __filename, ...(sourceName === 'handoff-broker.cpp' ? ['handoff_broker.h','handoff_receiver.h','handoff_image.h','handoff_pipe.h'].map(name => path.join(__dirname,'../sdlcef/windows',name)) : []), ...(windows ? [resource, icon, path.join(__dirname, 'transition-bootstrap.h')] : [])];
+  const optionsFile = exe + '.options.json';
+  const options = JSON.stringify({ transition, handoff:sourceName==='handoff-broker.cpp' });
+  if (fs.existsSync(exe) && fs.existsSync(optionsFile) && fs.readFileSync(optionsFile, 'utf8') === options && fs.statSync(exe).mtimeMs >= Math.max(...inputs.map(file => fs.statSync(file).mtimeMs))) return exe;
   const vswhere = path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft Visual Studio/Installer/vswhere.exe');
   let installation;
   try { installation = execFileSync(vswhere, ['-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'], { encoding: 'utf8', windowsHide: true }).trim(); } catch {}
@@ -19,8 +21,9 @@ function compile(sourceName, executableName, windows = false, addon = false) {
   const batch = path.join(output, 'compile.cmd');
   const resourceOutput = path.join(output, 'launcher.res');
   const resourceCommand = windows ? `pushd "${__dirname}"\r\nrc /nologo /fo "${resourceOutput}" "${resource}"\r\nif errorlevel 1 exit /b 1\r\npopd\r\n` : '';
-  fs.writeFileSync(batch, `@echo off\r\ncall "${setup}" >nul\r\nif errorlevel 1 exit /b 1\r\n${resourceCommand}cl /nologo /std:c++17 /EHsc /O2 /MT /W4 ${addon ? '/LD' : ''} "${source}" ${windows ? `"${resourceOutput}"` : ''} /Fo"${path.join(output, sourceName + '.obj')}" /Fe"${exe}" /link user32.lib ${windows ? 'advapi32.lib /SUBSYSTEM:WINDOWS' : ''}\r\n`);
+  fs.writeFileSync(batch, `@echo off\r\ncall "${setup}" >nul\r\nif errorlevel 1 exit /b 1\r\n${resourceCommand}cl /nologo /std:c++17 /EHsc /O2 /MT /W4 ${transition ? '/DQRAZY_TRANSITION_BOOTSTRAP=1' : ''} ${addon ? '/LD' : ''} "${source}" ${windows ? `"${resourceOutput}"` : ''} /Fo"${path.join(output, sourceName + '.obj')}" /Fe"${exe}" /link user32.lib ${windows ? 'advapi32.lib /SUBSYSTEM:WINDOWS' : ''}\r\n`);
   execFileSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', 'compile.cmd'], { cwd: output, stdio: 'inherit', windowsHide: true });
+  fs.writeFileSync(optionsFile, options);
   return exe;
 }
 function buildNative() {
@@ -38,6 +41,7 @@ function buildNative() {
   fs.chmodSync(temporary, 0o755); fs.renameSync(temporary, output);
   return output;
 }
-function buildLauncher() { return compile('launcher.cpp', 'Qrazy.exe', true); }
-module.exports = { buildNative, buildLauncher };
+function buildLauncher(transition = false) { return compile('launcher.cpp', 'Qrazy.exe', true, false, transition); }
+function buildHandoffBroker() { return compile('handoff-broker.cpp', 'qrazy-handoff.node', false, true); }
+module.exports = { buildNative, buildLauncher, buildHandoffBroker };
 if (require.main === module) buildNative();

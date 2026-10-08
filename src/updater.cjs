@@ -21,52 +21,7 @@ async function hashBytes(bytes) {
   }
   return digest.digest('hex');
 }
-function versionParts(value) {
-  if (typeof value !== 'string' || !/^\d{1,6}\.\d{1,6}\.\d{1,6}$/.test(value)) throw new Error('Invalid stable version');
-  return value.split('.').map(Number);
-}
-function newer(a, b) {
-  const aa = versionParts(a), bb = versionParts(b);
-  for (let i = 0; i < 3; i++) if (aa[i] !== bb[i]) return aa[i] > bb[i];
-  return false;
-}
-function validPath(value, platform) {
-  if (typeof value !== 'string' || value.length > 240 || !/^[a-zA-Z0-9_. /-]+$/.test(value)) return false;
-  const parts = value.split('/');
-  if (parts.some(p => !p || p === '.' || p === '..' || /[. ]$/.test(p) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(p))) return false;
-  if (platform === 'win32-x64') return value === 'Qrazy.exe' || value === 'LICENSE' || value.startsWith('runtime/');
-  return ['Qrazy', 'LICENSE', 'LICENSE.electron', 'LICENSES.chromium.html', 'LINUX-SUPPORT.txt', 'SYSTEM-REQUIREMENTS.txt', 'chrome-sandbox', 'chrome_crashpad_handler', 'chrome_100_percent.pak', 'chrome_200_percent.pak', 'icudtl.dat', 'resources.pak', 'snapshot_blob.bin', 'v8_context_snapshot.bin', 'vk_swiftshader_icd.json', 'version'].includes(value) || /^(locales\/[^/]+\.pak|resources\/(app\.asar|qrazy-input-x11)|[^/]+\.so(?:\.\d+)*)$/.test(value);
-}
-function verifyManifest(envelope, config, platform) {
-  if (!config.publicKey) throw new Error('Update signing key is not configured');
-  if (!envelope || typeof envelope.payload !== 'string' || typeof envelope.signature !== 'string' || envelope.payload.length > 3 * 1024 * 1024) throw new Error('Invalid update manifest');
-  const bytes = Buffer.from(envelope.payload, 'base64');
-  if (!crypto.verify(null, bytes, config.publicKey, Buffer.from(envelope.signature, 'base64'))) throw new Error('Update signature is invalid');
-  const manifest = JSON.parse(bytes.toString('utf8'));
-  versionParts(manifest.version);
-  if (![1, 2].includes(manifest.schema) || typeof manifest.notes !== 'string' || manifest.notes.length > 8000) throw new Error('Unsupported update manifest');
-  if (manifest.schema === 2 && (!manifest.bundle || manifest.bundle.dataStart !== DATA_START || !Number.isSafeInteger(manifest.bundle.dataSize) || manifest.bundle.dataSize < 1 || manifest.bundle.dataSize > 2 * MAX_BYTES || typeof manifest.bundle.url !== 'string')) throw new Error('Invalid update package inventory');
-  const files = manifest.platforms?.[platform];
-  if (!Array.isArray(files) || !files.length || files.length > 4096) throw new Error('No update for this platform');
-  let total = 0; const names = new Set();
-  for (const file of files) {
-    if (!validPath(file.path, platform) || names.has(file.path.toLowerCase())) throw new Error('Unsafe or duplicate update path');
-    names.add(file.path.toLowerCase());
-    for (const field of ['size', 'downloadSize']) if (!Number.isSafeInteger(file[field]) || file[field] < 1 || file[field] > MAX_BYTES) throw new Error('Invalid update size');
-    for (const field of ['sha256', 'downloadSha256']) if (!/^[a-f0-9]{64}$/.test(file[field])) throw new Error('Invalid update hash');
-    const url = new URL(file.url);
-    if (!file.url.startsWith(config.assetPrefix) || url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !/^[a-zA-Z0-9._/-]+$/.test(url.pathname)) throw new Error('Untrusted update URL');
-    if (manifest.schema === 2 && (file.url !== manifest.bundle.url || !Number.isSafeInteger(file.offset) || file.offset < 0 || file.offset + file.downloadSize > manifest.bundle.dataSize)) throw new Error('Invalid update package range');
-    if (![0o644, 0o755].includes(file.mode)) throw new Error('Invalid update permissions');
-    total += file.size;
-  }
-  if (total > MAX_BYTES || !names.has(platform === 'win32-x64' ? 'runtime/resources/app.asar' : 'resources/app.asar') || !names.has(platform === 'win32-x64' ? 'qrazy.exe' : 'qrazy')) throw new Error('Incomplete or oversized update');
-  const required = platform === 'win32-x64' ? ['runtime/electron.exe', 'runtime/resources/qrazy-input.node'] : ['resources/qrazy-input-x11', 'chrome-sandbox'];
-  if (required.some(name => !names.has(name))) throw new Error('Incomplete update runtime');
-  if (platform === 'linux-x64' && files.some(file => ['Qrazy', 'chrome-sandbox', 'chrome_crashpad_handler', 'resources/qrazy-input-x11'].includes(file.path) && file.mode !== 0o755)) throw new Error('Linux executables must be executable');
-  for (const name of names) if ([...names].some(other => other.startsWith(name + '/'))) throw new Error('Conflicting update paths');
-  return { version: manifest.version, notes: manifest.notes, files, ...(manifest.schema === 2 ? { bundle: manifest.bundle } : {}) };
-}
+const {verifyManifest,validPath,newer}=require('./sdlcef/legacy-release.cjs');
 async function noLinks(root, relative = '') {
   let current = path.resolve(root);
   // Check ancestors too: an installation redirected through a junction is unsafe.
@@ -92,13 +47,16 @@ async function readBounded(response, limit, progress = () => {}) {
   return Buffer.concat(chunks);
 }
 class Updater {
-  constructor({ root, directory, version, platform, config, fetch, requestRange = rangeRequest, allUsers = false, notify = () => {} }) {
-    Object.assign(this, { root, directory, version, platform, config, fetch, requestRange, allUsers, notify });
+  constructor({ root, directory, version, platform, config, fetch, requestRange = rangeRequest, allUsers = false, appImage = null, notify = () => {} }) {
+    if (platform === 'linux-appimage-x64' && !appImage) throw new Error('AppImage update location is required');
+    if (appImage && (platform !== 'linux-appimage-x64' || !path.isAbsolute(appImage) || path.dirname(appImage) !== path.resolve(root))) throw new Error('Invalid AppImage update location');
+    Object.assign(this, { root, directory, version, platform, config, fetch, requestRange, allUsers, appImage, notify });
     this.state = { phase: config.publicKey ? 'idle' : 'unconfigured', installedVersion: version, message: config.publicKey ? '' : 'Updates are being prepared for the first release.' };
     this.busy = false;
   }
   getState() { return { ...this.state, requiresAdmin: this.allUsers }; }
-  stagingParent() { return this.allUsers ? this.directory : path.dirname(path.resolve(this.root)); }
+  stagingParent() { return this.appImage ? this.root : this.allUsers ? this.directory : path.dirname(path.resolve(this.root)); }
+  installedFile(file) { return this.appImage ? noLinks(this.appImage) : noLinks(this.root, file.path); }
   setState(value) { this.state = { installedVersion: this.version, ...value }; this.notify(this.getState()); return this.getState(); }
   async discardStage() {
     if (!this.stage) return;
@@ -112,9 +70,36 @@ class Updater {
     try {
       if ((await fs.stat(pendingPath)).size > 4 * 1024 * 1024) throw new Error('Invalid pending update');
       const pending = JSON.parse(await fs.readFile(pendingPath, 'utf8'));
-      if (path.resolve(pending.root) !== path.resolve(this.root)) return this.getState();
+      if (path.resolve(pending.root) !== path.resolve(this.root) || (pending.appImage || null) !== this.appImage) return this.getState();
       const release = verifyManifest(pending.envelope, this.config, this.platform);
-      if (!newer(release.version, this.version)) { await fs.unlink(pendingPath); return this.getState(); }
+      if (!newer(release.version, this.version)) {
+        if (this.platform === 'win32-x64' && release.version === this.version) {
+          // The legacy helper leaves this signed envelope in userData. Preserve
+          // only authenticated delivery metadata for the intermediate client's
+          // automatic continuation before normal pending-update cleanup.
+          try {
+            for (const file of release.files) {
+              const target = await this.installedFile(file);
+              if (!(await fs.stat(target)).isFile() || (await fs.stat(target)).size !== file.size || await hashFile(target) !== file.sha256) throw new Error('Installed delivery changed');
+            }
+            const record = path.join(this.directory, 'installed-delivery.json');
+            await noLinks(this.directory, 'installed-delivery.json');
+            await noLinks(this.directory, 'installed-delivery.json.tmp');
+            try { if (!(await fs.lstat(record + '.tmp')).isFile()) throw new Error('Unsafe delivery metadata temporary'); await fs.unlink(record + '.tmp'); }
+            catch (error) { if (error.code !== 'ENOENT') throw error; }
+            const output = await fs.open(record + '.tmp', 'wx', 0o600);
+            try {
+              await output.writeFile(JSON.stringify({ schema: 'qrazy-electron-installed-delivery-v1', root: this.root,
+                envelope: { payload: pending.envelope.payload, signature: pending.envelope.signature } }));
+              await output.sync();
+            } finally { await output.close(); }
+            await fs.rename(record + '.tmp', record);
+          } catch {
+            return this.setState({ phase: 'error', message: 'The installed Electron delivery could not be verified. Its signed update record is retained for recovery.' });
+          }
+        }
+        await fs.unlink(pendingPath); return this.getState();
+      }
       const stage = path.resolve(pending.stage);
       if (path.dirname(stage) !== path.resolve(this.stagingParent()) || !/^\.qrazy-update-[a-zA-Z0-9]+$/.test(path.basename(stage))) throw new Error('Invalid pending update folder');
       await noLinks(stage);
@@ -147,7 +132,7 @@ class Updater {
       this.envelope = envelope;
       const changed = [];
       for (const file of release.files) {
-        const target = await noLinks(this.root, file.path);
+        const target = await this.installedFile(file);
         let same = false;
         try { const stat = await fs.stat(target); same = stat.isFile() && stat.size === file.size && await hashFile(target) === file.sha256; }
         catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -177,7 +162,7 @@ class Updater {
         const target = path.join(this.stage, ...file.path.split('/'));
         await fs.mkdir(path.dirname(target), { recursive: true });
         if (!this.changed.has(file.path)) {
-          const source = await noLinks(this.root, file.path);
+          const source = await this.installedFile(file);
           await fs.copyFile(source, target, require('node:fs').constants.COPYFILE_EXCL);
           if ((await fs.stat(target)).size !== file.size || await hashFile(target) !== file.sha256) throw new Error('Existing file changed; check for updates again');
         } else {
@@ -203,7 +188,7 @@ class Updater {
       }
       await fs.mkdir(this.directory, { recursive: true });
       const pending = path.join(this.directory, 'pending.json');
-      await fs.writeFile(pending + '.tmp', JSON.stringify({ root: this.root, stage: this.stage, envelope: this.envelope, downloadBytes: previous.downloadBytes }), { mode: 0o600 });
+      await fs.writeFile(pending + '.tmp', JSON.stringify({ root: this.root, appImage: this.appImage, stage: this.stage, envelope: this.envelope, downloadBytes: previous.downloadBytes }), { mode: 0o600 });
       await fs.rename(pending + '.tmp', pending);
       return this.setState({ ...previous, phase: 'ready', downloadedBytes: downloaded, message: 'Client update verified and ready to install. Your saved login, settings and downloaded assets will be kept.' });
     } catch (error) {
@@ -217,6 +202,10 @@ class Updater {
     if (this.busy || this.state.phase !== 'ready' || !this.stage) throw new Error('Download and verify an update first');
     try {
       await noLinks(this.root); await noLinks(this.stage);
+      if (this.appImage) {
+        await noLinks(this.appImage);
+        if (!(await fs.stat(this.appImage)).isFile()) throw new Error('Installed AppImage is missing');
+      }
       for (const file of this.release.files) {
         const target = await noLinks(this.stage, file.path);
         if ((await fs.stat(target)).size !== file.size || await hashFile(target) !== file.sha256) throw new Error('Staged update changed');
@@ -229,8 +218,12 @@ class Updater {
     }
     await fs.mkdir(this.directory, { recursive: true });
     const token = crypto.randomBytes(12).toString('hex');
-    const backup = path.join(path.dirname(this.root), '.qrazy-previous-' + token);
-    const plan = { root: this.root, stage: this.stage, backup, version: this.release.version, pid, parentPid, files: this.release.files.map(({ path, sha256 }) => ({ path, sha256 })), result: path.join(this.directory, 'result.json'), ...(process.platform === 'win32' ? { helperReady: true } : {}), ...(this.allUsers ? { envelope: this.envelope, jobToken: token } : {}) };
+    const backup = path.join(this.appImage ? this.root : path.dirname(this.root), '.qrazy-previous-' + token + (this.appImage ? '.AppImage' : ''));
+    const plan = { root: this.root, stage: this.stage, backup, ...(this.appImage ? { appImage: this.appImage } : {}), version: this.release.version, pid, parentPid, files: this.release.files.map(({ path, sha256 }) => ({ path, sha256 })), result: path.join(this.directory, 'result.json'), ...(process.platform === 'win32' ? { helperReady: true } : {}), ...(this.allUsers ? { envelope: this.envelope, jobToken: token } : {}) };
+    // Applies only to helpers delivered with this source. Published clients
+    // still start their replacement launcher; a transition bootstrap must
+    // suppress that runtime start independently of this new plan field.
+    if (process.platform === 'win32') plan.noRestart = true;
     const planPath = path.join(this.directory, 'plan-' + token + '.json');
     await fs.writeFile(planPath, JSON.stringify(plan), { mode: 0o600, flag: 'wx' });
     return { plan, planPath };
