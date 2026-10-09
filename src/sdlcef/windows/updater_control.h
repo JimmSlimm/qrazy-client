@@ -33,12 +33,12 @@ struct Pins {
 };
 inline std::wstring Quote(const std::wstring& text){if(text.find(L'"')!=std::wstring::npos)return {};return L"\""+text+L"\"";}
 inline bool Helper(const std::filesystem::path& root,const std::wstring& operation,std::string& output,std::atomic<bool>* cancel=nullptr,const std::filesystem::path& controls_root={}) {
-  if(operation!=L"verify"&&operation!=L"state"&&operation!=L"update"&&operation!=L"prepare"&&operation!=L"install"&&operation!=L"transition-peer"&&operation!=L"transition-finish"&&operation!=L"transition-recovery")return false;
+  if(operation!=L"verify"&&operation!=L"check"&&operation!=L"state"&&operation!=L"update"&&operation!=L"prepare"&&operation!=L"install"&&operation!=L"transition-peer"&&operation!=L"transition-finish"&&operation!=L"transition-recovery")return false;
   const auto controls=controls_root.empty()?root:controls_root;
   if(controls!=root&&(operation!=L"transition-recovery"||controls!=root/L".qrazy-transition"/L"next"))return false;
   Pins pins;if(!pins.Check(controls))return false;
   // Node flags and environment are controlled by native startup, never website data.
-  auto exe=controls/L"updater"/L"node.exe";auto script=controls/L"updater"/L"production-runtime.cjs";
+  auto exe=controls/L"updater"/L"node.exe";auto script=operation==L"check"?root/L"runtime"/L"update-notice.cjs":controls/L"updater"/L"production-runtime.cjs";
   std::wstring cmd=Quote(exe.wstring())+L" --use-bundled-ca --no-addons --no-global-search-paths "+Quote(script.wstring())+L" "+operation+L" "+Quote(root.wstring());
   SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE read=nullptr,write=nullptr;if(!CreatePipe(&read,&write,&sa,0))return false;
   SetHandleInformation(read,HANDLE_FLAG_INHERIT,0);

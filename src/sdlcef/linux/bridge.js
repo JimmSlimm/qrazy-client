@@ -181,7 +181,13 @@
     version: 1, supportedKinds: Object.freeze(['map','sound','shader','texture']),
     has: (kind,key) => assetCall('has',[kind,key]),
     openRead: (kind,key) => assetCall('openRead',[kind,key]),
-    async readChunk(token) { const value=await assetCall('readChunk',[token]); const text=atob(value.base64); return {bytes:Uint8Array.from(text,c=>c.charCodeAt(0)),done:value.done}; },
+    async readChunk(token) {
+      const value=await assetCall('readChunk',[token]);
+      const text=atob(value.base64), bytes=new Uint8Array(text.length);
+      // Avoid string iteration and a callback for every byte of cached assets.
+      for(let i=0;i<text.length;i++)bytes[i]=text.charCodeAt(i);
+      return {bytes,done:value.done};
+    },
     closeRead: token => assetCall('closeRead',[token]),
     beginWrite: descriptor => assetCall('beginWrite',[descriptor]),
     writeChunk: (token,bytes) => assetCall('writeChunk',[token,encodeBytes(bytes)]),
@@ -217,17 +223,11 @@
   const validBuild = value => typeof value === 'string' && /^[a-f0-9]{7,40}$/.test(value);
   const combinedState = state => ({...state, gameRefreshNeeded:siteOutdated});
   function renderSiteUpdate() {
-    const menu = document.getElementById('overlay');
-    if (!menu || !siteOutdated) return;
-    siteNotice?.remove();
-    const box = document.createElement('section');
-    box.style.cssText = 'position:fixed;bottom:64px;right:16px;max-width:480px;z-index:2147483646;background:#0b1424;color:#edf2fa;border:2px solid #fbbf24;border-radius:10px;padding:20px;font:16px/1.5 system-ui;box-shadow:0 8px 40px #000b';
-    const title = document.createElement('strong');title.textContent = siteDismissed ? 'Refresh needed' : 'New game version available';title.style.color='#fbbf24';box.append(title);
-    if (!siteDismissed) { const text=document.createElement('p');text.textContent='Until you refresh, some features may not work correctly and runs may be rejected. Refreshing ends the current run and reconnects multiplayer.';box.append(text); }
-    const action = (label, fn) => { const b=document.createElement('button');b.type='button';b.textContent=label;b.style.cssText='width:auto;margin:8px 8px 0 0;padding:10px 14px;font:15px system-ui;letter-spacing:normal';b.onclick=async event=>{event.preventDefault();event.stopPropagation();if(!event.isTrusted||b.disabled)return;b.disabled=true;try{await fn();}catch{b.disabled=false;b.textContent='Retry refresh';}};box.append(b); };
-    action('Refresh game',()=>updates.refreshGame());
-    if (!siteDismissed) action('Keep playing',()=>{siteDismissed=true;renderSiteUpdate();});
-    menu.append(box);siteNotice=box;
+    siteNotice?.remove();siteNotice=null;
+    renderClientNotice();
+    const menu=document.getElementById('overlay');if(!menu||!siteOutdated||!siteDismissed)return;
+    const reminder=document.createElement('button');reminder.type='button';reminder.textContent='Game refresh needed';reminder.style.cssText='position:fixed;bottom:64px;right:16px;z-index:2147483645;width:auto;background:#0b1424;color:#fbbf24;border:1px solid #fbbf24;padding:10px;font:15px system-ui;letter-spacing:normal';
+    reminder.onclick=event=>{event.preventDefault();event.stopPropagation();if(event.isTrusted){siteDismissed=false;renderSiteUpdate();}};menu.append(reminder);siteNotice=reminder;
   }
   async function checkSiteUpdate() {
     if (!loadedBuild || siteBusy || siteOutdated) return;
@@ -262,6 +262,42 @@
     updates.reportLoadedBuild(document.documentElement.dataset.build).catch(()=>{});renderSiteUpdate();
   });
 
+
+  let clientNoticeState=null, clientNoticeDismissed='', clientCheckBusy=false, clientCheckTime=0;
+  async function checkClientNotice() {
+    const menu=document.getElementById('overlay');
+    if(!menu||!menu.getClientRects().length||document.visibilityState==='hidden'||!document.hasFocus()||clientCheckBusy||Date.now()-clientCheckTime<5*60*1000)return;
+    clientCheckBusy=true;clientCheckTime=Date.now();
+    try { const reply=await rpc('update-notice');if(reply.ok&&reply.data){clientNoticeState=reply.data;renderClientNotice();} }
+    catch { /* Offline checks stay quiet; the manual check remains available. */ }
+    finally { clientCheckBusy=false; }
+  }
+  function renderClientNotice() {
+    const menu=document.getElementById('overlay');
+    document.getElementById('qrazy-client-update-notice')?.remove();
+    const state=clientNoticeState,clientAvailable=state&&['available','ready'].includes(state.phase),showClient=clientAvailable&&clientNoticeDismissed!==state.version,showGame=siteOutdated&&!siteDismissed;
+    if(!menu||(!showClient&&!showGame))return;
+    const box=document.createElement('section');box.id='qrazy-client-update-notice';box.setAttribute('role','status');
+    box.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(560px,calc(100% - 64px));max-height:75vh;overflow:auto;z-index:2147483646;background:#0b1424;color:#edf2fa;border:2px solid #fbbf24;border-radius:12px;padding:24px;font:16px/1.5 system-ui;box-shadow:0 12px 60px #000c';
+    const add=(tag,text)=>{const el=document.createElement(tag);el.textContent=text;box.append(el);return el;};
+    add('h2','Updates available').style.cssText='color:#fbbf24;margin-top:0';
+    const action=(label,fn)=>{const b=add('button',label);b.type='button';b.style.cssText='width:auto;margin:8px 12px 0 0;padding:10px 16px;font:16px system-ui;letter-spacing:normal';b.onclick=async event=>{event.preventDefault();event.stopPropagation();if(!event.isTrusted||b.disabled)return;b.disabled=true;try{await fn();}catch(error){add('p',error.message);}finally{b.disabled=false;}};return b;};
+    if(showClient){
+      add('h3','Client update · v'+state.version);
+      add('p','Installed: v'+state.installedVersion+'. Installing closes Qrazy. Reopen it manually afterward; the game will then load the latest site.');
+      if(state.notes)add('pre',state.notes).style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;font:inherit';
+      action(state.phase==='ready'?'Install client update':'Download client update',async()=>{
+        if(state.phase==='ready'){const reply=await rpc('update-install');if(!reply.ok)throw Error(reply.error||'Installation could not start');return;}
+        const reply=await rpc('update-check');if(!reply.ok)throw Error(reply.error||'Download failed');clientNoticeState=reply.data;emit(updateListeners,combinedState(reply.data));renderClientNotice();
+      });
+    }
+    if(showGame){
+      add('h3','Game update');add('p','Refreshing ends the current run and reconnects multiplayer. Until refreshed, some features may not work and runs may be rejected.');
+      action(showClient?'Refresh game only':'Refresh game',()=>updates.refreshGame());
+    }
+    action('Later',()=>{if(showClient)clientNoticeDismissed=state.version;if(showGame)siteDismissed=true;renderSiteUpdate();});
+    menu.append(box);
+  }
 
   function desktopPanel() {
     if (!document.body || document.getElementById('qrazy-prototype-tools')) return;
@@ -298,16 +334,24 @@
       action('Graphics report',async()=>{report.textContent=JSON.stringify((await rpc('diagnostics')).data,null,2);},diagnosticActions);
       action('Copy report',async()=>{if(!report.textContent)return;await rpc('clipboard-write',{text:report.textContent});},diagnosticActions);
       panel.append(diagnostics);menu.append(panel);
-      try{showUpdate((await rpc('update-state')).data);}catch(error){versions.textContent='Installed version unavailable · Next version: not checked';report.textContent=error.message;}
+      try{showUpdate(clientNoticeState&&['available','ready'].includes(clientNoticeState.phase)?clientNoticeState:(await rpc('update-state')).data);}catch(error){versions.textContent='Installed version unavailable · Next version: not checked';report.textContent=error.message;}
     };
     menu.append(button);
+    const observer=new MutationObserver(checkClientNotice);observer.observe(menu,{attributes:true,attributeFilter:['style','class','hidden']});
+    states.add(checkClientNotice);const timer=setInterval(checkClientNotice,30000);window.addEventListener('focus',checkClientNotice);
+    window.addEventListener('pagehide',()=>{clearInterval(timer);observer.disconnect();},{once:true});checkClientNotice();
+    const noticeObserver=new MutationObserver(()=>{checkClientNotice();});noticeObserver.observe(menu,{attributes:true,attributeFilter:['style','class','hidden']});
+    states.add(()=>checkClientNotice());
+    const noticeTimer=setInterval(checkClientNotice,30000);window.addEventListener('focus',checkClientNotice);
+    window.addEventListener('pagehide',()=>{clearInterval(noticeTimer);noticeObserver.disconnect();},{once:true});
+    checkClientNotice();
   }
   window.addEventListener('DOMContentLoaded',desktopPanel,{once:true});
   let next = 0, captured = false, generation = 0, sequence = 0, offset = 0, lastTime = -Infinity;
   function rpc(op, payload = null) {
     const id = ++next;
     return new Promise((resolve, reject) => {
-      const timeout=op==='config-import'||op==='config-export'?310000:op==='update-check'||op==='update-stage'||op==='update-install'||op==='update-rollback'?910000:30000;
+      const timeout=op==='config-import'||op==='config-export'?310000:op==='update-notice'||op==='update-check'||op==='update-stage'||op==='update-install'||op==='update-rollback'?910000:30000;
       const timer = setTimeout(() => { pending.delete(id); reject(new Error('Native host reply timed out')); }, timeout);
       pending.set(id, value => { clearTimeout(timer); if (value?.ok === false && value.error) reject(new Error(value.error)); else resolve(value); });
       try { host(op, id, JSON.stringify(payload)); } catch (e) { clearTimeout(timer); pending.delete(id); reject(e); }

@@ -11,5 +11,6 @@ successful shutdown and manual relaunch. One installed runtime; no retained roll
 Launcher/helper/trust-root upgrades require a complete distribution replacement.
 During initial transition, Electron recovery remains until authentication and
 cookie flush succeed. Interrupted transitions can restore the previous client.
-No telemetry or automatic update checks. Runtime compatibility and migration
+No telemetry. Signed release availability is checked automatically in the menu;
+download and installation remain explicit. Runtime compatibility and migration
 acceptance must be completed before a player release.

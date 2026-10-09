@@ -19,6 +19,7 @@ for item in (a.cef_root/'Resources').iterdir():
     if item.is_dir():shutil.copytree(item,runtime/item.name)
     else:shutil.copyfile(item,runtime/item.name)
 shutil.copyfile(source/'bridge-production.js',runtime/'bridge.js')
+shutil.copyfile(source.parent/'update-notice.cjs',runtime/'update-notice.cjs')
 for name in ('SYSTEM-REQUIREMENTS.txt','CHANGES.txt'):
     shutil.copyfile(source/name,runtime/name)
 licenses=runtime/'licenses';licenses.mkdir()

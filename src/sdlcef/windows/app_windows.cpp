@@ -17,6 +17,7 @@
 #include "include/cef_render_handler.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_download_handler.h"
+#include "../demo_download.h"
 #include "include/cef_dialog_handler.h"
 #include "include/cef_context_menu_handler.h"
 #include "include/cef_sandbox_win.h"
@@ -155,9 +156,9 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       cef_window_open_disposition_t,bool gesture,const CefPopupFeatures&,CefWindowInfo&,CefRefPtr<CefClient>&,CefBrowserSettings&,CefRefPtr<CefDictionaryValue>&,bool*) override {
     OpenWebLink(frame,url,gesture);return true;
   }
-  bool CanDownload(CefRefPtr<CefBrowser>,const CefString&,const CefString&) override{return false;}
-  bool OnBeforeDownload(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem>,const CefString&,CefRefPtr<CefBeforeDownloadCallback>) override{return true;}
-  void OnDownloadUpdated(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem>,CefRefPtr<CefDownloadItemCallback> callback) override{callback->Cancel();}
+  bool CanDownload(CefRefPtr<CefBrowser> value,const CefString& url,const CefString& method) override {return !closing && value && Trusted(value->GetMainFrame()->GetURL()) && method=="GET" && DemoDownload::TrustedBlob(url.ToString());}
+  bool OnBeforeDownload(CefRefPtr<CefBrowser> value,CefRefPtr<CefDownloadItem> item,const CefString& name,CefRefPtr<CefBeforeDownloadCallback> callback) override {if(!closing && !dialog_active && value && Trusted(value->GetMainFrame()->GetURL()) && DemoDownload::TrustedBlob(item->GetOriginalUrl().ToString()) && DemoDownload::ExportName(name.ToString())) {Release("export-save");DemoDownload::Save(window,name.ToString(),callback);}return true;}
+  void OnDownloadUpdated(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem> item,CefRefPtr<CefDownloadItemCallback> callback) override {if(!DemoDownload::TrustedBlob(item->GetOriginalUrl().ToString()))callback->Cancel();}
   bool OnFileDialog(CefRefPtr<CefBrowser>,FileDialogMode,const CefString&,const CefString&,const std::vector<CefString>&,const std::vector<CefString>&,const std::vector<CefString>&,CefRefPtr<CefFileDialogCallback> callback) override{callback->Cancel();return true;}
   void OnTextSelectionChanged(CefRefPtr<CefBrowser>,const CefString& text,const CefRange&) override{selection=text.ToString().substr(0,1048576);}
   void OnImeCompositionRangeChanged(CefRefPtr<CefBrowser>,const CefRange&,const RectList& bounds) override {
@@ -231,18 +232,18 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       result->SetBool("ok",false);result->SetString("error","Desktop storage worker unavailable or busy; normal loading can continue");
     }else if(op=="release"){Release("release");return true;}
     else if(op=="config-import"||op=="config-export") {
-      if(!menu||dialog_active.exchange(true)){result->SetBool("ok",false);result->SetString("error","Config dialogs require a focused menu and no active dialog");Reply(id,result);return true;}
+      if((!menu && !(op=="config-export" && !closing && !recovering && !loading && SDL_GetKeyboardFocus()==window)) || DemoDownload::active || dialog_active.exchange(true)){result->SetBool("ok",false);result->SetString("error","Config dialogs require a focused menu and no active dialog");Reply(id,result);return true;}
       auto selected=new DialogResult{id,asset_worker.epoch.load(),op=="config-export"};
       static const SDL_DialogFileFilter filter={"Qrazy configuration","cfg"};
       if(selected->save){std::string name=d?d->GetString("name"):CefString();selected->text=d?d->GetString("text"):CefString();
         if(name.size()<5||name.size()>100||name.substr(name.size()-4)!=".cfg"||name.find_first_of("/\\\r\n")!=std::string::npos||name.find('\0')!=std::string::npos||selected->text.size()>1048576||selected->text.find('\0')!=std::string::npos){delete selected;dialog_active=false;result->SetBool("ok",false);result->SetString("error","Expected a cfg filename and at most 1 MiB of text");Reply(id,result);return true;}
-        SDL_ShowSaveFileDialog(FileChosen,selected,window,&filter,1,name.c_str());
+        Release("export-save");SDL_ShowSaveFileDialog(FileChosen,selected,window,&filter,1,name.c_str());
       }else SDL_ShowOpenFileDialog(FileChosen,selected,window,&filter,1,nullptr,false);
       return true;
-    }else if(op=="update-state"||op=="update-check"||op=="update-stage"||op=="update-install") {
+    }else if(op=="update-notice"||op=="update-state"||op=="update-check"||op=="update-stage"||op=="update-install") {
       if(!menu){Reply(id,QrazyWindows::Error("Return to the focused menu before updating"));return true;}
-      std::string action=op=="update-state"?"state":op=="update-install"?"prepare":"update";
-      if(action!="state"){
+      std::string action=op=="update-notice"?"check":op=="update-state"?"state":op=="update-install"?"prepare":"update";
+      if(action!="state"&&action!="check"){
         if(!update_gesture||SDL_GetTicksNS()-update_gesture>2'000'000'000ull){Reply(id,QrazyWindows::Error("Click the Update or Install button to continue"));return true;}update_gesture=0;
       }
       if(action=="prepare"){

@@ -1,6 +1,21 @@
 {
   "releases": [
     {
+      "version": "0.4.2",
+      "date": "2026-10-09",
+      "added": [
+        "Automatic client update notices in the menu show the available version and release notes, with Download, Install and Later options."
+      ],
+      "changed": [
+        "Client and game updates now share one notice, with an option to refresh only the game."
+      ],
+      "fixed": [
+        "Restored saving recorded demos, HUD/JSON exports and configuration files, including exports started during gameplay.",
+        "Fixed a Linux connection-retry timer that could show a connection failure after five minutes even when already connected.",
+        "Restored Linux client focus after a successful connection retry so mouse capture can resume without switching windows."
+      ]
+    },
+    {
       "version": "0.4.1",
       "date": "2026-10-09",
       "added": [

@@ -25,6 +25,7 @@
 #include "include/cef_version.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_download_handler.h"
+#include "../demo_download.h"
 #include "include/cef_dialog_handler.h"
 #include "include/cef_context_menu_handler.h"
 #include "desktop_worker.h"
@@ -109,7 +110,7 @@ class Native final : public CefV8Handler {
     if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 3 || !args[2]->IsString() || args[2]->GetStringValue().length()>1500000 ||
         !args[0]->IsString() || !args[1]->IsInt()) { exception = "Unauthorized native bridge call"; return true; }
     const auto op = args[0]->GetStringValue().ToString();
-    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog") {
+    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-notice" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog") {
       exception = "Unknown native operation"; return true;
     }
     auto message = CefProcessMessage::Create("qrazy-command-v1");
@@ -307,11 +308,9 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override { return this; }
   CefRefPtr<CefDialogHandler> GetDialogHandler() override { return this; }
-  // This CEF version has no download initiator origin/frame accessor. Deny
-  // generic downloads/choosers; config uses the exact main-frame bridge below.
-  bool CanDownload(CefRefPtr<CefBrowser>,const CefString&,const CefString&) override { return false; }
-  bool OnBeforeDownload(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem>,const CefString&,CefRefPtr<CefBeforeDownloadCallback>) override { return true; }
-  void OnDownloadUpdated(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem>,CefRefPtr<CefDownloadItemCallback> callback) override { callback->Cancel(); }
+  bool CanDownload(CefRefPtr<CefBrowser> value,const CefString& url,const CefString& method) override {return !closing && value && Trusted(value->GetMainFrame()->GetURL()) && method=="GET" && DemoDownload::TrustedBlob(url.ToString());}
+  bool OnBeforeDownload(CefRefPtr<CefBrowser> value,CefRefPtr<CefDownloadItem> item,const CefString& name,CefRefPtr<CefBeforeDownloadCallback> callback) override {if(!closing && !dialog_active && value && Trusted(value->GetMainFrame()->GetURL()) && DemoDownload::TrustedBlob(item->GetOriginalUrl().ToString()) && DemoDownload::ExportName(name.ToString())) {Release("export-save");DemoDownload::Save(window,name.ToString(),callback);}return true;}
+  void OnDownloadUpdated(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem> item,CefRefPtr<CefDownloadItemCallback> callback) override {if(!DemoDownload::TrustedBlob(item->GetOriginalUrl().ToString()))callback->Cancel();}
   bool OnFileDialog(CefRefPtr<CefBrowser>,FileDialogMode,const CefString&,const CefString&,const std::vector<CefString>&,const std::vector<CefString>&,const std::vector<CefString>&,CefRefPtr<CefFileDialogCallback> callback) override { callback->Cancel();return true; }
   bool GetScreenInfo(CefRefPtr<CefBrowser>,CefScreenInfo& info) override {
     int w,h,pw,ph;SDL_GetWindowSize(window,&w,&h);SDL_GetWindowSizeInPixels(window,&pw,&ph);
@@ -332,8 +331,18 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     if(!frame->IsMain()||!loading||recovering||!Trusted(frame->GetURL()))return;
     if(code>=400){Fail("GAME SERVER UNAVAILABLE",code==502||code==503||code==504);return;}
     if(!FinishLoad(Trusted(frame->GetURL()),code))return;
+    // A completed navigation ends connection recovery. Leaving its timer active
+    // interrupts an already connected game when the five-minute window expires.
+    server_retry.Stop();
     SDL_SetWindowTitle(window,"Qrazy SDL3 + CEF — experimental");
-    if(browser)browser->GetHost()->SetAudioMuted(hidden_check||SDL_GetKeyboardFocus()!=window);
+    if(browser){
+      // Retry can replace the renderer without an SDL focus event. Refresh CEF's
+      // focus from the actual window so capture does not depend on Alt+Tab.
+      // The game still decides when to request capture; menus stay uncaptured.
+      const bool focused=!hidden_check&&SDL_GetKeyboardFocus()==window;
+      browser->GetHost()->SetFocus(focused);
+      browser->GetHost()->SetAudioMuted(!focused);
+    }
   }
   void OnLoadError(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,ErrorCode code,const CefString&,const CefString& failed_url) override {
     if(frame->IsMain()&&loading&&!recovering&&code!=ERR_ABORTED)Fail("CONNECTION FAILED",Trusted(failed_url)&&(code==ERR_CONNECTION_TIMED_OUT||code==ERR_TIMED_OUT||code==ERR_CONNECTION_RESET||code==ERR_CONNECTION_CLOSED||code==ERR_CONNECTION_REFUSED||code==ERR_CONNECTION_FAILED||code==ERR_NAME_NOT_RESOLVED||code==ERR_INTERNET_DISCONNECTED||code==ERR_NETWORK_CHANGED));
@@ -481,7 +490,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     auto result = Dict(); result->SetBool("ok", true);
     auto payload=CefParseJSON(args->GetString(2),JSON_PARSER_RFC);
     auto data_payload=payload&&payload->GetType()==VTYPE_DICTIONARY?payload->GetDictionary():nullptr;
-    if(op=="assets"||op=="update-state"||op=="update-check"||op=="update-install"||op=="changelog") {
+    if(op=="assets"||op=="update-notice"||op=="update-state"||op=="update-check"||op=="update-install"||op=="changelog") {
       auto request=Dict();
       if((op=="update-install")&&!DesktopPolicy::AllowCloseAction(closing,recovering,loading,captured,SDL_GetKeyboardFocus()==window,hidden_check)) {
         result->SetBool("ok",false);result->SetString("error","Installation requires a focused menu");Reply(id,result);return true;
@@ -529,7 +538,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
       d->SetBool("sandboxRequested",true);d->SetBool("gpuSandboxDisabled",true);d->SetBool("gpuSandboxFailuresFatal",false);d->SetBool("mesaDiskCachesDisabled",true);
       d->SetString("verification","Sandbox configuration, not a live per-thread audit. Presentation, input latency and physical GPU performance unverified.");result->SetDictionary("data",d);
     } else if(op=="config-import"||op=="config-export") {
-      bool allowed=!hidden_check&&!captured&&!closing&&!recovering&&!loading&&SDL_GetKeyboardFocus()==window&&!dialog_active.exchange(true);
+      bool allowed=!hidden_check&&(!captured||op=="config-export")&&!closing&&!recovering&&!loading&&SDL_GetKeyboardFocus()==window&&!DemoDownload::active&&!dialog_active.exchange(true);
       if(!allowed){result->SetBool("ok",false);result->SetString("error","File dialogs require focused menus and no active dialog");Reply(id,result);return true;}
       auto selected=new DialogResult{id,desktop_worker.epoch.load(),op=="config-export",false,{},{}};
       static const SDL_DialogFileFilter filter={"Qrazy configuration","cfg"};
@@ -538,7 +547,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
         bool valid=name.size()>=5&&name.size()<=100&&name.substr(name.size()-4)==".cfg"&&name.find_first_of("/\\\r\n")==std::string::npos&&selected->text.size()<=1048576&&selected->text.find('\0')==std::string::npos;
         if(!valid){delete selected;dialog_active=false;result->SetBool("ok",false);result->SetString("error","Expected a cfg filename and at most 1 MiB of text");Reply(id,result);return true;}
         selected->path=name;
-        SDL_ShowSaveFileDialog(FileChosen,selected,window,&filter,1,selected->path.c_str());
+        Release("export-save");SDL_ShowSaveFileDialog(FileChosen,selected,window,&filter,1,selected->path.c_str());
       }else SDL_ShowOpenFileDialog(FileChosen,selected,window,&filter,1,nullptr,false);
       return true;
     } else if (op == "release") { Release("release"); return true; }

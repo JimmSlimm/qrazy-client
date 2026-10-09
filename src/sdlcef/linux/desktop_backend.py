@@ -163,15 +163,15 @@ def serve(profile):
                 elif op=='changelog':
                     with open_file(pathlib.Path(__file__).resolve().parent/'CHANGES.txt',os.O_RDONLY) as f: value=f.read(16000).decode()
                 elif op.startswith('update-'):
-                    if args or op not in ('update-state','update-check','update-install'): raise ValueError('Invalid production update action')
+                    if args or op not in ('update-notice','update-state','update-check','update-install'): raise ValueError('Invalid production update action')
                     import subprocess
                     root=pathlib.Path(profile).parent
-                    operation={'update-state':'state','update-check':'update','update-install':'prepare'}[op]
+                    operation={'update-notice':'check','update-state':'state','update-check':'update','update-install':'prepare'}[op]
                     env=dict(os.environ);env.pop('NODE_OPTIONS',None);env.pop('NODE_PATH',None);env.pop('LD_PRELOAD',None);env.pop('LD_LIBRARY_PATH',None)
                     # Keep exclusion through Node's lifetime, even if this worker
                     # is interrupted during a download. A new launch/install must
                     # wait for that operation rather than racing its staged files.
-                    result=subprocess.run([str(root/'updater/node'),'--no-addons',str(root/'updater/production-runtime.cjs'),operation,str(root)],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=880,env=env,pass_fds=(lock.fileno(),),check=False)
+                    result=subprocess.run([str(root/'updater/node'),'--no-addons',str(root/'runtime/update-notice.cjs' if op=='update-notice' else root/'updater/production-runtime.cjs'),operation,str(root)],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=880,env=env,pass_fds=(lock.fileno(),),check=False)
                     if result.returncode or len(result.stdout)>1500000: raise ValueError('Signed update failed; preserve the folder and reopen manually')
                     reply=json.loads(result.stdout)
                     if not reply.get('ok'): raise ValueError('Signed update verification failed')

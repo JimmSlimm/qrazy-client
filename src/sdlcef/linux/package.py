@@ -3,6 +3,7 @@ import argparse
 parser=argparse.ArgumentParser(description='Prepare an unsigned Linux candidate using retained dependencies; no system installation or publication')
 parser.add_argument('--workspace',required=True);parser.add_argument('--dependencies',required=True)
 parser.add_argument('--version',required=True);parser.add_argument('--sequence',required=True,type=int)
+parser.add_argument('--notes-file',help='Finalized release notes; replaces the packaged CHANGES.txt')
 args=parser.parse_args()
 assert re.fullmatch(r'(0|[1-9][0-9]{0,5})[.](0|[1-9][0-9]{0,5})[.](0|[1-9][0-9]{0,5})',args.version) and args.sequence>0
 root=pathlib.Path(args.workspace).resolve();old=pathlib.Path(args.dependencies).resolve()
@@ -16,7 +17,10 @@ for p in (cef/'Resources').iterdir():
  if p.is_dir():shutil.copytree(p,runtime/p.name)
  else:shutil.copyfile(p,runtime/p.name)
 shutil.copyfile(old/'deps/baseline/sdl/lib/libSDL3.so.0.4.18',runtime/'libSDL3.so.0')
+shutil.copyfile(source/'update-notice.cjs',runtime/'update-notice.cjs')
 for name in ('bridge.js','desktop_backend.py','SYSTEM-REQUIREMENTS.txt','CHANGES.txt'):shutil.copyfile(linux/name,runtime/name)
+notes=pathlib.Path(args.notes_file).read_text() if args.notes_file else (linux/'CHANGES.txt').read_text()
+(runtime/'CHANGES.txt').write_text(notes)
 shutil.copyfile(root/'build/qrazy-sdl-cef',runtime/'qrazy-sdl-cef')
 licenses=runtime/'licenses';licenses.mkdir()
 for src,name in [(cef/'LICENSE.txt','CEF-LICENSE.txt'),(cef/'CREDITS.html','CEF-CREDITS.html'),(old/'deps/baseline/sdl/share/licenses/SDL3/LICENSE.txt','SDL3-LICENSE.txt'),(old/'PROJECT-LICENSE.txt','PROJECT-LICENSE.txt')]:shutil.copyfile(src,licenses/name)
@@ -44,7 +48,7 @@ with zipfile.ZipFile(asset,'x',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=F
  for f in inventory:
   p=runtime/f['path'];info=zipfile.ZipInfo(f['path'],(2026,10,8,0,0,0));info.external_attr=(0o100000|f['mode'])<<16;info.compress_type=zipfile.ZIP_DEFLATED
   with p.open('rb') as stream,z.open(info,'w') as dest:shutil.copyfileobj(stream,dest)
-manifest=dict(schema='qrazy-sdlcef-release-v1',product='qrazy-sdlcef',platform='linux-x64',channel='stable',version=args.version,sequence=args.sequence,notes=(linux/'CHANGES.txt').read_text(),files=inventory,asset=dict(name=asset.name,size=asset.stat().st_size,sha256=sha(asset)))
+manifest=dict(schema='qrazy-sdlcef-release-v1',product='qrazy-sdlcef',platform='linux-x64',channel='stable',version=args.version,sequence=args.sequence,notes=notes,files=inventory,asset=dict(name=asset.name,size=asset.stat().st_size,sha256=sha(asset)))
 (out/'runtime-manifest.json').write_text(json.dumps(manifest,separators=(',',':')))
 pins={p.relative_to(target).as_posix():sha(p) for p in control.iterdir()}
 launch=(linux/'launch.py').read_text().replace('CONTROL_PINS = {}', 'CONTROL_PINS = '+repr(pins))
