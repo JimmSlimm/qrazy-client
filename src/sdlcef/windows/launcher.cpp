@@ -6,6 +6,7 @@
 #include <sddl.h>
 #include "updater_control.h"
 #include "handoff_image.h"
+#include "client_destination.h"
 #include <sstream>
 #include <cstdlib>
 namespace {
@@ -109,7 +110,7 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR command,int) {
     if(recovered<0)return Failure(L"The transition could not be safely recovered. Keep this folder and both profiles intact. Replace the application files from an official full download if recovery remains unavailable.");
     if(recovered>0){MessageBoxW(nullptr,L"Close this notice, then reopen Qrazy in a few seconds. The previous client will be restored and your profiles kept.",L"Qrazy recovery",MB_OK|MB_ICONINFORMATION);return 0;}
   }
-  auto profile=root/L"profile-sdlcef-windows";std::error_code error;std::filesystem::create_directories(profile,error);if(error||!Production::NoLinks(profile))return Failure(L"The Qrazy profile folder is unavailable.");
+  auto profile=root/QrazyDestination::Profile;std::error_code error;std::filesystem::create_directories(profile,error);if(error||!Production::NoLinks(profile))return Failure(L"The Qrazy profile folder is unavailable.");
   std::string output;
   {Lock host,worker;if(!host.Open(profile/L"host.lock")||!worker.Open(profile/L"desktop-worker.lock"))return Failure(L"Close the running Qrazy client before starting this copy.");
     if(!Production::Helper(root,L"verify",output))return Failure(L"Qrazy runtime verification failed. Keep the whole folder together. No unverified runtime was started.");}

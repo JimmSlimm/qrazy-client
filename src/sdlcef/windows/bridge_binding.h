@@ -1,8 +1,13 @@
 bool Trusted(const CefString& url) {
   CefURLParts parts;
-  return CefParseURL(url, parts) && CefString(&parts.scheme) == "https" &&
-    CefString(&parts.host) == "qrazy-game.onrender.com" &&
+  return CefParseURL(url, parts) &&
+#if QRAZY_DEV_MODE
+    CefString(&parts.scheme) == "http" && CefString(&parts.host) == "localhost" &&
+    CefString(&parts.port) == "5173" &&
+#else
+    CefString(&parts.scheme) == "https" && CefString(&parts.host) == "qrazy-game.onrender.com" &&
     (CefString(&parts.port).empty() || CefString(&parts.port) == "443") &&
+#endif
     CefString(&parts.username).empty() && CefString(&parts.password).empty();
 }
 CefRefPtr<CefDictionaryValue> Dict() { return CefDictionaryValue::Create(); }

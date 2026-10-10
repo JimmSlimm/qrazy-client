@@ -32,10 +32,11 @@
 #include "updater_worker.h"
 #include "handoff_startup.h"
 #include "server_retry.h"
+#include "client_destination.h"
 
 namespace {
-constexpr char kOrigin[]="https://qrazy-game.onrender.com/";
-constexpr char kProfile[]="profile-sdlcef-windows";
+constexpr auto& kOrigin=QrazyDestination::Origin;
+constexpr auto& kProfile=QrazyDestination::Profile;
 SDL_Window* window=nullptr;
 std::string client_title="Qrazy";
 SDL_Renderer* renderer=nullptr;
@@ -296,6 +297,7 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       }else SDL_ShowOpenFileDialog(FileChosen,selected,window,&filter,1,nullptr,false);
       return true;
     }else if(op=="update-notice"||op=="update-state"||op=="update-check"||op=="update-stage"||op=="update-install") {
+      if(QRAZY_DEV_MODE){Reply(id,QrazyWindows::Error("Updates are disabled in the development client"));return true;}
       if(!menu){Reply(id,QrazyWindows::Error("Return to the focused menu before updating"));return true;}
       std::string action=op=="update-notice"?"check":op=="update-state"?"state":op=="update-install"?"prepare":"update";
       if(action!="state"&&action!="check"){
@@ -413,6 +415,7 @@ int Run(HINSTANCE instance,void* sandbox) {
       if(!version.empty()&&version.size()<64&&version.find_first_not_of("0123456789.")==std::string::npos)client_title="Qrazy v"+version;
     }
   }
+  if(QRAZY_DEV_MODE)client_title+=" [DEV localhost:5173]";
   SDL_SetWindowTitle(window,client_title.c_str());
   int result=0;
   {

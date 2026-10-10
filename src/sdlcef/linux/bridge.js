@@ -42,16 +42,20 @@
     add(box, 'div', data.map || 'No current map', 'font-size:28px;font-weight:800;color:#fbbf24;overflow-wrap:anywhere');
     add(box, 'div', `${data.mode || '\u2014'} - Physics: ${data.physics || '\u2014'} - Mode: ${data.category || '\u2014'} - Session: ${data.sessionTime || '\u2014'}`, 'color:#c3cfdf;margin:4px 0 18px');
     const records = add(box, 'div', '', 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px');
-    for (const physics of ['pql','vql']) for (const category of ['w','s']) {
-      const record = data.records.find(r => r.physics === physics && r.category === category);
-      const active = data.activeRecord?.physics === physics && data.activeRecord?.category === category;
-      const card = add(records, 'div', '', `background:${active ? '#34301e' : '#152238'};border:2px solid ${active ? '#fbbf24' : 'transparent'};border-radius:6px;padding:10px 12px;min-width:0`);
+    const boards = data.profileRecords.length ? data.profileRecords : ['pql','vql'].flatMap(physics => ['w','s'].map(category => ({physics, category})));
+    for (const board of boards) {
+      const {physics, category} = board;
+      const profile = data.profileRecords.length > 0;
+      const record = profile ? board : data.records.find(r => r.physics === physics && r.category === category);
+      const selection = profile ? data.activeProfileRecord : data.activeRecord;
+      const active = profile ? selection?.profileId === board.profileId : selection?.physics === physics && selection?.category === category;
+      const title = profile ? board.label : `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : 'STRAFE'}`;
+      const card = add(records, 'div', '', `background:${active ? '#34301e' : '#152238'};border:2px solid ${active ? '#fbbf24' : 'transparent'};border-radius:6px;padding:10px 12px;min-width:0;display:flex;flex-direction:column;align-items:flex-start`);
       if (active) {
-        const label = data.activeRecord.source === 'pov' ? 'WATCHING' : 'YOU';
-        card.setAttribute('aria-label', `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : 'STRAFE'} world record \u2014 ${label}`);
-        add(card, 'div', label, 'font-size:12px;font-weight:900;letter-spacing:1px;color:#0b1424;background:#fbbf24;border-radius:3px;padding:2px 7px;display:inline-block;margin-bottom:6px');
+        const label = selection.source === 'pov' ? 'WATCHING' : 'YOU';
+        card.setAttribute('aria-label', `${title} world record \u2014 ${label}`);
       }
-      add(card, 'div', `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : 'STRAFE'} \u00b7 WR`, 'font-size:13px;font-weight:750;color:#fbbf24');
+      add(card, 'div', `${title} \u00b7 WR`, 'font-size:13px;font-weight:750;color:#fbbf24');
       const recordTime = record?.state === 'ready' ? record.time || 'No record' : record?.state === 'loading' ? 'Loading\u2026' : 'Unavailable';
       const time = add(card, 'div', '', 'font-size:20px;font-weight:700;font-variant-numeric:tabular-nums');
       // Keep the game's plain-text verification mark, styling only its presentation.
@@ -65,6 +69,10 @@
       } else time.textContent = recordTime;
       const name = add(card, 'div', '', 'font-size:14px;color:#b8c8dc;overflow-wrap:anywhere');
       if (record?.state === 'ready') coloredName(name, record); else name.textContent = 'Awaiting game data';
+      if (active) {
+        const footer = add(card, 'div', '', 'margin-top:auto;padding-top:6px');
+        add(footer, 'div', selection.source === 'pov' ? 'WATCHING' : 'YOU', 'font-size:12px;font-weight:900;letter-spacing:1px;color:#0b1424;background:#fbbf24;border-radius:3px;padding:2px 7px;display:inline-block');
+      }
     }
     const columns = add(box, 'div', '', 'display:grid;gap:14px');
     function panel(title, rows) {
@@ -96,8 +104,8 @@
       });
     }
     if (data.multiplayer.state === 'disconnected' && data.mode !== 'Solo') add(columns, 'div', 'Not connected to multiplayer.', 'padding:14px;background:#152238;border-radius:6px;color:#cbd7e7');
-    else if (!data.groups.length) add(columns, 'div', 'No active players.', 'color:#cbd7e7');
-    for (const group of data.groups) panel(group.label, group.rows);
+    else if (!data.groups.some(group => group.rows.length)) add(columns, 'div', 'No active players.', 'color:#cbd7e7');
+    for (const group of data.groups) if (group.rows.length) panel(group.label, group.rows);
     const spectators = add(box, 'div', '', 'display:flex;gap:16px;align-items:baseline;border-top:1px solid #40516a;padding-top:12px;margin-top:16px');
     add(spectators, 'div', 'SPECTATORS:', 'font-size:14px;font-weight:800;color:#9eafc5');
     const spectatorNames = add(spectators, 'div', '', 'display:flex;flex-wrap:wrap;gap:8px;font-size:16px;min-width:0');
@@ -113,6 +121,7 @@
   const information = {
     version: 1,
     layoutVersion: 3,
+    supportsProfileRecords: true,
     report(value) {
       const states = ['loading', 'ready', 'unavailable', 'disconnected'];
       if (!value || !states.includes(value.leaderboard?.state) || !states.includes(value.multiplayer?.state) ||
@@ -129,7 +138,7 @@
         groups = active.length ? [{label: 'Players \u00b7 category data unavailable', rows: active.map(player)}] : [];
         spectators = players.filter(r => r.status === 'Spectating').map(player);
       } else {
-        if (value.multiplayer.groups.length > 5 || !Array.isArray(value.multiplayer.spectators) || value.multiplayer.spectators.length > 64) throw new TypeError('Invalid category snapshot');
+        if (value.multiplayer.groups.length > 64 || !Array.isArray(value.multiplayer.spectators) || value.multiplayer.spectators.length > 64) throw new TypeError('Invalid category snapshot');
         let count = value.multiplayer.spectators.length;
         groups = value.multiplayer.groups.map(g => {
           if (!Array.isArray(g.rows) || g.rows.length > 64) throw new TypeError('Invalid category rows');
@@ -144,12 +153,25 @@
         if (!['pql','vql'].includes(r.physics) || !['w','s'].includes(r.category) || !states.includes(r.state)) throw new TypeError('Invalid record board');
         return {...clan(r), physics:r.physics, category:r.category, state:r.state, name:infoText(r.name, 96), coloredName:infoText(r.coloredName, 192), time:infoText(r.time, 48)};
       });
+      if (value.profileRecords !== undefined && (!Array.isArray(value.profileRecords) || value.profileRecords.length > 1)) throw new TypeError('Invalid profile records');
+      const profileRecords = (value.profileRecords || []).map(r => {
+        if (!r || typeof r.profileId !== 'string' || !r.profileId.trim() || r.profileId.length > 96 ||
+            typeof r.label !== 'string' || !r.label.trim() || r.label.length > 64 ||
+            !['pql','vql'].includes(r.physics) || !['w','s'].includes(r.category) ||
+            !['loading','ready','unavailable'].includes(r.state)) throw new TypeError('Invalid profile record board');
+        return {...clan(r), profileId:r.profileId, label:r.label, physics:r.physics, category:r.category, state:r.state,
+          name:infoText(r.name, 96), coloredName:infoText(r.coloredName, 192), time:infoText(r.time, 48)};
+      });
+      const profileActive = value.activeProfileRecord;
+      const activeProfileRecord = profileActive && typeof profileActive.profileId === 'string' &&
+        profileRecords.some(r => r.profileId === profileActive.profileId) && ['self','pov'].includes(profileActive.source)
+        ? {profileId:profileActive.profileId, source:profileActive.source} : null;
       // Only explicit game-owned POV context can select a board. Missing/invalid data clears it.
       const active = value.activeRecord;
       const activeRecord = active && ['pql','vql'].includes(active.physics) && ['w','s'].includes(active.category) && ['self','pov'].includes(active.source)
         ? {physics: active.physics, category: active.category, source: active.source} : null;
       informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), category: infoText(value.category, 32), activeRecord,
-        groups, spectators, records, legacy,
+        groups, spectators, records, profileRecords, activeProfileRecord, legacy,
         leaderboard: {state: value.leaderboard.state, rows}, multiplayer: {state: value.multiplayer.state, rows: players,
           total: Number.isSafeInteger(value.multiplayer.total) && value.multiplayer.total >= players.length ? value.multiplayer.total : players.length}};
       renderInformation();
@@ -267,8 +289,8 @@
   async function checkClientNotice() {
     const menu=document.getElementById('overlay');
     if(!menu||!menu.getClientRects().length||document.visibilityState==='hidden'||!document.hasFocus()||clientCheckBusy||Date.now()-clientCheckTime<5*60*1000)return;
-    clientCheckBusy=true;clientCheckTime=Date.now();
-    try { const reply=await rpc('update-notice');if(reply.ok&&reply.data){clientNoticeState=reply.data;renderClientNotice();} }
+    clientCheckBusy=true;
+    try { const reply=await rpc('update-notice');if(reply.ok&&reply.data){clientCheckTime=Date.now();clientNoticeState=reply.data;renderClientNotice();} }
     catch { /* Offline checks stay quiet; the manual check remains available. */ }
     finally { clientCheckBusy=false; }
   }

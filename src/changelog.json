@@ -1,6 +1,17 @@
 {
   "releases": [
     {
+      "version": "0.4.4",
+      "date": "2026-10-10",
+      "added": [],
+      "changed": [
+        "YOU and WATCHING badges now appear below the world-record details in the Tab overlay."
+      ],
+      "fixed": [
+        "Automatic client update checks retry after startup or network failures instead of waiting through the normal cooldown."
+      ]
+    },
+    {
       "version": "0.4.3",
       "date": "2026-10-10",
       "added": [
