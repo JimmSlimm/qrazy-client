@@ -38,7 +38,7 @@ inline bool Helper(const std::filesystem::path& root,const std::wstring& operati
   if(controls!=root&&(operation!=L"transition-recovery"||controls!=root/L".qrazy-transition"/L"next"))return false;
   Pins pins;if(!pins.Check(controls))return false;
   // Node flags and environment are controlled by native startup, never website data.
-  auto exe=controls/L"updater"/L"node.exe";auto script=operation==L"check"?root/L"runtime"/L"update-notice.cjs":controls/L"updater"/L"production-runtime.cjs";
+  auto exe=controls/L"updater"/L"node.exe";auto script=operation==L"check"?root/L"runtime"/L"update-notice.cjs":operation==L"update"?root/L"runtime"/L"update-download.cjs":controls/L"updater"/L"production-runtime.cjs";
   std::wstring cmd=Quote(exe.wstring())+L" --use-bundled-ca --no-addons --no-global-search-paths "+Quote(script.wstring())+L" "+operation+L" "+Quote(root.wstring());
   SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE read=nullptr,write=nullptr;if(!CreatePipe(&read,&write,&sa,0))return false;
   SetHandleInformation(read,HANDLE_FLAG_INHERIT,0);

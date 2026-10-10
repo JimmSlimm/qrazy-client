@@ -18,6 +18,7 @@ for p in (cef/'Resources').iterdir():
  else:shutil.copyfile(p,runtime/p.name)
 shutil.copyfile(old/'deps/baseline/sdl/lib/libSDL3.so.0.4.18',runtime/'libSDL3.so.0')
 shutil.copyfile(source/'update-notice.cjs',runtime/'update-notice.cjs')
+shutil.copyfile(source/'update-download.cjs',runtime/'update-download.cjs')
 for name in ('bridge.js','desktop_backend.py','SYSTEM-REQUIREMENTS.txt','CHANGES.txt'):shutil.copyfile(linux/name,runtime/name)
 notes=pathlib.Path(args.notes_file).read_text() if args.notes_file else (linux/'CHANGES.txt').read_text()
 (runtime/'CHANGES.txt').write_text(notes)

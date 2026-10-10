@@ -14,3 +14,5 @@ cookie flush succeed. Interrupted transitions can restore the previous client.
 No telemetry. Signed release availability is checked automatically in the menu;
 download and installation remain explicit. Runtime compatibility and migration
 acceptance must be completed before a player release.
+Incremental runtime downloads reuse verified local files and fetch changed files
+from the release ZIP. Complete staging and installation still verify every file.

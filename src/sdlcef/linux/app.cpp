@@ -36,6 +36,7 @@
 #include "include/cef_render_handler.h"
 #include "include/cef_v8.h"
 #include "include/wrapper/cef_helpers.h"
+#include "experimental_pacing.h"
 
 namespace {
 constexpr char kOrigin[] = "https://qrazy-game.onrender.com/";
@@ -51,6 +52,8 @@ bool amd_mesa_renderer = false;
 QrazyWindows::ServerRetry server_retry;
 uint64_t connect_started=0;
 int render_rate = 0;
+ExperimentalPacing pacing; /* opt-in, see experimental_pacing.h */
+TimerBeginClock pacing_clock;
 DesktopWorker desktop_worker;
 #include "profile_lock.h"
 #include "desktop_policy.h"
@@ -110,7 +113,7 @@ class Native final : public CefV8Handler {
     if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 3 || !args[2]->IsString() || args[2]->GetStringValue().length()>1500000 ||
         !args[0]->IsString() || !args[1]->IsInt()) { exception = "Unauthorized native bridge call"; return true; }
     const auto op = args[0]->GetStringValue().ToString();
-    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-notice" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog") {
+    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-notice" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog" && op != "experimental-get" && op != "experimental-set" && op != "vsync-get" && op != "vsync-set" && op != "max-fps-get" && op != "max-fps-set") {
       exception = "Unknown native operation"; return true;
     }
     auto message = CefProcessMessage::Create("qrazy-command-v1");
@@ -131,6 +134,8 @@ class App final : public CefApp, public CefRenderProcessHandler, public CefBrows
   CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override { return this; }
   CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
   void OnBeforeChildProcessLaunch(CefRefPtr<CefCommandLine> line) override {
+    /* Lets the renderer's bridge know, synchronously at load, whether the experimental mode is active. */
+    if (pacing.active) line->AppendSwitch("qrazy-experimental-pacing");
     if (line->GetSwitchValue("type") != "gpu-process") return;
     // Log only this fixed set of graphics controls, never the full command line.
     // Hardware captures confirm disable-angle-features already reaches the child.
@@ -174,6 +179,7 @@ class App final : public CefApp, public CefRenderProcessHandler, public CefBrows
     if (!frame->IsMain() || !Trusted(frame->GetURL())) return;
     auto native = CefV8Value::CreateFunction("qrazyNative", new Native);
     // Temporary bootstrap slot; removed before any website script runs. Dispatcher stays private.
+    native->SetValue("pacing", CefV8Value::CreateBool(CefCommandLine::GetGlobalCommandLine()->HasSwitch("qrazy-experimental-pacing")), V8_PROPERTY_ATTRIBUTE_READONLY);
     context->GetGlobal()->SetValue("__qrazyBootstrap", native, V8_PROPERTY_ATTRIBUTE_NONE);
     CefRefPtr<CefV8Value> dispatch; CefRefPtr<CefV8Exception> exception;
     bool ok = context->Eval(bridge_source + "(__qrazyBootstrap)", "qrazy-native-bridge", 1, dispatch, exception);
@@ -273,6 +279,11 @@ class Texture {
     } else { glViewport(0, 0, pw, ph); glDisable(GL_BLEND); }
     glUseProgram(program);
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, texture); glUniform1i(glGetUniformLocation(program, "tex"), 0);
+    // A frame within a pixel or two of the window is a rounding artifact, not a real resize: sample it
+    // unfiltered so fractional display scales stay sharp. Larger mismatches (live resize) keep bilinear.
+    const bool nearest = area || (std::abs(width - pw) <= 2 && std::abs(height - ph) <= 2);
+    const GLint filter = nearest ? GL_NEAREST : GL_LINEAR;
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
     const GLfloat quad[] = {-1,1,0,0, -1,-1,0,1, 1,1,1,0, 1,-1,1,1};
     glBindBuffer(GL_ARRAY_BUFFER, 0); glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(GLfloat), quad);
@@ -322,8 +333,10 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     if(hidden_check||bounds.empty())return;
     const auto& r=bounds.back();SDL_Rect rect{r.x,r.y,r.width,r.height};SDL_SetTextInputArea(window,&rect,r.width);
   }
-  void OnLoadStart(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,TransitionType) override {
+  void OnLoadStart(CefRefPtr<CefBrowser> b,CefRefPtr<CefFrame> frame,TransitionType) override {
     if(!frame->IsMain())return;
+    // Zoom is remembered per site in the profile; undo any earlier Ctrl+scroll zoom.
+    if(b&&b->GetHost()->GetZoomLevel()!=0.0)b->GetHost()->SetZoomLevel(0.0);
     // Admission occurs in OnBeforeBrowse/Retry. A late start must not clear failure.
     if(loading&&!recovering)SDL_SetWindowTitle(window,installed_title.c_str());
   }
@@ -477,6 +490,15 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     auto data = Dict(); data->SetString("type", "state"); data->SetString("reason", reason); Send(data);
     std::fprintf(stderr, "QRAZY capture-released reason=%s\n", reason);
   }
+  void RequestFrame() { /* experimental pacing only: one begin frame per clock tick */
+    if(!pacing.active)return;
+    pacing_clock.Configure(pacing.Target(render_rate));
+    if(!browser||closing||!pacing_clock.Take())return;
+    browser->GetHost()->SendExternalBeginFrame();
+  }
+  void RenderSettingsChanged() {
+    auto event=Dict();event->SetString("type","render-settings");event->SetDictionary("vsync",pacing.VSyncState());event->SetDictionary("maxFps",pacing.MaxFpsState());Send(event);
+  }
   void FullscreenState() {
     auto data=Dict(); data->SetString("type","fullscreen"); data->SetBool("value",!!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN)); Send(data);
   }
@@ -564,6 +586,38 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
       result->SetBool("ok", !hidden_check && SDL_SetWindowFullscreen(window, enabled));
       result->SetBool("fullscreen", !!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
     } else if (op == "fullscreen-state") result->SetBool("fullscreen", !!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
+    else if (op == "experimental-get") result->SetDictionary("data", pacing.State());
+    else if (op == "experimental-set") {
+      /* Saved for the next start only; nothing changes in the running client. */
+      bool valid = !hidden_check && data_payload && data_payload->GetType("enabled") == VTYPE_BOOL;
+      if (valid) {
+        const bool previous = pacing.enabled;
+        pacing.enabled = data_payload->GetBool("enabled");
+        if (!pacing.Save()) { pacing.enabled = previous; valid = false; }
+      }
+      if (!valid) { result->SetBool("ok", false); result->SetString("error", "Experimental frame pacing setting could not be saved"); }
+      else result->SetDictionary("data", pacing.State());
+    }
+    else if (op == "vsync-get" || op == "max-fps-get" || op == "vsync-set" || op == "max-fps-set") {
+      const bool is_vsync = op == "vsync-get" || op == "vsync-set", is_set = op == "vsync-set" || op == "max-fps-set";
+      if (!pacing.active) { result->SetBool("ok", false); result->SetString("error", "Experimental frame pacing is off; enable it and restart the client first"); }
+      else if (!is_set) result->SetDictionary("data", is_vsync ? pacing.VSyncState() : pacing.MaxFpsState());
+      else if (closing || recovering || loading || hidden_check || SDL_GetKeyboardFocus() != window) { result->SetBool("ok", false); result->SetString("error", "Return to the focused game before changing rendering settings"); }
+      else if (!data_payload || (is_vsync ? data_payload->GetType("enabled") != VTYPE_BOOL : data_payload->GetType("value") != VTYPE_INT) || (!is_vsync && (data_payload->GetInt("value") < 30 || data_payload->GetInt("value") > 10000))) {
+        result->SetBool("ok", false); result->SetString("error", "Expected a VSync boolean or com_maxfps integer from 30 to 10000");
+      } else {
+        const ExperimentalPacing previous = pacing;
+        if (is_vsync) pacing.vsync = data_payload->GetBool("enabled"); else pacing.max_fps = data_payload->GetInt("value");
+        int actual = -1; const int wanted = pacing.vsync ? 1 : 0;
+        if (!SDL_GL_MakeCurrent(window, glcontext) || !SDL_GL_SetSwapInterval(wanted) || !SDL_GL_GetSwapInterval(&actual) || actual != wanted || !pacing.Save()) {
+          pacing = previous; SDL_GL_SetSwapInterval(pacing.vsync ? 1 : 0);
+          result->SetBool("ok", false); result->SetString("error", "Rendering setting could not be applied and saved");
+        } else {
+          result->SetDictionary("data", is_vsync ? pacing.VSyncState() : pacing.MaxFpsState());
+          RenderSettingsChanged();
+        }
+      }
+    }
     else return true;
     Reply(id,result);
     return true;
@@ -767,6 +821,16 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
   ProfileLock profile_lock;
   if(!profile_lock.Acquire(prototype_profile)){std::fprintf(stderr,"QRAZY profile already in use or unavailable; close its existing client before relaunching\n");return 4;}
   if(!desktop_worker.Start(executable,prototype_profile))std::fprintf(stderr,"QRAZY desktop worker unavailable; browser loading fallback retained\n");
+  if(!hidden_check) {
+    /* Opt-in experimental frame pacing (off by default). The marker file is removed on a clean exit; if it is still there
+       next start, the experiment is switched off again. */
+    pacing.Load(prototype_profile);
+    if(pacing.enabled) {
+      pacing.active=pacing_clock.Start();
+      if(pacing.active){pacing.MarkRunning();std::fprintf(stderr,"QRAZY EXPERIMENTAL frame pacing active (opt-in, unverified on this hardware)\n");}
+      else std::fprintf(stderr,"QRAZY experimental pacing clock unavailable; normal pacing used\n");
+    }
+  }
   // Configure flags inside CefApp rather than accepting arbitrary runtime security flags.
   SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER,"1");
   SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "wayland"); SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "0"); SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SPEED_SCALE, "1");
@@ -782,9 +846,11 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
   if (!render_rate) { std::fprintf(stderr, "QRAZY display refresh unavailable; refusing arbitrary FPS fallback\n"); return 5; }
   if (!hidden_check) {
     SDL_StartTextInput(window);
-    int interval = 0;
-    if (!SDL_GL_SetSwapInterval(1) || !SDL_GL_GetSwapInterval(&interval) || interval != 1) {
-      std::fprintf(stderr, "QRAZY VSync swap interval 1 unavailable: %s\n", SDL_GetError()); return 5;
+    int interval = 0; const int wanted = (pacing.active && !pacing.vsync) ? 0 : 1; /* VSync stays required unless experimental pacing is active */
+    if (!SDL_GL_SetSwapInterval(wanted) || !SDL_GL_GetSwapInterval(&interval) || interval != wanted) {
+      std::fprintf(stderr, "QRAZY VSync swap interval %d unavailable: %s\n", wanted, SDL_GetError());
+      if (wanted == 1 || !SDL_GL_SetSwapInterval(1) || !SDL_GL_GetSwapInterval(&interval) || interval != 1) return 5;
+      pacing.vsync = true;
     }
     std::fprintf(stderr, "QRAZY SDL swap interval=%d (presentation timing unmeasured)\n", interval);
   }
@@ -802,8 +868,8 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
   int result = 0;
   {
     CefRefPtr<Client> client = new Client;
-    CefWindowInfo info; info.SetAsWindowless(0); info.shared_texture_enabled = true;
-    CefBrowserSettings bs; bs.windowless_frame_rate = render_rate; bs.background_color = CefColorSetARGB(255,0,0,0);
+    CefWindowInfo info; info.SetAsWindowless(0); info.shared_texture_enabled = true; info.external_begin_frame_enabled = pacing.active;
+    CefBrowserSettings bs; bs.windowless_frame_rate = pacing.active ? pacing.Target(render_rate) : render_rate; bs.background_color = CefColorSetARGB(255,0,0,0);
     if (!CefBrowserHost::CreateBrowser(info, client, kOrigin, bs, nullptr, nullptr)) return 7;
     auto end = std::chrono::steady_clock::now() + std::chrono::seconds(25);
     auto inspect_at = std::chrono::steady_clock::now() + std::chrono::seconds(8);
@@ -811,13 +877,13 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     bool close_sent = false;
     auto refresh_at = std::chrono::steady_clock::now();
     while (!closed) {
-      CefDoMessageLoopWork();client->PumpDesktop();client->PumpRetry();
+      CefDoMessageLoopWork();client->PumpDesktop();client->PumpRetry();client->RequestFrame();
       // Also catch refresh changes that do not move or resize the window.
       if (std::chrono::steady_clock::now() >= refresh_at) {
         int rate = DisplayRenderRate();
         if (rate && rate != render_rate) {
           render_rate = rate;
-          if (client->browser) client->browser->GetHost()->SetWindowlessFrameRate(rate);
+          if (client->browser) client->browser->GetHost()->SetWindowlessFrameRate(pacing.active ? pacing.Target(rate) : rate);
         } else if (!rate) {
           std::fprintf(stderr, "QRAZY display refresh unavailable; retaining last known target=%d\n", render_rate);
         }
@@ -903,7 +969,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
           }
         }
         if (event.type == SDL_EVENT_MOUSE_WHEEL && client->browser) {
-          CefMouseEvent mouse; mouse.x=static_cast<int>(event.wheel.mouse_x); mouse.y=static_cast<int>(event.wheel.mouse_y); mouse.modifiers=MouseModifiers();
+          CefMouseEvent mouse; mouse.x=static_cast<int>(event.wheel.mouse_x); mouse.y=static_cast<int>(event.wheel.mouse_y); mouse.modifiers=MouseModifiers()&~static_cast<uint32_t>(EVENTFLAG_CONTROL_DOWN);
           float sign=event.wheel.direction==SDL_MOUSEWHEEL_FLIPPED ? -1.f : 1.f;
           client->browser->GetHost()->SendMouseWheelEvent(mouse,static_cast<int>(client->wheel_x+=120*event.wheel.x*sign),static_cast<int>(client->wheel_y+=120*event.wheel.y*sign));
           client->wheel_x-=static_cast<int>(client->wheel_x);client->wheel_y-=static_cast<int>(client->wheel_y);
@@ -945,8 +1011,10 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     if(!close_action.empty()&&!DesktopPolicy::ShutdownReady(requested,flushed->done))
       std::fprintf(stderr,"QRAZY offline action refused: cookie flush failed or timed out; runtime unchanged\n");
   }
+  pacing_clock.Stop();
   CefShutdown(); app=nullptr; SDL_GL_DestroyContext(glcontext); SDL_DestroyWindow(window); SDL_Quit();
   desktop_worker.Stop();
+  if(pacing.active&&result==0)pacing.MarkClean(); /* anything else leaves the marker, which switches the experiment off next start */
   if(result==0&&!close_action.empty())return 42; // Launcher installs only after this orderly, flushed shutdown.
   return result;
 }

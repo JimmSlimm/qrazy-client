@@ -16,7 +16,7 @@
     };
     const coloredText = (parent, text) => {
       const parts = text.split(/\^([0-9])/);
-      const colors = ['#000','#f00','#0f0','#ff0','#00f','#0ff','#f0f','#fff','#000'];
+      const colors = ['#000','#f00','#0f0','#ff0','#3D65E9','#0ff','#f0f','#fff','#000'];
       let color = '';
       if (parts[0]) add(parent, 'span', parts[0]);
       for (let i = 1; i < parts.length; i += 2) {
@@ -367,6 +367,36 @@
     host('release', 0, 'null');
     if (captured) { captured = false; emit(states, { captured: false }); }
   }
+  const vsyncListeners=new Set(),maxFpsListeners=new Set(),presentationListeners=new Set();
+  let presentationState={fps:null,intervalMs:0,presents:0,source:'sdl-present'};
+  function updatePresentationLabel(){
+    const label=document.getElementById('fps');if(!label||presentationState.fps===null)return;
+    const suffix=label.textContent.includes(' · ')?label.textContent.slice(label.textContent.indexOf(' · ')):'';
+    const text=`${Math.round(presentationState.fps)} FPS${suffix}`;
+    if(label.textContent!==text)label.textContent=text;
+    label.title='Successful SDL presents per second; not a physical scanout measurement';
+  }
+  window.addEventListener('DOMContentLoaded',()=>{
+    const label=document.getElementById('fps');if(!label)return;
+    const observer=new MutationObserver(updatePresentationLabel);
+    observer.observe(label,{childList:true,characterData:true,subtree:true});
+    window.addEventListener('pagehide',()=>observer.disconnect(),{once:true});updatePresentationLabel();
+  },{once:true});
+  const vsync={getState:()=>rpc('vsync-get'),setEnabled(enabled){if(typeof enabled!=='boolean')return Promise.reject(new TypeError('VSync must be a boolean'));return rpc('vsync-set',{enabled});},onChange:fn=>subscribe(vsyncListeners,fn)};
+  const maxFps={getState:()=>rpc('max-fps-get'),setValue(value){if(!Number.isSafeInteger(value)||value<30||value>10000)return Promise.reject(new TypeError('com_maxfps must be a whole number from 30 to 10000'));return rpc('max-fps-set',{value});},onChange:fn=>subscribe(maxFpsListeners,fn)};
+  function renderingSettings(){
+    const section=document.getElementById('display-section');if(!section||document.getElementById('qrazy-vsync'))return;
+    const label=document.createElement('label');label.textContent='VSync ';const check=document.createElement('input');check.id='qrazy-vsync';check.type='checkbox';check.disabled=true;label.append(check);section.append(label);
+    const fpsLabel=document.createElement('label');fpsLabel.textContent='Maximum FPS (com_maxfps) ';const fps=document.createElement('input');fps.id='qrazy-max-fps';fps.type='number';fps.min='30';fps.max='10000';fps.step='1';fps.disabled=true;fpsLabel.append(fps);section.append(fpsLabel);
+    const error=document.createElement('p');error.style.color='#fbbf24';error.hidden=true;section.append(error);
+    const showVsync=s=>{check.checked=s.enabled;},showFps=s=>{fps.value=String(s.value);};
+    vsync.onChange(showVsync);maxFps.onChange(showFps);
+    async function change(input,action,refresh){input.disabled=true;error.hidden=true;try{await action();}catch(e){error.textContent=e.message;error.hidden=false;}finally{try{await refresh();}finally{input.disabled=false;}}}
+    check.addEventListener('change',e=>{if(e.isTrusted)void change(check,()=>vsync.setEnabled(check.checked),async()=>showVsync(await vsync.getState()));});
+    fps.addEventListener('change',e=>{if(e.isTrusted)void change(fps,()=>maxFps.setValue(Number(fps.value)),async()=>showFps(await maxFps.getState()));});
+    Promise.all([vsync.getState(),maxFps.getState()]).then(([v,m])=>{showVsync(v);showFps(m);check.disabled=fps.disabled=false;}).catch(e=>{error.textContent=e.message;error.hidden=false;});
+  }
+  window.addEventListener('DOMContentLoaded',renderingSettings,{once:true});
   const rawMouse = Object.freeze({
     async capture() {
       const token = ++sequence;
@@ -378,7 +408,8 @@
       }
       const result = await rpc('capture');
       if (token !== sequence) return false;
-      if (!result.ok) { release(); return false; }
+      // The game appends this message to its on-screen capture error.
+      if (!result.ok) { release(); throw new Error('host refused capture: ' + (result.reason || 'unknown')); }
       generation = result.generation; captured = true; lastTime = -Infinity;
       emit(states, { captured: true }); return true;
     },
@@ -395,6 +426,9 @@
     information: Object.freeze(information),
     assets: Object.freeze(assets),
     status: Object.freeze({ version: 1, report: reportStatus }),
+    vsync: Object.freeze(vsync),
+    maxFps: Object.freeze(maxFps),
+    presentation: Object.freeze({version:1,getState:async()=>({...presentationState}),onChange:fn=>subscribe(presentationListeners,fn)}),
     graphics: Object.freeze({ getState: async () => (await rpc('diagnostics')).data }),
     config: Object.freeze({ version: 1, importFile: async () => (await rpc('config-import')).data, exportFile: async (name, text) => (await rpc('config-export', {name,text})).data }),
     quit: () => rpc('quit'),
@@ -405,6 +439,14 @@
   window.addEventListener('blur', event => { if(event.target===window)release(); });
   return function dispatch(json) {
     const message = JSON.parse(json);
+    if(message.type==='presentation-rate'){
+      if(Number.isFinite(message.fps)&&message.fps>=0&&Number.isFinite(message.intervalMs)&&message.intervalMs>0&&Number.isInteger(message.presents)&&message.presents>=0){
+        presentationState={fps:message.fps,intervalMs:message.intervalMs,presents:message.presents,source:'sdl-present'};
+        updatePresentationLabel();emit(presentationListeners,{...presentationState});
+      }
+      return;
+    }
+    if(message.type==='render-settings'){emit(vsyncListeners,message.vsync);emit(maxFpsListeners,message.maxFps);return;}
     if (message.type === 'reply') { const fn = pending.get(message.id); pending.delete(message.id); fn?.(message.value); }
     else if (message.type === 'state') {
       // release() already invalidated and notified synchronously. Its host

@@ -16,7 +16,7 @@
     };
     const coloredText = (parent, text) => {
       const parts = text.split(/\^([0-9])/);
-      const colors = ['#000','#f00','#0f0','#ff0','#00f','#0ff','#f0f','#fff','#000'];
+      const colors = ['#000','#f00','#0f0','#ff0','#3D65E9','#0ff','#f0f','#fff','#000'];
       let color = '';
       if (parts[0]) add(parent, 'span', parts[0]);
       for (let i = 1; i < parts.length; i += 2) {
@@ -367,6 +367,24 @@
     host('release', 0, 'null');
     if (captured) { captured = false; emit(states, { captured: false }); }
   }
+  // Experimental frame pacing (opt-in, takes effect after a restart). vsync/maxFps exist only while it is active, so the
+  // game's r_swapinterval / com_maxfps cvars stay hidden on a normal start.
+  const vsyncListeners = new Set(), maxFpsListeners = new Set();
+  const experimental = Object.freeze({
+    version: 1,
+    getState: async () => (await rpc('experimental-get')).data,
+    setEnabled: async enabled => { if (typeof enabled !== 'boolean') throw new TypeError('Expected a boolean'); return (await rpc('experimental-set', { enabled })).data; }
+  });
+  const vsync = Object.freeze({
+    getState: async () => (await rpc('vsync-get')).data,
+    setEnabled: async enabled => { if (typeof enabled !== 'boolean') throw new TypeError('VSync must be a boolean'); return (await rpc('vsync-set', { enabled })).data; },
+    onChange: fn => subscribe(vsyncListeners, fn)
+  });
+  const maxFps = Object.freeze({
+    getState: async () => (await rpc('max-fps-get')).data,
+    setValue: async value => { if (!Number.isSafeInteger(value) || value < 30 || value > 10000) throw new TypeError('com_maxfps must be a whole number from 30 to 10000'); return (await rpc('max-fps-set', { value })).data; },
+    onChange: fn => subscribe(maxFpsListeners, fn)
+  });
   const rawMouse = Object.freeze({
     async capture() {
       const token = ++sequence;
@@ -398,6 +416,8 @@
     graphics: Object.freeze({ getState: async () => (await rpc('diagnostics')).data }),
     config: Object.freeze({ version: 1, importFile: async () => (await rpc('config-import')).data, exportFile: async (name, text) => (await rpc('config-export', {name,text})).data }),
     quit: () => rpc('quit'),
+    experimental,
+    ...(host.pacing === true ? { vsync, maxFps } : {}),
     fullscreen: Object.freeze({ getState: async () => (await rpc('fullscreen-state')).fullscreen, toggle: async () => (await rpc('fullscreen-toggle')).fullscreen, onChange: fn => subscribe(fullscreen, fn) })
   }) });
   window.addEventListener('pagehide', release);
@@ -417,6 +437,7 @@
     } else if (message.type === 'focus') {
       window.dispatchEvent(new Event(message.focused ? 'focus' : 'blur'));
     } else if (message.type === 'fullscreen') emit(fullscreen, message.value);
+    else if (message.type === 'render-settings') { emit(vsyncListeners, message.vsync); emit(maxFpsListeners, message.maxFps); }
     else if (message.type === 'button') {
       // CEF's native click API covers only three buttons. The existing game accepts
       // document mouse events for side buttons; these events are deliberately synthetic.

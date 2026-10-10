@@ -14,3 +14,18 @@ src/package-windows.py
 src/sdlcef/**/build*/
 src/sdlcef/**/deps/
 src/sdlcef/**/__pycache__/
+
+# Private AI instructions, memory and chat artifacts (also inside src).
+.claude/
+.codex/
+.agents/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+MEMORY.md
+memory/
+chatlogs/
+chat-logs/
+claude-chatlogs/
+claude-memory/
+CLAUDE-HANDOFF.md
