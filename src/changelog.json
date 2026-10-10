@@ -1,6 +1,24 @@
 {
   "releases": [
     {
+      "version": "0.4.3",
+      "date": "2026-10-10",
+      "added": [
+        "Windows: VSync and Maximum FPS settings in the Display settings, saved and applied without a restart."
+      ],
+      "changed": [
+        "Client updates reuse files you already have and download only what changed.",
+        "Windows: the FPS counter shows how many frames the client presents per second.",
+        "Windows: frame timing now follows your display's refresh rate or your Maximum FPS setting.",
+        "The ^4 blue in the Tab overlay is now a lighter blue."
+      ],
+      "fixed": [
+        "Windows: mouse capture no longer fails after chat or the console when the cursor had left the window, and a failed capture now says why.",
+        "Page zoom from an earlier Ctrl+scroll no longer carries over between launches.",
+        "The picture stays sharp at fractional display scaling such as 125% or 150%."
+      ]
+    },
+    {
       "version": "0.4.2",
       "date": "2026-10-09",
       "added": [
@@ -59,19 +77,8 @@
     }
   ],
   "pending": {
-    "added": [
-      "Windows: VSync and Maximum FPS settings in the Display settings, saved and applied without a restart."
-    ],
-    "changed": [
-      "Client updates reuse files you already have and download only what changed.",
-      "Windows: the FPS counter shows how many frames the client presents per second.",
-      "Windows: frame timing now follows your display's refresh rate or your Maximum FPS setting.",
-      "The ^4 blue in the Tab overlay is now a lighter blue."
-    ],
-    "fixed": [
-      "Windows: mouse capture no longer fails after chat or the console when the cursor had left the window, and a failed capture now says why.",
-      "Page zoom from an earlier Ctrl+scroll no longer carries over between launches.",
-      "The picture stays sharp at fractional display scaling such as 125% or 150%."
-    ]
+    "added": [],
+    "changed": [],
+    "fixed": []
   }
 }
