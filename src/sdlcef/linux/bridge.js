@@ -321,6 +321,92 @@
     menu.append(box);
   }
 
+
+  function gameGraphicsSnapshot() {
+    const snapshot={status:'Game renderer unavailable'};
+    try {
+      // Read the game's existing WebGL2 canvas; never allocate a diagnostic context.
+      const canvas=document.querySelector('#viewport > canvas');
+      if(canvas) {
+        const gl=canvas.getContext('webgl2');
+        if(gl) {
+          snapshot.status=gl.isContextLost()?'Context lost':'Available';
+          snapshot.drawingBuffer=[gl.drawingBufferWidth,gl.drawingBufferHeight];
+          snapshot.canvasCssPixels=[canvas.clientWidth,canvas.clientHeight];
+          snapshot.contextAttributes=gl.getContextAttributes();
+          if(!gl.isContextLost()) {
+            snapshot.api=gl.getParameter(gl.VERSION);snapshot.shadingLanguage=gl.getParameter(gl.SHADING_LANGUAGE_VERSION);
+            snapshot.samples=gl.getParameter(gl.SAMPLES);snapshot.maxTextureSize=gl.getParameter(gl.MAX_TEXTURE_SIZE);
+            const debug=gl.getExtension('WEBGL_debug_renderer_info');
+            snapshot.gpu=debug?gl.getParameter(debug.UNMASKED_RENDERER_WEBGL):'Not exposed by browser';
+            snapshot.vendor=debug?gl.getParameter(debug.UNMASKED_VENDOR_WEBGL):'Not exposed by browser';
+          }
+        }
+      }
+    }catch{snapshot.status='Game renderer details unavailable';}
+    try {
+      const settings=JSON.parse(localStorage.getItem('qlrace-controls-v1'))?.settings;
+      snapshot.savedGraphicsSettings={};
+      for(const key of ['antialias','renderScale','autoScale','picmip','mirrors','marks','markTime','sortTranslucent','fastSky','volumeFog','mapFx','drawPlayers','showGhost','fov']) {
+        const value=settings?.[key];
+        if(typeof value==='boolean'||(typeof value==='number'&&Number.isFinite(value)))snapshot.savedGraphicsSettings[key]=value;
+      }
+    }catch{snapshot.savedGraphicsSettings='Unavailable';}
+    snapshot.devicePixelRatio=window.devicePixelRatio;snapshot.viewportCssPixels=[innerWidth,innerHeight];
+    snapshot.pageVisibility=document.visibilityState;
+    if(informationSnapshot)snapshot.mapContext={map:informationSnapshot.map,mode:informationSnapshot.mode,physics:informationSnapshot.physics};
+    return snapshot;
+  }
+  function supportGraphicsText(g,game) {
+    const missing='Unavailable',number=(value,digits=0)=>typeof value==='number'&&Number.isFinite(value)?value.toFixed(digits):missing;
+    const notes=[];
+    if(g.powerSource==='Battery')notes.push('Running on battery; Windows or the GPU driver may limit performance.');
+    if(g.batterySaver)notes.push('Windows battery saver is enabled.');
+    if(g.remoteSession)notes.push('Windows reports a remote desktop session; graphics behavior may differ.');
+    if(g.displayChangedSinceStartup&&g.sdlVSync)notes.push('The window moved to another monitor after launch; the VSync frame clock still uses the startup monitor. Restart Qrazy on the intended monitor.');
+    if(g.windowsGpuPreference==='Power saving')notes.push('Windows is configured to prefer a power-saving GPU for Qrazy.');
+    if(g.memoryLoadPercent>=90)notes.push('System RAM is nearly full at the time of this report.');
+    if(g.installationFreeGiB<1)notes.push('Less than 1 GiB free on the installation drive; asset saving may be restricted.');
+    if(/swiftshader|llvmpipe|software|basic render/i.test(game.gpu||''))notes.push('The game renderer reports a software-rendering GPU.');
+    if(game.status==='Context lost')notes.push('The game WebGL context is lost.');
+    if(game.contextAttributes?.antialias&&game.drawingBuffer?.[0]*game.drawingBuffer?.[1]>8000000)notes.push('The game draws over 8 million pixels with antialiasing enabled; this can be demanding.');
+    const vsync=typeof g.sdlVSync==='boolean'?(g.sdlVSync?'On':'Off'):(g.swapInterval===1?'On':g.swapInterval===0?'Off':missing);
+    const plans={'381b4222-f694-41f0-9685-ff5bb260df2e':'Balanced','8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c':'High performance','a1841308-3541-4fab-bc81-f71556f20b4a':'Power saver'};
+    if(plans[g.powerPlan]==='Power saver')notes.push('Windows Power saver plan is active.');
+    return [
+      'Qrazy graphics support report v2',
+      'Generated: '+new Date().toISOString(),
+      'Client: '+(g.client||missing),
+      'OS: '+(g.windowsVersion||g.platform||missing),
+      'CPU: '+(g.cpu||missing)+' · Logical processors: '+(g.logicalProcessors??missing),
+      'RAM: '+number(g.ramTotalMiB/1024,1)+' GiB total · '+number(g.ramAvailableMiB/1024,1)+' GiB available · '+(g.memoryLoadPercent??missing)+'% used',
+      'Power: '+(g.powerSource||missing)+' · Battery saver: '+(typeof g.batterySaver==='boolean'?(g.batterySaver?'On':'Off'):missing),
+      'Windows power plan: '+(plans[g.powerPlan]||g.powerPlan||missing),
+      'Windows GPU preference: '+(g.windowsGpuPreference||missing),
+      'Display GPU: '+(g.presentationGpu||g.glRenderer||missing),
+      'Game GPU: '+(game.gpu||missing),
+      'Game renderer status: '+game.status,
+      'Window: '+(g.pixelWidth||'?')+' × '+(g.pixelHeight||'?')+' pixels · Scale: '+number(g.displayScale*100)+'% · '+(g.fullscreen?'Fullscreen':'Windowed'),
+      'Display: '+(g.displayName||missing)+' · '+(g.refreshHz??missing)+' Hz',
+      'Game drawing buffer: '+(game.drawingBuffer?.join(' × ')||missing)+' pixels',
+      'VSync: '+vsync+' · FPS limit: '+(g.maxFps??missing)+' · Requested rendering rate: '+(g.cefTarget??g.cefTargetFps??missing),
+      'Frame clock: '+(g.frameClock||missing),
+      'Runtime: CEF '+(g.cefVersion||missing)+' · Chromium '+(g.chromiumVersion||missing)+' · SDL '+(g.sdlVersion||missing),
+      'Installation drive free space: '+number(g.installationFreeGiB,1)+' GiB',
+      '',
+      'Configuration checks:',
+      ...(notes.length?notes:['No issues flagged by these limited configuration checks.']),
+      '',
+      'Technical snapshot (for support):',
+      JSON.stringify({client:g,game},null,2),
+      '',
+      'Snapshot only: no gameplay history, FPS recording or automatic upload.',
+      'Requested rendering rate is not measured FPS. RAM/free space are current snapshots.',
+      'GPU driver versions are Windows interface versions. GPU budget/usage and host memory refer to the native host, not the Chromium GPU process or total GPU usage.',
+      'Saved game settings may differ from temporary console overrides; absent settings use game defaults.',
+      'Driver overlays, other applications and the exact circumstances of a drop are not captured.'
+    ].join('\n');
+  }
   function desktopPanel() {
     if (!document.body || document.getElementById('qrazy-prototype-tools')) return;
     // Match the existing Electron menu insertion point; no game data is read.
@@ -352,9 +438,17 @@
       action('Close panel',async()=>panel.remove());
       const diagnostics=document.createElement('details');diagnostics.style.cssText='margin-top:20px';
       const summary=document.createElement('summary');summary.textContent='Diagnostics';diagnostics.append(summary);
+      const symptomLabel=document.createElement('label');symptomLabel.textContent='FPS problem details (optional, included when copying):';
+      symptomLabel.style.cssText='display:block;margin-top:12px';
+      const symptoms=document.createElement('textarea');symptoms.maxLength=1000;symptoms.rows=3;symptoms.placeholder='Usual FPS → FPS during drops; map; when it happens (loading, crowded area, turning, or seemingly random).';
+      symptoms.style.cssText='display:block;width:100%;box-sizing:border-box;margin-top:6px;background:#111827;color:#e5e7eb;border:1px solid #64748b;padding:8px;font:inherit';
+      symptomLabel.append(symptoms);diagnostics.append(symptomLabel);
       const diagnosticActions=document.createElement('div');diagnosticActions.style.cssText='display:flex;flex-wrap:wrap;gap:12px;margin-top:12px';diagnostics.append(diagnosticActions);
-      action('Graphics report',async()=>{report.textContent=JSON.stringify((await rpc('diagnostics')).data,null,2);},diagnosticActions);
-      action('Copy report',async()=>{if(!report.textContent)return;await rpc('clipboard-write',{text:report.textContent});},diagnosticActions);
+      action('Graphics report',async()=>{
+        const g=(await rpc('diagnostics')).data;
+        report.textContent=supportGraphicsText(g,gameGraphicsSnapshot());
+      },diagnosticActions);
+      action('Copy report',async()=>{if(!report.textContent)return;await rpc('clipboard-write',{text:report.textContent+(symptoms.value.trim()?'\n\nPlayer observations:\n'+symptoms.value.trim():'')});},diagnosticActions);
       panel.append(diagnostics);menu.append(panel);
       try{showUpdate(clientNoticeState&&['available','ready'].includes(clientNoticeState.phase)?clientNoticeState:(await rpc('update-state')).data);}catch(error){versions.textContent='Installed version unavailable · Next version: not checked';report.textContent=error.message;}
     };

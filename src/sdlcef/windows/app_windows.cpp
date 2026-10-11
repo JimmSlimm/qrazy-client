@@ -1,5 +1,9 @@
 // Windows host implementation in progress. No game/input/physics implementation.
 #include <windows.h>
+#include <intrin.h>
+#include <psapi.h>
+#include <dxgi1_4.h>
+#include "include/cef_version.h"
 #include <dxgi1_2.h>
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -81,8 +85,20 @@ int RefreshRate() {
   return NominalRefreshRate(hz);
 }
 float CefScale(){float scale=SDL_GetWindowDisplayScale(window);return std::isfinite(scale)&&scale>0?scale:1.f;}
+std::string PresentationGpu() {
+  auto device=static_cast<ID3D11Device*>(SDL_GetPointerProperty(SDL_GetRendererProperties(renderer),SDL_PROP_RENDERER_D3D11_DEVICE_POINTER,nullptr));
+  IDXGIDevice* dxgi=nullptr;IDXGIAdapter* adapter=nullptr;DXGI_ADAPTER_DESC desc{};
+  if(!device||FAILED(device->QueryInterface(__uuidof(IDXGIDevice),reinterpret_cast<void**>(&dxgi))))return "Unavailable";
+  const bool found=SUCCEEDED(dxgi->GetAdapter(&adapter))&&SUCCEEDED(adapter->GetDesc(&desc));
+  if(adapter)adapter->Release();dxgi->Release();
+  if(!found)return "Unavailable";
+  const int size=WideCharToMultiByte(CP_UTF8,0,desc.Description,-1,nullptr,0,nullptr,nullptr);
+  if(size<=1)return "Unavailable";
+  std::string name(static_cast<size_t>(size),'\0');WideCharToMultiByte(CP_UTF8,0,desc.Description,-1,name.data(),size,nullptr,nullptr);name.pop_back();return name;
+}
 int Dip(float coordinate){return static_cast<int>(coordinate/CefScale());}
 #include "frame_clock.h"
+#include "graphics_report.h"
 class Texture {
   QrazyWindows::BorrowedTextureCopy copy_;
   SDL_Texture* texture_=nullptr;
@@ -313,7 +329,11 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     }else if(op=="changelog") {
       std::ifstream changes(updater_worker.root/"runtime"/"CHANGES.txt",std::ios::binary);std::string text(16001,'\0');changes.read(text.data(),16001);text.resize(static_cast<size_t>(changes.gcount()));if(!changes.is_open()||changes.bad()||text.size()>16000){Reply(id,QrazyWindows::Error("Release notes unavailable"));return true;}auto value=CefValue::Create();value->SetString(text);Reply(id,QrazyWindows::Success(value));return true;
     }else if(op=="diagnostics") {
-      auto report=Dict();report->SetString("platform","Windows SDL3 + CEF");report->SetInt("cefTarget",render_preferences.CefTarget(render_rate));report->SetBool("sdlVSync",render_preferences.vsync);report->SetString("acceptance","Compiled source; manual Windows GPU, sandbox and desktop acceptance pending");Reply(id,QrazyWindows::Success(QrazyWindows::Value(report)));return true;
+      auto report=Dict();report->SetString("platform","Windows SDL3 + CEF");report->SetString("client",client_title);
+      report->SetString("presentationGpu",PresentationGpu());report->SetString("renderer","Direct3D 11");
+      report->SetInt("cefTarget",render_preferences.CefTarget(render_rate));report->SetInt("maxFps",render_preferences.max_fps);report->SetBool("sdlVSync",render_preferences.vsync);
+      report->SetInt("refreshHz",RefreshRate());int width=0,height=0;SDL_GetWindowSizeInPixels(window,&width,&height);report->SetInt("pixelWidth",width);report->SetInt("pixelHeight",height);
+      report->SetDouble("displayScale",SDL_GetWindowDisplayScale(window));SupportGraphics(report);Reply(id,QrazyWindows::Success(QrazyWindows::Value(report)));return true;
     }else if(op=="clock")result->SetDouble("time",SDL_GetTicksNS()/1e6);
     else if(op=="capture") {
       const char* why=closing?"closing":recovering?"recovering":loading?"loading":dialog_active?"dialog":SDL_GetKeyboardFocus()!=window?"no-keyboard-focus":nullptr;
@@ -433,6 +453,10 @@ int Run(HINSTANCE instance,void* sandbox) {
     CefBrowserSettings bs;bs.windowless_frame_rate=render_preferences.CefTarget(render_rate);bs.background_color=CefColorSetARGB(255,0,0,0);
     if(result||!CefBrowserHost::CreateBrowser(info,client,transitioning?"about:blank":kOrigin,bs,nullptr,request_context)){if(!result)result=5;}
     bool close_sent=false;auto refresh=std::chrono::steady_clock::now();SDL_StartTextInput(window);
+    auto update_display=[&](){
+      if(!frame_clock.UpdateDisplay(hwnd)){client->fatal=true;closing=true;return;}
+      int rate=RefreshRate();if(rate&&rate!=render_rate){render_rate=rate;if(client->browser)client->browser->GetHost()->SetWindowlessFrameRate(render_preferences.CefTarget(rate));}
+    };
     auto render_frame=[&](){client->dirty=false;SDL_SetRenderDrawColor(renderer,6,12,22,255);SDL_RenderClear(renderer);
         if(client->loading||client->recovering){
           SDL_SetRenderScale(renderer,2,2);SDL_SetRenderDrawColor(renderer,251,191,36,255);
@@ -487,9 +511,10 @@ int Run(HINSTANCE instance,void* sandbox) {
         auto list=CefListValue::Create();list->SetString(0,choice.path);if(choice.save)list->SetString(1,choice.text);
         if(!asset_worker.Submit(choice.id,choice.save?"config-write":"config-read",list))client->Reply(choice.id,QrazyWindows::Error("Config worker unavailable or busy"));
       }
-      if(std::chrono::steady_clock::now()>=refresh){int rate=RefreshRate();if(rate&&rate!=render_rate){render_rate=rate;if(client->browser)client->browser->GetHost()->SetWindowlessFrameRate(render_preferences.CefTarget(rate));}refresh=std::chrono::steady_clock::now()+std::chrono::seconds(1);}
+      if(std::chrono::steady_clock::now()>=refresh){update_display();refresh=std::chrono::steady_clock::now()+std::chrono::seconds(1);}
       SDL_Event e;auto move_batch=CefListValue::Create(); /* captured-mouse samples from this pass go out as one message */
       while(SDL_PollEvent(&e)) {
+        if(e.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED||e.type==SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED||e.type==SDL_EVENT_DISPLAY_ADDED||e.type==SDL_EVENT_DISPLAY_REMOVED)update_display();
         if(((e.type==SDL_EVENT_MOUSE_BUTTON_DOWN&&e.button.button==SDL_BUTTON_LEFT)||(e.type==SDL_EVENT_KEY_DOWN&&(e.key.key==SDLK_RETURN||e.key.key==SDLK_SPACE)))&&SDL_GetKeyboardFocus()==window)update_gesture=SDL_GetTicksNS();
         if(e.type==SDL_EVENT_QUIT||e.type==SDL_EVENT_WINDOW_CLOSE_REQUESTED)closing=true;
         if(e.type==SDL_EVENT_WINDOW_FOCUS_LOST||e.type==SDL_EVENT_WINDOW_MINIMIZED) {

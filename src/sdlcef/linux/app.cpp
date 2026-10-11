@@ -425,7 +425,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   void GetViewRect(CefRefPtr<CefBrowser>, CefRect& rect) override { int w,h; SDL_GetWindowSize(window, &w,&h); rect = CefRect(0,0,std::max(w,1),std::max(h,1)); }
   void OnAfterCreated(CefRefPtr<CefBrowser> b) override {
     browser = b;
-    browser->GetHost()->SetWindowlessFrameRate(render_rate);
+    browser->GetHost()->SetWindowlessFrameRate(pacing.active ? pacing.Target(render_rate) : render_rate);
     if (hidden_check) browser->GetHost()->SetAudioMuted(true);
     else browser->GetHost()->SetFocus(SDL_GetKeyboardFocus() == window);
     server_retry.Start(SDL_GetTicks());server_retry.Attempt(SDL_GetTicks());connect_started=SDL_GetTicks();
@@ -490,10 +490,15 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     auto data = Dict(); data->SetString("type", "state"); data->SetString("reason", reason); Send(data);
     std::fprintf(stderr, "QRAZY capture-released reason=%s\n", reason);
   }
-  void RequestFrame() { /* experimental pacing only: one begin frame per clock tick */
+  Uint64 frame_sent=0;
+  void RequestFrame() { /* experimental only; request after input and presentation */
     if(!pacing.active)return;
     pacing_clock.Configure(pacing.Target(render_rate));
     if(!browser||closing||!pacing_clock.Take())return;
+    const Uint64 now=SDL_GetTicksNS();
+    const int target=pacing.Target(render_rate);
+    if(now-frame_sent<1000000000ull/static_cast<Uint64>(target))return;
+    frame_sent=now;
     browser->GetHost()->SendExternalBeginFrame();
   }
   void RenderSettingsChanged() {
@@ -613,6 +618,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
           pacing = previous; SDL_GL_SetSwapInterval(pacing.vsync ? 1 : 0);
           result->SetBool("ok", false); result->SetString("error", "Rendering setting could not be applied and saved");
         } else {
+          browser->GetHost()->SetWindowlessFrameRate(pacing.Target(render_rate));
           result->SetDictionary("data", is_vsync ? pacing.VSyncState() : pacing.MaxFpsState());
           RenderSettingsChanged();
         }
@@ -877,7 +883,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     bool close_sent = false;
     auto refresh_at = std::chrono::steady_clock::now();
     while (!closed) {
-      CefDoMessageLoopWork();client->PumpDesktop();client->PumpRetry();client->RequestFrame();
+      CefDoMessageLoopWork();client->PumpDesktop();client->PumpRetry();
       // Also catch refresh changes that do not move or resize the window.
       if (std::chrono::steady_clock::now() >= refresh_at) {
         int rate = DisplayRenderRate();
@@ -996,6 +1002,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
           swap_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
         }
       }
+      client->RequestFrame();
       SDL_Delay(1);
     }
     desktop_worker.Reset();if(!hidden_check){saved_window.Observe();saved_window.Save();}

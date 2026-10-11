@@ -1,6 +1,17 @@
 {
   "releases": [
     {
+      "version": "0.4.5",
+      "date": "2026-10-11",
+      "added": [
+        "Windows: the Client panel's Diagnostics now builds a readable graphics support report (system, GPU, display and game renderer details) with an optional box for describing FPS problems, included when you copy it."
+      ],
+      "changed": [],
+      "fixed": [
+        "Windows: frame timing now follows the monitor the window is on when you move it or change display settings."
+      ]
+    },
+    {
       "version": "0.4.4",
       "date": "2026-10-10",
       "added": [],
