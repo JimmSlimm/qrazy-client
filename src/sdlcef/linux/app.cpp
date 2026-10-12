@@ -490,15 +490,10 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     auto data = Dict(); data->SetString("type", "state"); data->SetString("reason", reason); Send(data);
     std::fprintf(stderr, "QRAZY capture-released reason=%s\n", reason);
   }
-  Uint64 frame_sent=0;
   void RequestFrame() { /* experimental only; request after input and presentation */
     if(!pacing.active)return;
     pacing_clock.Configure(pacing.Target(render_rate));
     if(!browser||closing||!pacing_clock.Take())return;
-    const Uint64 now=SDL_GetTicksNS();
-    const int target=pacing.Target(render_rate);
-    if(now-frame_sent<1000000000ull/static_cast<Uint64>(target))return;
-    frame_sent=now;
     browser->GetHost()->SendExternalBeginFrame();
   }
   void RenderSettingsChanged() {
@@ -1003,7 +998,8 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
         }
       }
       client->RequestFrame();
-      SDL_Delay(1);
+      if(pacing.active)pacing_clock.Wait();
+      else SDL_Delay(1);
     }
     desktop_worker.Reset();if(!hidden_check){saved_window.Observe();saved_window.Save();}
     CefRefPtr<CookieFlushed> flushed=new CookieFlushed;

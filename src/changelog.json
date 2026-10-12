@@ -1,6 +1,18 @@
 {
   "releases": [
     {
+      "version": "0.4.6",
+      "date": "2026-10-12",
+      "added": [],
+      "changed": [
+        "Player numbers now appear beside names in the Tab overlay when the game provides them.",
+        "Linux: the opt-in experimental frame pacing now uses a reworked frame timer."
+      ],
+      "fixed": [
+        "Windows: mouse capture now keeps the cursor confined to the window, and releases capture if Windows lifts the confinement (for example while moving or resizing the window)."
+      ]
+    },
+    {
       "version": "0.4.5",
       "date": "2026-10-11",
       "added": [

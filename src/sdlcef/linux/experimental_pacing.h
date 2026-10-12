@@ -2,12 +2,13 @@
 // Opt-in experimental frame pacing for Linux. Off unless the player enables it from the game console; the saved flag
 // applies on the NEXT start. A run that does not exit cleanly clears the flag again, so a broken start cannot repeat.
 #include <algorithm>
-#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <thread>
-#include <time.h>
+#include <mutex>
 
 struct ExperimentalPacing {
   bool enabled=false; // saved preference for the next start
@@ -53,32 +54,58 @@ struct ExperimentalPacing {
   }
 };
 
-// Independent begin-frame clock: a worker sleeps to absolute CLOCK_MONOTONIC deadlines (no drift) and sets one coalesced
-// "tick" flag. Only the SDL thread takes ticks and calls CEF; nothing else moves off that thread.
+// One rate controller. Absolute monotonic deadlines preserve cadence despite dispatch jitter;
+// missed deadlines are skipped, never replayed. The SDL thread alone calls CEF and owns graphics.
 class TimerBeginClock {
-  std::atomic<bool> running_{false},pending_{false};
-  std::atomic<long long> period_ns_{4000000};
+  using Clock=std::chrono::steady_clock;
+  std::mutex mutex_;
+  std::condition_variable changed_,tick_;
+  bool running_=false,pending_=false;
+  long long period_ns_=4000000;
+  unsigned generation_=0;
   std::thread thread_;
  public:
   ~TimerBeginClock(){Stop();}
+  static Clock::time_point NextDeadline(Clock::time_point due,Clock::time_point now,long long period_ns) {
+    const auto period=std::chrono::nanoseconds(period_ns);
+    return due+period*((now-due)/period+1);
+  }
   bool Start() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if(running_)return true;
     running_=true;
     thread_=std::thread([this]{
-      timespec next{};clock_gettime(CLOCK_MONOTONIC,&next);
-      while(running_) {
-        long long period=period_ns_.load();
-        next.tv_nsec+=period;
-        while(next.tv_nsec>=1000000000){next.tv_nsec-=1000000000;++next.tv_sec;}
-        clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&next,nullptr);
-        timespec now{};clock_gettime(CLOCK_MONOTONIC,&now);
-        const long long late=(now.tv_sec-next.tv_sec)*1000000000ll+(now.tv_nsec-next.tv_nsec);
-        if(late>50000000ll)next=now; // far behind (suspend, stall): resynchronise instead of bursting
-        if(running_)pending_=true;    // coalesce; never queue a backlog
-      }
+        std::unique_lock<std::mutex> lock(mutex_);
+        unsigned generation=generation_;
+        auto next=Clock::now()+std::chrono::nanoseconds(period_ns_);
+        while(running_) {
+          if(changed_.wait_until(lock,next,[&]{return !running_||generation!=generation_;})) {
+            if(!running_)break;
+            generation=generation_;
+            next=Clock::now()+std::chrono::nanoseconds(period_ns_);
+            continue;
+          }
+          pending_=true;tick_.notify_one();
+          next=NextDeadline(next,Clock::now(),period_ns_);
+        }
     });
     return thread_.joinable();
   }
-  bool Take(){return pending_.exchange(false);}
-  void Configure(int fps){period_ns_=1000000000ll/std::clamp(fps,30,10000);}
-  void Stop(){running_=false;if(thread_.joinable())thread_.join();}
+  bool Take(){std::lock_guard<std::mutex> lock(mutex_);bool tick=pending_;pending_=false;return tick;}
+  void Configure(int fps){
+    std::lock_guard<std::mutex> lock(mutex_);
+    const long long period=1000000000ll/std::clamp(fps,30,10000);
+    if(period==period_ns_)return;
+    period_ns_=period;++generation_;pending_=false;changed_.notify_one();
+  }
+  void Wait(){
+    std::unique_lock<std::mutex> lock(mutex_);
+    // Keep the existing <=1 ms polling interval for CEF/SDL events, but a frame
+    // tick wakes us immediately instead of waiting for a whole extra millisecond.
+    tick_.wait_for(lock,std::chrono::milliseconds(1),[&]{return pending_||!running_;});
+  }
+  void Stop(){
+    {std::lock_guard<std::mutex> lock(mutex_);running_=false;pending_=false;changed_.notify_one();tick_.notify_one();}
+    if(thread_.joinable())thread_.join();
+  }
 };

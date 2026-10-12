@@ -46,6 +46,18 @@ std::string client_title="Qrazy";
 SDL_Renderer* renderer=nullptr;
 HWND hwnd=nullptr;
 bool closing=false,closed=false,captured=false;
+// Windows can clear cursor confinement independently of SDL's relative-mode
+// flag (for example during native move/resize). Check the actual OS rectangle.
+bool ConfineCapturedCursor() {
+  if(!hwnd||GetForegroundWindow()!=hwnd||SDL_GetKeyboardFocus()!=window||IsIconic(hwnd))return false;
+  RECT bounds{},clip{};POINT origin{};
+  if(!GetClientRect(hwnd,&bounds)||!ClientToScreen(hwnd,&origin))return false;
+  OffsetRect(&bounds,origin.x,origin.y);
+  if(bounds.right<=bounds.left||bounds.bottom<=bounds.top)return false;
+  if(GetClipCursor(&clip)&&clip.right>clip.left&&clip.bottom>clip.top&&
+     clip.left>=bounds.left&&clip.top>=bounds.top&&clip.right<=bounds.right&&clip.bottom<=bounds.bottom)return true;
+  return ClipCursor(&bounds)!=FALSE;
+}
 int generation=0,render_rate=0;
 #include "render_preferences.h"
 RenderPreferences render_preferences;
@@ -227,6 +239,7 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   void Reply(int id,CefRefPtr<CefDictionaryValue> value){auto data=Dict();data->SetString("type","reply");data->SetInt("id",id);data->SetDictionary("value",value);Send(data);}
   void Release(const char* reason) {
     SDL_SetWindowRelativeMouseMode(window,false);SDL_EnableScreenSaver();
+    if(captured)ClipCursor(nullptr);
     if(!captured)return;captured=false;++generation;
     if(SDL_GetKeyboardFocus()==window)SDL_StartTextInput(window);
     auto data=Dict();data->SetString("type","state");data->SetString("reason",reason);Send(data);
@@ -342,6 +355,7 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       if(!why&&SDL_GetMouseFocus()!=window){int w=0,h=0;SDL_GetWindowSize(window,&w,&h);SDL_WarpMouseInWindow(window,w/2.f,h/2.f);}
       bool ok=!why&&SDL_SetWindowRelativeMouseMode(window,true);
       if(!why&&!ok)why="relative-mode-failed";
+      if(ok&&!ConfineCapturedCursor()){ok=false;why="cursor-confinement-failed";SDL_SetWindowRelativeMouseMode(window,false);}
       if(why)result->SetString("reason",why);
       captured=ok;if(ok){SDL_StopTextInput(window);if(!SDL_DisableScreenSaver())std::fprintf(stderr,"PROTOTYPE idle inhibition failed\n");}
       result->SetBool("ok",ok);result->SetInt("generation",++generation);
@@ -539,6 +553,7 @@ int Run(HINSTANCE instance,void* sandbox) {
         if(e.type==SDL_EVENT_MOUSE_WHEEL){CefMouseEvent mouse;mouse.x=Dip(e.wheel.mouse_x);mouse.y=Dip(e.wheel.mouse_y);mouse.modifiers=MouseModifiers()&~static_cast<uint32_t>(EVENTFLAG_CONTROL_DOWN);float sign=e.wheel.direction==SDL_MOUSEWHEEL_FLIPPED?-1.f:1.f;client->browser->GetHost()->SendMouseWheelEvent(mouse,static_cast<int>(client->wheel_x+=120*e.wheel.x*sign),static_cast<int>(client->wheel_y+=120*e.wheel.y*sign));client->wheel_x-=static_cast<int>(client->wheel_x);client->wheel_y-=static_cast<int>(client->wheel_y);}
       }
       if(move_batch->GetSize()&&client->browser){auto d=Dict();d->SetString("type","move");d->SetList("samples",move_batch);client->Send(d);}
+      if(captured&&!ConfineCapturedCursor())client->Release("cursor-confinement-lost");
       if(closing&&client->browser&&!close_sent){client->Release("close");client->browser->GetHost()->CloseBrowser(true);close_sent=true;}
       if(client->dirty||client->loading||client->recovering)render_frame();
       if(frame_clock.Failed()){client->fatal=true;closing=true;}

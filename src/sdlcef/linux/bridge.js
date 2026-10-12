@@ -24,6 +24,12 @@
         if (parts[i + 1]) add(parent, 'span', parts[i + 1], `color:${color || 'inherit'}`);
       }
     };
+    const playerName = (parent, row) => {
+      const run = add(parent, 'span', '', 'display:flex;align-items:baseline;min-width:0;max-width:100%;gap:8px');
+      if (row.playerNumber !== null) add(run, 'span', '#' + row.playerNumber, 'color:#9eafc5;font-size:0.82em;font-variant-numeric:tabular-nums;flex:none;min-width:3ch;text-align:right;white-space:nowrap');
+      const name = add(run, 'span', '', 'min-width:0;overflow-wrap:anywhere');
+      coloredName(name, row);
+    };
     const coloredName = (parent, row) => {
       if (!row.clanTag) { coloredText(parent, row.coloredName || row.name); return; }
       // One inline run lets layout measure and truncate tag + space + name together.
@@ -95,7 +101,7 @@
         [row.name, row.pb || '\u2014', row.sessionBest || '\u2014', row.ping || '\u2014'].forEach((cell, i) => {
           const td = add(tr, 'td', i === 0 ? '' : cell, `text-align:${i ? 'right' : 'left'};padding:8px 12px;border-bottom:1px solid #26354b;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;${i ? 'white-space:nowrap' : ''}`);
           if (i === 0) {
-            coloredName(td, row);
+            playerName(td, row);
             if (highlight) add(td, 'div', highlight, 'font-size:11px;font-weight:900;letter-spacing:1px;color:#0b1424;background:#fbbf24;border-radius:3px;padding:1px 6px;display:inline-block;margin-top:4px');
           }
           if (i === 1 && row.pb && row.pb !== '\u2014') comparison(td, row.pbWrComparison);
@@ -112,7 +118,7 @@
     if (!data.spectators.length) spectatorNames.textContent = 'None';
     for (const row of data.spectators) {
       const chip = add(spectatorNames, 'span', '', `background:#19263a;border:1px solid #52637b;border-radius:5px;padding:3px 10px;overflow-wrap:anywhere;${row.clanTag ? 'min-width:0;max-width:100%;box-sizing:border-box;' : ''}`);
-      coloredName(chip, row);
+      playerName(chip, row);
     }
     const playerCount = data.mode === 'Solo' ? data.groups.reduce((count, group) => count + group.rows.length, 0) + data.spectators.length : data.multiplayer.total;
     add(box, 'div', `${playerCount} ${playerCount === 1 ? 'player' : 'players'} \u00b7 Release Tab to return${data.legacy ? ' \u00b7 Category, PB, session-best and WR data need the updated game adapter' : data.mode === 'Solo' ? ' \u00b7 Session best: local untainted finish, not server-verified' : ' \u00b7 Session best: hub-reported, not replay-verified'}`, 'font-size:13px;color:#9eafc5;margin-top:12px');
@@ -122,6 +128,7 @@
     version: 1,
     layoutVersion: 3,
     supportsProfileRecords: true,
+    supportsPlayerNumbers: true,
     report(value) {
       const states = ['loading', 'ready', 'unavailable', 'disconnected'];
       if (!value || !states.includes(value.leaderboard?.state) || !states.includes(value.multiplayer?.state) ||
@@ -130,7 +137,7 @@
       const rows = value.leaderboard.rows.map(r => ({rank: infoText(r.rank, 12), name: infoText(r.name, 64), time: infoText(r.time, 48)}));
       const players = value.multiplayer.rows.map(r => ({name: infoText(r.name, 64), status: infoText(r.status, 32), detail: infoText(r.detail, 64), ping: infoText(r.ping, 16)}));
       const clan = r => ({clanTag: infoText(r.clanTag, 192), clanOfficial: r.clanOfficial === true, coloredBaseName: infoText(r.coloredBaseName, 192)});
-      const player = r => ({...clan(r), watching: r.watching === true, you: r.you === true, coloredName: infoText(r.coloredName, 192), pbWrComparison: infoText(r.pbWrComparison, 32), sessionWrComparison: infoText(r.sessionWrComparison, 32), name: infoText(r.name, 96), pb: infoText(r.pb, 48), sessionBest: infoText(r.sessionBest, 48), ping: infoText(r.ping, 16)});
+      const player = r => ({...clan(r), playerNumber: Number.isSafeInteger(r.playerNumber) && r.playerNumber >= 0 ? r.playerNumber : null, watching: r.watching === true, you: r.you === true, coloredName: infoText(r.coloredName, 192), pbWrComparison: infoText(r.pbWrComparison, 32), sessionWrComparison: infoText(r.sessionWrComparison, 32), name: infoText(r.name, 96), pb: infoText(r.pb, 48), sessionBest: infoText(r.sessionBest, 48), ping: infoText(r.ping, 16)});
       const legacy = !Array.isArray(value.multiplayer.groups);
       let groups, spectators;
       if (legacy) {
