@@ -1,6 +1,15 @@
 {
   "releases": [
     {
+      "version": "0.4.7",
+      "date": "2026-10-12",
+      "added": [
+        "Windows: spray slots can now open a file picker to choose an image (PNG, JPG, GIF, WebP or BMP)."
+      ],
+      "changed": [],
+      "fixed": []
+    },
+    {
       "version": "0.4.6",
       "date": "2026-10-12",
       "added": [],

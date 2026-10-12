@@ -226,7 +226,18 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   bool CanDownload(CefRefPtr<CefBrowser> value,const CefString& url,const CefString& method) override {return !closing && value && Trusted(value->GetMainFrame()->GetURL()) && method=="GET" && DemoDownload::TrustedBlob(url.ToString());}
   bool OnBeforeDownload(CefRefPtr<CefBrowser> value,CefRefPtr<CefDownloadItem> item,const CefString& name,CefRefPtr<CefBeforeDownloadCallback> callback) override {if(!closing && !dialog_active && value && Trusted(value->GetMainFrame()->GetURL()) && DemoDownload::TrustedBlob(item->GetOriginalUrl().ToString()) && DemoDownload::ExportName(name.ToString())) {Release("export-save");DemoDownload::Save(window,name.ToString(),callback);}return true;}
   void OnDownloadUpdated(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem> item,CefRefPtr<CefDownloadItemCallback> callback) override {if(!DemoDownload::TrustedBlob(item->GetOriginalUrl().ToString()))callback->Cancel();}
-  bool OnFileDialog(CefRefPtr<CefBrowser>,FileDialogMode,const CefString&,const CefString&,const std::vector<CefString>&,const std::vector<CefString>&,const std::vector<CefString>&,CefRefPtr<CefFileDialogCallback> callback) override{callback->Cancel();return true;}
+  // Only single-file image pickers (spray slots) from the trusted page are allowed; everything else is cancelled.
+  static void SDLCALL ImageChosen(void* userdata,const char* const* files,int) {
+    std::unique_ptr<CefRefPtr<CefFileDialogCallback>> callback(static_cast<CefRefPtr<CefFileDialogCallback>*>(userdata));
+    if(files&&files[0])(*callback)->Continue({CefString(std::string(files[0]))});else (*callback)->Cancel();
+    dialog_active=false;
+  }
+  bool OnFileDialog(CefRefPtr<CefBrowser> value,FileDialogMode mode,const CefString&,const CefString&,const std::vector<CefString>& filters,const std::vector<CefString>&,const std::vector<CefString>&,CefRefPtr<CefFileDialogCallback> callback) override{
+    bool images=!filters.empty();for(const auto& filter:filters)if(filter.ToString().rfind("image/",0)!=0)images=false;
+    if((static_cast<int>(mode)&0xFF)!=static_cast<int>(FILE_DIALOG_OPEN)||!images||closing||recovering||loading||captured||SDL_GetKeyboardFocus()!=window||DemoDownload::active||!value||!Trusted(value->GetMainFrame()->GetURL())||dialog_active.exchange(true)){callback->Cancel();return true;}
+    static const SDL_DialogFileFilter image_filter={"Images","png;jpg;jpeg;gif;webp;bmp"};
+    SDL_ShowOpenFileDialog(ImageChosen,new CefRefPtr<CefFileDialogCallback>(callback),window,&image_filter,1,nullptr,false);return true;
+  }
   void OnTextSelectionChanged(CefRefPtr<CefBrowser>,const CefString& text,const CefRange&) override{selection=text.ToString().substr(0,1048576);}
   void OnImeCompositionRangeChanged(CefRefPtr<CefBrowser>,const CefRange&,const RectList& bounds) override {
     if(bounds.empty())return;auto r=bounds.back();float scale=CefScale();SDL_Rect area{static_cast<int>(r.x*scale),static_cast<int>(r.y*scale),static_cast<int>(r.width*scale),static_cast<int>(r.height*scale)};SDL_SetTextInputArea(window,&area,area.w);
