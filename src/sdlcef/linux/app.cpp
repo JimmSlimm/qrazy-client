@@ -490,6 +490,17 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     auto data = Dict(); data->SetString("type", "state"); data->SetString("reason", reason); Send(data);
     std::fprintf(stderr, "QRAZY capture-released reason=%s\n", reason);
   }
+  Uint64 presentation_started=SDL_GetTicksNS();
+  unsigned presentation_count=0;
+  void PresentationTick() { /* experimental pacing only: measured successful swaps per second, sent about twice a second */
+    if(!pacing.active)return;
+    const Uint64 now=SDL_GetTicksNS(),elapsed=now-presentation_started;
+    if(elapsed<500000000ull)return;
+    auto data=Dict();data->SetString("type","presentation-rate");
+    data->SetDouble("fps",presentation_count*1e9/static_cast<double>(elapsed));
+    data->SetDouble("intervalMs",elapsed/1e6);data->SetInt("presents",static_cast<int>(presentation_count));
+    Send(data);presentation_count=0;presentation_started=now;
+  }
   void RequestFrame() { /* experimental only; request after input and presentation */
     if(!pacing.active)return;
     pacing_clock.Configure(pacing.Target(render_rate));
@@ -626,7 +637,18 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   void Motion(const SDL_MouseMotionEvent& e) {
     if (!captured || SDL_GetKeyboardFocus() != window) return;
     auto sample = Dict(); sample->SetInt("generation", generation); sample->SetDouble("time", e.timestamp/1e6); sample->SetDouble("dx", e.xrel); sample->SetDouble("dy", e.yrel);
-    auto list = CefListValue::Create(); list->SetDictionary(0, sample);
+    if (!pacing.active) { /* normal path unchanged: one message per motion event */
+      auto list = CefListValue::Create(); list->SetDictionary(0, sample);
+      auto data = Dict(); data->SetString("type", "move"); data->SetList("samples", list); Send(data);
+      return;
+    }
+    move_batch->SetDictionary(move_batch->GetSize(), sample); /* experimental pacing only: batched per loop pass */
+  }
+  CefRefPtr<CefListValue> move_batch = CefListValue::Create(); /* captured-mouse samples from one loop pass go out as one message */
+  void FlushMotion() {
+    if (!move_batch->GetSize()) return;
+    auto list = move_batch; move_batch = CefListValue::Create();
+    if (!browser) return;
     auto data = Dict(); data->SetString("type", "move"); data->SetList("samples", list); Send(data);
   }
   void OnPaint(CefRefPtr<CefBrowser>, PaintElementType, const RectList&, const void*, int, int) override {
@@ -976,6 +998,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
           client->wheel_x-=static_cast<int>(client->wheel_x);client->wheel_y-=static_cast<int>(client->wheel_y);
         }
       }
+      client->FlushMotion();
       if (closing && client->browser && !close_sent) { client->Release("close"); client->browser->GetHost()->CloseBrowser(true); close_sent=true; }
       bool native_card=!hidden_check&&(client->install_confirmation||client->recovering||client->loading);
       if(client->install_confirmation)RecoveryCard("INSTALL VERIFIED UPDATE","QRAZY WILL CLOSE. REOPEN MANUALLY",true);
@@ -995,8 +1018,10 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
             std::fprintf(stderr, "QRAZY SDL swap failed: %s\n", SDL_GetError());
           }
           swap_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
+          if(errors==0)++client->presentation_count;
         }
       }
+      client->PresentationTick();
       client->RequestFrame();
       if(pacing.active)pacing_clock.Wait();
       else SDL_Delay(1);

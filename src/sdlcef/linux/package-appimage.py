@@ -26,7 +26,7 @@ def main():
     manifest = json.loads(payload)
     if manifest['platform'] != 'linux-x64':
         raise ValueError('Expected Linux signed runtime')
-    if target.name != 'Qrazy-SDLCEF-linux-x64-distribution-' + manifest['version'] + '.AppImage':
+    if target.name != 'Qrazy-linux-x64.AppImage':
         raise ValueError('Unexpected AppImage asset name')
     inventory = []
     for file in sorted(root.rglob('*')):

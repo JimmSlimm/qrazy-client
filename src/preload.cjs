@@ -71,11 +71,11 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
     for (const physics of ['pql','vql']) for (const category of ['w','s']) {
       const record = data.records.find(r => r.physics === physics && r.category === category);
       const active = data.activeRecord?.physics === physics && data.activeRecord?.category === category;
-      const card = add(records, 'div', '', `background:${active ? '#34301e' : '#152238'};border:2px solid ${active ? '#fbbf24' : 'transparent'};border-radius:6px;padding:10px 12px;min-width:0`);
+      const card = add(records, 'div', '', `background:${active ? '#1d2535' : '#152238'};border:2px solid ${active ? '#8a7a45' : 'transparent'};border-radius:6px;padding:10px 12px;min-width:0`);
       if (active) {
         const label = data.activeRecord.source === 'pov' ? 'WATCHING' : 'YOU';
         card.setAttribute('aria-label', `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : 'STRAFE'} world record — ${label}`);
-        add(card, 'div', label, 'font-size:12px;font-weight:900;letter-spacing:1px;color:#0b1424;background:#fbbf24;border-radius:3px;padding:2px 7px;display:inline-block;margin-bottom:6px');
+        add(card, 'div', label, 'font-size:10px;font-weight:700;letter-spacing:1px;color:#b8a96a;display:inline-block;margin-bottom:6px');
       }
       add(card, 'div', `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : 'STRAFE'} · WR`, 'font-size:13px;font-weight:750;color:#fbbf24');
       const recordTime = record?.state === 'ready' ? record.time || 'No record' : record?.state === 'loading' ? 'Loading…' : 'Unavailable';
@@ -93,28 +93,32 @@ if (process.isMainFrame && location.origin === desktopGameOrigin) {
       if (record?.state === 'ready') coloredName(name, record); else name.textContent = 'Awaiting game data';
     }
     const columns = add(box, 'div', '', 'display:grid;gap:14px');
+    let table = null, body = null;
     function panel(title, rows) {
-      const section = add(columns, 'div', '', 'min-width:0');
-      add(section, 'div', title, 'font-size:18px;font-weight:750;color:#fbbf24;background:#19263a;padding:8px 12px;border-left:3px solid #fbbf24');
-      const table = add(section, 'table', '', 'width:100%;border-collapse:collapse;font-size:17px;table-layout:fixed');
-      const head = document.createElement('thead'); table.append(head);
-      const tr = document.createElement('tr'); head.append(tr);
-      ['Player','PB','Session best','Ping'].forEach((h, i) => add(tr, 'th', h, `width:${[46,22,22,10][i]}%;text-align:${i ? 'right' : 'left'};color:#9eafc5;font-size:14px;padding:6px 12px;border-bottom:1px solid #40516a`));
-      const body = document.createElement('tbody'); table.append(body);
+      if (!table) {
+        table = add(columns, 'table', '', 'width:100%;border-collapse:collapse;font-size:17px;table-layout:fixed');
+        const head = document.createElement('thead'); table.append(head);
+        const hr = document.createElement('tr'); head.append(hr);
+        ['Player','PB','Session best','Ping'].forEach((h, i) => add(hr, 'th', h, `width:${[46,22,22,10][i]}%;text-align:${i ? 'right' : 'left'};color:#9eafc5;font-size:14px;padding:6px 12px;border-bottom:1px solid #40516a`));
+        body = document.createElement('tbody'); table.append(body);
+      }
+      const gr = document.createElement('tr'); body.append(gr);
+      const gc = add(gr, 'td', title, 'font-size:18px;font-weight:750;color:#fbbf24;background:#19263a;padding:8px 12px;border-left:3px solid #fbbf24');
+      gc.colSpan = 4;
       rows.forEach(row => {
         const tr = document.createElement('tr'); body.append(tr);
         const watching = data.mode === 'Spectating' && row.watching;
         const self = ['Multiplayer', 'Solo'].includes(data.mode) && row.you;
         const highlight = watching ? 'WATCHING' : self ? 'YOU' : null;
         if (highlight) {
-          tr.style.cssText = 'background:#34301e;box-shadow:inset 3px 0 #fbbf24';
+          tr.style.cssText = 'background:#1d2535;box-shadow:inset 2px 0 #8a7a45';
           tr.setAttribute('aria-label', `${row.name} — ${highlight}`);
         }
         [row.name, row.pb || '\u2014', row.sessionBest || '\u2014', row.ping || '\u2014'].forEach((cell, i) => {
           const td = add(tr, 'td', i === 0 ? '' : cell, `text-align:${i ? 'right' : 'left'};padding:8px 12px;border-bottom:1px solid #26354b;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;${i ? 'white-space:nowrap' : ''}`);
           if (i === 0) {
             coloredName(td, row);
-            if (highlight) add(td, 'div', highlight, 'font-size:11px;font-weight:900;letter-spacing:1px;color:#0b1424;background:#fbbf24;border-radius:3px;padding:1px 6px;display:inline-block;margin-top:4px');
+            if (highlight) add(td, 'div', highlight, 'font-size:10px;font-weight:700;letter-spacing:1px;color:#b8a96a;display:inline-block;margin-top:2px');
           }
           if (i === 1 && row.pb && row.pb !== '\u2014') comparison(td, row.pbWrComparison);
           if (i === 2 && row.sessionBest && row.sessionBest !== '\u2014') comparison(td, row.sessionWrComparison);

@@ -1,6 +1,16 @@
 {
   "releases": [
     {
+      "version": "0.4.8",
+      "date": "2026-10-13",
+      "added": [],
+      "changed": [
+        "Downloads now have stable names, so permanent links always give the newest Windows ZIP, Windows installer and Linux AppImage.",
+        "The Tab overlay shows all players under a single column header, with less prominent YOU and WATCHING badges and highlights."
+      ],
+      "fixed": []
+    },
+    {
       "version": "0.4.7",
       "date": "2026-10-12",
       "added": [

@@ -44,7 +44,7 @@ subprocess.run([str(control/'node'),'--version'],check=True)
 inventory=[]
 for p in sorted(runtime.rglob('*')):
  if p.is_file():inventory.append(dict(path=p.relative_to(runtime).as_posix(),size=p.stat().st_size,sha256=sha(p),mode=493 if p.stat().st_mode&0o111 else 420))
-asset=out/('Qrazy-SDLCEF-linux-x64-'+args.version+'.zip')
+asset=out/('Qrazy-SDLCEF-linux-x64-AUTO-UPDATER-ONLY-'+args.version+'.zip')
 with zipfile.ZipFile(asset,'x',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=False) as z:
  for f in inventory:
   p=runtime/f['path'];info=zipfile.ZipInfo(f['path'],(2026,10,8,0,0,0));info.external_attr=(0o100000|f['mode'])<<16;info.compress_type=zipfile.ZIP_DEFLATED
