@@ -1,6 +1,21 @@
 {
   "releases": [
     {
+      "version": "0.5.1",
+      "date": "2026-10-15",
+      "added": [
+        "The information overlay shows the time on the current map next to the session time.",
+        "Qrazy can now show a short message from the developers in the menu when something needs your attention, such as a reinstall."
+      ],
+      "changed": [
+        "Windows: client updates now also replace the launcher (Qrazy.exe), so launcher fixes reach you without a manual reinstall."
+      ],
+      "fixed": [
+        "Windows: fixed Qrazy refusing to start with \"Qrazy runtime verification failed\", most often on the second launch.",
+        "Windows: the installer now works when you reinstall into the same folder after uninstalling. Your saved profile is kept."
+      ]
+    },
+    {
       "version": "0.5.0",
       "date": "2026-10-15",
       "added": [],

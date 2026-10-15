@@ -46,7 +46,7 @@
       add(parent, 'div', `${text} vs WR`, `font-size:13px;color:${text.startsWith('-') ? '#86efac' : text.startsWith('+') ? '#fca5a5' : '#c3cfdf'}`);
     };
     add(box, 'div', data.map || 'No current map', 'font-size:28px;font-weight:800;color:#fbbf24;overflow-wrap:anywhere');
-    add(box, 'div', `${data.mode || '\u2014'} - Physics: ${data.physics || '\u2014'} - Mode: ${data.category || '\u2014'} - Session: ${data.sessionTime || '\u2014'}`, 'color:#c3cfdf;margin:4px 0 18px');
+    add(box, 'div', `${data.mode || '\u2014'} - Physics: ${data.physics || '\u2014'} - Mode: ${data.category || '\u2014'} - Session: ${data.sessionTime || '\u2014'}${data.mapTime ? ` - Map: ${data.mapTime}` : ''}`, 'color:#c3cfdf;margin:4px 0 18px');
     const records = add(box, 'div', '', 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px');
     const boards = data.profileRecords.length ? data.profileRecords : ['pql','vql'].flatMap(physics => ['w','s'].map(category => ({physics, category})));
     for (const board of boards) {
@@ -181,7 +181,7 @@
       const active = value.activeRecord;
       const activeRecord = active && ['pql','vql'].includes(active.physics) && ['w','s'].includes(active.category) && ['self','pov'].includes(active.source)
         ? {physics: active.physics, category: active.category, source: active.source} : null;
-      informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), category: infoText(value.category, 32), activeRecord,
+      informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), mapTime: infoText(value.mapTime, 32),category: infoText(value.category, 32), activeRecord,
         groups, spectators, records, profileRecords, activeProfileRecord, legacy,
         leaderboard: {state: value.leaderboard.state, rows}, multiplayer: {state: value.multiplayer.state, rows: players,
           total: Number.isSafeInteger(value.multiplayer.total) && value.multiplayer.total >= players.length ? value.multiplayer.total : players.length}};

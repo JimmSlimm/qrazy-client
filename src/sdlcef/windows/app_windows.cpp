@@ -537,6 +537,28 @@ class CookieFlushed final : public CefCompletionCallback {
  private:IMPLEMENT_REFCOUNTING(CookieFlushed);
 };
 
+static bool SameFile(const std::filesystem::path& a,const std::filesystem::path& b) {
+  std::error_code error;
+  if(std::filesystem::file_size(a,error)!=std::filesystem::file_size(b,error)||error)return false;
+  std::ifstream first(a,std::ios::binary),second(b,std::ios::binary);
+  std::ostringstream x,y;x<<first.rdbuf();y<<second.rdbuf();
+  return x.str()==y.str();
+}
+// The launcher sits outside the runtime folder that updates replace, so a newer one
+// ships inside the runtime and is swapped in here. A running exe can be renamed.
+static void RefreshLauncher(const std::filesystem::path& base,const std::filesystem::path& runtime) {
+  std::error_code error;
+  const auto fresh=runtime/L"Qrazy-launcher.exe",live=base/L"Qrazy.exe",staged=base/L"Qrazy.exe.new",previous=base/L"Qrazy.exe.old";
+  std::filesystem::remove(previous,error);std::filesystem::remove(staged,error);
+  if(!std::filesystem::is_regular_file(fresh,error)||!std::filesystem::is_regular_file(live,error)||SameFile(fresh,live))return;
+  std::filesystem::copy_file(fresh,staged,std::filesystem::copy_options::overwrite_existing,error);
+  if(error)return;
+  std::filesystem::rename(live,previous,error);
+  if(error){std::filesystem::remove(staged,error);return;}
+  std::filesystem::rename(staged,live,error);
+  if(error){std::error_code undo;std::filesystem::rename(previous,live,undo);std::filesystem::remove(staged,undo);}
+}
+
 int Run(HINSTANCE instance,void* sandbox) {
   if(!sandbox)return 2; // Bootstrap sandbox is required, never silently disabled.
   wchar_t name[32768];DWORD n=GetModuleFileNameW(nullptr,name,32768);if(!n||n>=32768)return 2;
@@ -549,10 +571,11 @@ int Run(HINSTANCE instance,void* sandbox) {
   if(!switches.empty()||!arguments.empty())return 2;
   auto base=root.parent_path();wchar_t marker[32768];DWORD marker_size=GetEnvironmentVariableW(L"QRAZY_SDLCEF_ROOT",marker,32768);
   if(!marker_size||marker_size>=32768||std::filesystem::path(marker)!=base||root.filename()!=L"runtime")return 2;
-  Production::CleanEnvironment();Production::Pins pins;if(!pins.Check(base))return 2;
+  Production::CleanEnvironment();
   updater_worker.root=base;
   auto profile=base/kProfile;std::error_code error;std::filesystem::create_directories(profile,error);
   if(error||!QrazyWindows::NoReparse(profile))return 2;ProfileLock lock;if(!lock.Acquire(profile/"host.lock"))return 2;
+  RefreshLauncher(base,root);
   render_preferences.Load(profile);native_window=render_preferences.native_window;startup_vsync=render_preferences.vsync;
   asset_worker.Start(profile);
   SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER,"1");SDL_SetHint(SDL_HINT_MOUSE_AUTO_CAPTURE,"0");

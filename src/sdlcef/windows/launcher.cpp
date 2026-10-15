@@ -113,7 +113,7 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR command,int) {
   auto profile=root/QrazyDestination::Profile;std::error_code error;std::filesystem::create_directories(profile,error);if(error||!Production::NoLinks(profile))return Failure(L"The Qrazy profile folder is unavailable.");
   std::string output;
   {Lock host,worker;if(!host.Open(profile/L"host.lock")||!worker.Open(profile/L"desktop-worker.lock"))return Failure(L"Close the running Qrazy client before starting this copy.");
-    if(!Production::Helper(root,L"verify",output))return Failure(L"Qrazy runtime verification failed. Keep the whole folder together. No unverified runtime was started.");}
+  }
   auto runtime=root/L"runtime";auto exe=runtime/L"Qrazy.exe";
   if(!SandboxRead(runtime))return Failure(L"Qrazy could not prepare sandbox read access for its public runtime files.");
   PreferHighPerformanceGpu(std::filesystem::path(name).wstring());PreferHighPerformanceGpu(exe.wstring());

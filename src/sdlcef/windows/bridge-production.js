@@ -48,7 +48,7 @@
       add(parent, 'div', `${text} vs WR`, `font-size:13px;color:${text.startsWith('-') ? '#86efac' : text.startsWith('+') ? '#fca5a5' : '#c3cfdf'}`);
     };
     add(box, 'div', data.map || 'No current map', 'font-size:28px;font-weight:800;color:#fbbf24;overflow-wrap:anywhere');
-    add(box, 'div', `${data.mode || '\u2014'} - Physics: ${data.physics || '\u2014'} - Mode: ${data.category || '\u2014'} - Session: ${data.sessionTime || '\u2014'}`, 'color:#c3cfdf;margin:4px 0 18px');
+    add(box, 'div', `${data.mode || '\u2014'} - Physics: ${data.physics || '\u2014'} - Mode: ${data.category || '\u2014'} - Session: ${data.sessionTime || '\u2014'}${data.mapTime ? ` - Map: ${data.mapTime}` : ''}`, 'color:#c3cfdf;margin:4px 0 18px');
     const records = add(box, 'div', '', 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px');
     const boards = data.profileRecords.length ? data.profileRecords : ['pql','vql'].flatMap(physics => ['w','s'].map(category => ({physics, category})));
     for (const board of boards) {
@@ -183,7 +183,7 @@
       const active = value.activeRecord;
       const activeRecord = active && ['pql','vql'].includes(active.physics) && ['w','s'].includes(active.category) && ['self','pov'].includes(active.source)
         ? {physics: active.physics, category: active.category, source: active.source} : null;
-      informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), category: infoText(value.category, 32), activeRecord,
+      informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), mapTime: infoText(value.mapTime, 32),category: infoText(value.category, 32), activeRecord,
         groups, spectators, records, profileRecords, activeProfileRecord, legacy,
         leaderboard: {state: value.leaderboard.state, rows}, multiplayer: {state: value.multiplayer.state, rows: players,
           total: Number.isSafeInteger(value.multiplayer.total) && value.multiplayer.total >= players.length ? value.multiplayer.total : players.length}};
@@ -298,12 +298,18 @@
   });
 
 
-  let clientNoticeState=null, clientNoticeDismissed='', clientCheckBusy=false, clientCheckTime=0;
+  let clientNoticeState=null, clientNoticeDismissed='', clientCheckBusy=false, clientCheckTime=0, clientMessage=null;
+  const clientMessageKey='qrazy-client-message-seen', clientMessageDismissedNow=new Set();
+  function clientMessageSeen(id){
+    if(clientMessageDismissedNow.has(id))return true;
+    try{return localStorage.getItem(clientMessageKey)===id;}catch{return false;}
+  }
+  function clientMessageDismiss(id){clientMessageDismissedNow.add(id);try{localStorage.setItem(clientMessageKey,id);}catch{}}
   async function checkClientNotice() {
     const menu=document.getElementById('overlay');
     if(!menu||!menu.getClientRects().length||document.visibilityState==='hidden'||!document.hasFocus()||clientCheckBusy||Date.now()-clientCheckTime<5*60*1000)return;
     clientCheckBusy=true;
-    try { const reply=await rpc('update-notice');if(reply.ok&&reply.data){clientCheckTime=Date.now();clientNoticeState=reply.data;renderClientNotice();} }
+    try { const reply=await rpc('update-notice');if(reply.ok&&reply.data){clientCheckTime=Date.now();clientNoticeState=reply.data;clientMessage=reply.data.notice||null;renderClientNotice();} }
     catch { /* Offline checks stay quiet; the manual check remains available. */ }
     finally { clientCheckBusy=false; }
   }
@@ -311,12 +317,17 @@
     const menu=document.getElementById('overlay');
     document.getElementById('qrazy-client-update-notice')?.remove();
     const state=clientNoticeState,clientAvailable=state&&['available','ready'].includes(state.phase),showClient=clientAvailable&&clientNoticeDismissed!==state.version,showGame=siteOutdated&&!siteDismissed;
-    if(!menu||(!showClient&&!showGame))return;
+    const message=clientMessage&&!clientMessageSeen(clientMessage.id)?clientMessage:null;
+    if(!menu||(!showClient&&!showGame&&!message))return;
     const box=document.createElement('section');box.id='qrazy-client-update-notice';box.setAttribute('role','status');
     box.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(560px,calc(100% - 64px));max-height:75vh;overflow:auto;z-index:2147483646;background:#0b1424;color:#edf2fa;border:2px solid #fbbf24;border-radius:12px;padding:24px;font:16px/1.5 system-ui;box-shadow:0 12px 60px #000c';
     const add=(tag,text)=>{const el=document.createElement(tag);el.textContent=text;box.append(el);return el;};
-    add('h2','Updates available').style.cssText='color:#fbbf24;margin-top:0';
+    add('h2',showClient||showGame?'Updates available':'Message from Qrazy').style.cssText='color:#fbbf24;margin-top:0';
     const action=(label,fn)=>{const b=add('button',label);b.type='button';b.style.cssText='width:auto;margin:8px 12px 0 0;padding:10px 16px;font:16px system-ui;letter-spacing:normal';b.onclick=async event=>{event.preventDefault();event.stopPropagation();if(!event.isTrusted||b.disabled)return;b.disabled=true;try{await fn();}catch(error){add('p',error.message);}finally{b.disabled=false;}};return b;};
+    // Plain text only; the message comes from the project's release description.
+    if(message){
+      add('h3',message.title);add('pre',message.message).style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;font:inherit';
+    }
     if(showClient){
       add('h3','Client update · v'+state.version);
       add('p','Installed: v'+state.installedVersion+'. Installing closes Qrazy. Reopen it manually afterward; the game will then load the latest site.');
@@ -330,7 +341,7 @@
       add('h3','Game update');add('p','Refreshing ends the current run and reconnects multiplayer. Until refreshed, some features may not work and runs may be rejected.');
       action(showClient?'Refresh game only':'Refresh game',()=>updates.refreshGame());
     }
-    action('Later',()=>{if(showClient)clientNoticeDismissed=state.version;if(showGame)siteDismissed=true;renderSiteUpdate();});
+    action(message&&!showClient&&!showGame?'OK':'Later',()=>{if(showClient)clientNoticeDismissed=state.version;if(showGame)siteDismissed=true;if(message)clientMessageDismiss(message.id);renderSiteUpdate();});
     menu.append(box);
   }
 
@@ -601,6 +612,23 @@
       return rpc('pointer-lock-activate').catch(() => {}).then(() => nativeRequest.apply(element, args));
     };
     document.addEventListener('pointerlockchange', reportLock); window.addEventListener('pagehide', () => { rpc('pointer-lock-state', { locked: false }).catch(() => {}); });
+    /* Frame-independent mouse delivery. Chromium dispatches pointermove once per begin-frame (at most), so with VSync off the game's 8 ms ticks alias against those batches: one tick finds the whole turn, the next finds none, although every sample carries its true timestamp. pointerrawupdate is dispatched as input arrives, not per frame; each one is forwarded as a synthetic pointermove with the same movement and hardware timestamp (the game already queues samples by timeStamp and interpolates aim per tick). The real pointermove is dropped only while raw updates are flowing, so nothing is counted twice and nothing is lost if pointerrawupdate is unavailable. */
+    if ('onpointerrawupdate' in window) {
+      let lastRaw = -Infinity;
+      const sampleOf = e => ({ movementX: e.movementX, movementY: e.movementY, timeStamp: e.timeStamp });
+      document.addEventListener('pointerrawupdate', e => {
+        if (!e.isTrusted || !document.pointerLockElement) return;
+        lastRaw = performance.now();
+        const list = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : [];
+        const samples = (list.length ? list : [e]).map(sampleOf);
+        const synthetic = new Event('pointermove');
+        Object.defineProperty(synthetic, 'getCoalescedEvents', { value: () => samples });
+        document.dispatchEvent(synthetic);
+      }, true);
+      window.addEventListener('pointermove', e => {
+        if (e.isTrusted && performance.now() - lastRaw < 100) e.stopImmediatePropagation();
+      }, true);
+    }
   }
   // Element blur bubbles through capture listeners; it is not window focus loss.
   window.addEventListener('blur', event => { if(event.target===window)release(); });

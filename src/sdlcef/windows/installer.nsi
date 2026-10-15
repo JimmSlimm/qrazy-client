@@ -189,6 +189,15 @@ Function CheckSelection
     StrCmp $1 "" selection_done
     StrCmp $1 "." selection_skip
     StrCmp $1 ".." selection_skip
+    ; Leftovers an uninstall keeps on purpose (profile) or that Qrazy itself creates.
+    StrCmp $1 "profile-sdlcef-windows" selection_skip
+    StrCmp $1 "profile-sdlcef-windows-dev" selection_skip
+    StrCmp $1 "install.lock" selection_skip
+    StrCmp $1 "updater" selection_skip
+    StrCmp $1 "runtime" selection_skip
+    StrCmp $1 "update-work" selection_skip
+    StrCmp $1 "update-old" selection_skip
+    StrCmp $1 "LICENSE" selection_skip
     FindClose $0
     IfFileExists "$INSTDIR\Qrazy.exe" 0 selection_not_qrazy
     IfFileExists "$INSTDIR\runtime\Qrazy.dll" 0 selection_not_qrazy
