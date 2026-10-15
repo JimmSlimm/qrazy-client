@@ -51,11 +51,12 @@ void Keyboard(Client* client, const SDL_KeyboardEvent& event) {
   }
   if(client->recovering){if(down&&!event.repeat&&event.scancode==SDL_SCANCODE_R)client->Retry();return;}
   if(client->loading)return;
+  if(native_window)return; // the CEF child window receives keys itself
   // SDL can receive focus before the asynchronous browser exists. Reconcile
   // CEF focus when a real foreground keyboard event reaches the host.
-  if(SDL_GetKeyboardFocus()!=window)return;
+  if(!Focused())return;
   client->browser->GetHost()->SetFocus(true);
-  if(down&&!event.repeat&&(event.mod&SDL_KMOD_CTRL)&&!(event.mod&(SDL_KMOD_ALT|SDL_KMOD_GUI))&&!captured&&SDL_GetKeyboardFocus()==window) {
+  if(down&&!event.repeat&&(event.mod&SDL_KMOD_CTRL)&&!(event.mod&(SDL_KMOD_ALT|SDL_KMOD_GUI))&&!captured&&Focused()) {
     if(event.scancode==SDL_SCANCODE_V){char* text=SDL_GetClipboardText();if(text){if(strlen(text)<=1048576)client->browser->GetHost()->ImeCommitText(text,CefRange(UINT32_MAX,UINT32_MAX),0);SDL_free(text);}return;}
     if(event.scancode==SDL_SCANCODE_C||event.scancode==SDL_SCANCODE_X){if(!client->selection.empty())SDL_SetClipboardText(client->selection.c_str());if(event.scancode==SDL_SCANCODE_X)client->browser->GetMainFrame()->Cut();return;}
   }

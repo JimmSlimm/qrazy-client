@@ -24,7 +24,7 @@ function verify(bytes,key,policy={platform:'windows-x64',channel:'stable'}) {
       typeof m.version!=='string'||!/^(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})\.(0|[1-9]\d{0,5})$/.test(m.version)||
       !Number.isSafeInteger(m.sequence)||m.sequence<1||!Array.isArray(m.files)||m.files.length>4096||!m.files.length||
       typeof m.runtimeIdentity!=='string'||!/^[a-f0-9]{64}$/.test(m.runtimeIdentity))throw fail();
-    const assetNames=linux?[...['.tar.gz','.AppImage'].map(ext=>'Qrazy-SDLCEF-linux-x64-distribution-'+m.version+ext),'Qrazy-linux-x64.AppImage']:['Qrazy-SDLCEF-windows-x64-distribution-'+m.version+'.zip'];
+    const assetNames=linux?[...['.tar.gz','.AppImage'].map(ext=>'Qrazy-SDLCEF-linux-x64-distribution-'+m.version+ext),'Qrazy-linux-x64.AppImage']:['Qrazy-SDLCEF-windows-x64-distribution-'+m.version+'.zip','Qrazy-windows-x64.zip'];
     if(!m.asset||!assetNames.includes(m.asset.name)||
       !Number.isSafeInteger(m.asset.size)||m.asset.size<1||m.asset.size>4*1024**3||
       typeof m.asset.sha256!=='string'||!/^[a-f0-9]{64}$/.test(m.asset.sha256))throw fail();

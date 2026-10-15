@@ -496,10 +496,12 @@
   }
   // Show measured presented frames per second in the game's FPS label (the game itself counts animation callbacks).
   let presentedFps=null;
+  let presentDetail='';
   function updatePresentationLabel(){
     const label=document.getElementById('fps');if(!label||presentedFps===null)return;
-    const suffix=label.textContent.includes(' · ')?label.textContent.slice(label.textContent.indexOf(' · ')):'';
-    const text=`${Math.round(presentedFps)} FPS${suffix}`;
+    const current=label.textContent.replace(/ \(cap [^)]*\)/,'');
+    const suffix=current.includes(' · ')?current.slice(current.indexOf(' · ')):'';
+    const text=`${Math.round(presentedFps)} FPS${presentDetail}${suffix}`;
     if(label.textContent!==text)label.textContent=text;
     label.title='Successful SDL presents per second; not a physical scanout measurement';
   }
@@ -515,7 +517,11 @@
   const experimental = Object.freeze({
     version: 1,
     getState: async () => (await rpc('experimental-get')).data,
-    setEnabled: async enabled => { if (typeof enabled !== 'boolean') throw new TypeError('Expected a boolean'); return (await rpc('experimental-set', { enabled })).data; }
+    setEnabled: async value => {
+      if (typeof value === 'boolean') return (await rpc('experimental-set', { enabled: value })).data;
+      if (!Number.isInteger(value) || value < 0) throw new TypeError('Expected a boolean or a whole number level');
+      return (await rpc('experimental-set', { level: value })).data;
+    }
   });
   const vsync = Object.freeze({
     getState: async () => (await rpc('vsync-get')).data,
@@ -568,7 +574,9 @@
   return function dispatch(json) {
     const message = JSON.parse(json);
     if (message.type === 'presentation-rate') {
-      if (Number.isFinite(message.fps) && message.fps >= 0) { presentedFps = message.fps; updatePresentationLabel(); }
+      if (Number.isFinite(message.fps) && message.fps >= 0) { presentedFps = message.fps;
+        if (Number.isFinite(message.requestedFps) && Number.isFinite(message.paintedFps)) presentDetail = ' (cap ' + message.cap + (message.target ? ', tgt ' + message.target : '') + ', cef ' + message.cefRate + ', req ' + Math.round(message.requestedFps) + ', paint ' + Math.round(message.paintedFps) + (Number.isFinite(message.passFps) ? ', loop ' + Math.round(message.passFps) + ', pump ' + Math.round(message.pumpMs) + ', copy ' + Math.round(message.copyMs) + ', swap ' + Math.round(message.swapMs) : '') + ')';
+        updatePresentationLabel(); }
       return;
     }
     if (message.type === 'reply') { const fn = pending.get(message.id); pending.delete(message.id); fn?.(message.value); }

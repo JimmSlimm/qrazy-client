@@ -1,6 +1,15 @@
 {
   "releases": [
     {
+      "version": "0.5.0",
+      "date": "2026-10-15",
+      "added": [],
+      "changed": [
+        "Windows: the game view is now drawn directly by CEF, the embedded Chromium engine, inside the Qrazy window, replacing the separate copy-and-redraw step the old view used. Mouse look uses raw, unaccelerated input, and with VSync on the frame rate follows the monitor the window is on (Maximum FPS applies with VSync off). If the window cannot be created, Qrazy shows an error asking you to report it."
+      ],
+      "fixed": []
+    },
+    {
       "version": "0.4.8",
       "date": "2026-10-13",
       "added": [],

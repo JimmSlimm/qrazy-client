@@ -1,5 +1,7 @@
 (function(host) {
   'use strict';
+  // Set by the host (render process) only for the opt-in windowed browser mode; Chromium then owns presentation and input.
+  const nativeWindow = typeof __qrazyNativeWindow !== 'undefined' && __qrazyNativeWindow === true;
   // Read-only presentation: the game owns data, formatting and Tab eligibility.
   let informationSnapshot = null, informationHeld = false, informationBox;
   const infoText = (value, max = 120) => typeof value === 'string' ? value.slice(0, max) : '';
@@ -399,7 +401,7 @@
       'Window: '+(g.pixelWidth||'?')+' × '+(g.pixelHeight||'?')+' pixels · Scale: '+number(g.displayScale*100)+'% · '+(g.fullscreen?'Fullscreen':'Windowed'),
       'Display: '+(g.displayName||missing)+' · '+(g.refreshHz??missing)+' Hz',
       'Game drawing buffer: '+(game.drawingBuffer?.join(' × ')||missing)+' pixels',
-      'VSync: '+vsync+' · FPS limit: '+(g.maxFps??missing)+' · Requested rendering rate: '+(g.cefTarget??g.cefTargetFps??missing),
+      g.nativeWindow?'Native browser window: Chromium presents the page itself (VSync applies after restart; com_maxfps is enforced by the bridge)':'VSync: '+vsync+' · FPS limit: '+(g.maxFps??missing)+' · Requested rendering rate: '+(g.cefTarget??g.cefTargetFps??missing),
       'Frame clock: '+(g.frameClock||missing),
       'Runtime: CEF '+(g.cefVersion||missing)+' · Chromium '+(g.chromiumVersion||missing)+' · SDL '+(g.sdlVersion||missing),
       'Installation drive free space: '+number(g.installationFreeGiB,1)+' GiB',
@@ -505,17 +507,48 @@
   },{once:true});
   const vsync={getState:()=>rpc('vsync-get'),setEnabled(enabled){if(typeof enabled!=='boolean')return Promise.reject(new TypeError('VSync must be a boolean'));return rpc('vsync-set',{enabled});},onChange:fn=>subscribe(vsyncListeners,fn)};
   const maxFps={getState:()=>rpc('max-fps-get'),setValue(value){if(!Number.isSafeInteger(value)||value<30||value>10000)return Promise.reject(new TypeError('com_maxfps must be a whole number from 30 to 10000'));return rpc('max-fps-set',{value});},onChange:fn=>subscribe(maxFpsListeners,fn)};
+  if(nativeWindow){ // Native mode: Chromium has no frame cap, so enforce com_maxfps by batching requestAnimationFrame callbacks (applies to the game's own rAF loop)
+    const nativeRaf=window.requestAnimationFrame.bind(window);let cap=0,vsyncOn=false,lastRun=-Infinity,nextId=1,pumping=false;const queue=new Map();
+    /* with a cap the game runs from MessageChannel hops, not rAF ticks: idle rAF ticks arrived at only ~110/s, so skipping them halved the rate, and nested setTimeout wakes 2-5 ms late on Windows (2026-10-04 timerMC lab: cap 250 gave 204 draws/s with timers, 250 with MessageChannel) */
+    const mc=new MessageChannel();let mcPump=null;mc.port1.onmessage=()=>{const f=mcPump;mcPump=null;f?.();};
+    /* GPU backpressure, VSync off only: the hop-driven loop bypasses Chromium's frame pacing, so a GPU-bound spot would build a long queue (measured: 22 frames/s shown, 177 ms to display, at cap 480). Keep at most FENCE_DEPTH frames of GPU work in flight; the timeout lets the game run on if a fence never signals (context lost, hidden window). */
+    const FENCE_DEPTH=2,FENCE_TIMEOUT_MS=250;let gl=null,fences=[],fenceSince=0;
+    const origGetContext=HTMLCanvasElement.prototype.getContext;HTMLCanvasElement.prototype.getContext=function(type,...rest){const c=origGetContext.call(this,type,...rest);if(!gl&&c&&type==='webgl2')gl=c;return c;};
+    const gpuBusy=()=>{if(!gl||vsyncOn)return false;try{if(gl.isContextLost())return false;const t=performance.now();while(fences.length&&gl.getSyncParameter(fences[0],gl.SYNC_STATUS)===gl.SIGNALED){gl.deleteSync(fences.shift());fenceSince=0;}if(fences.length<FENCE_DEPTH)return false;if(!fenceSince)fenceSince=t;if(t-fenceSince>FENCE_TIMEOUT_MS){for(const f of fences)gl.deleteSync(f);fences=[];fenceSince=0;return false;}return true;}catch(e){gl=null;fences=[];return false;}};
+    const fenceFrame=()=>{if(!gl||vsyncOn)return;try{if(gl.isContextLost())return;fences.push(gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE,0));gl.flush();}catch(e){gl=null;fences=[];}};
+    /* Display-time grid (VSync off): the game gets the predicted display time as its frame timestamp, so the frame that is shown carries the world at an evenly spaced time whatever moment it was drawn. Raw rAF tick times jitter by about a millisecond while the display cadence does not, so the ticks steer a slow phase-locked grid (5% correction per tick) that resyncs after a stall. */
+    let dispGrid=0,dispT=0,dispReady=false,lastTs=0,dispI=0,tickPrev=0;
+    const probe=()=>{const t=performance.now();if(tickPrev>0){const iv=t-tickPrev;if(iv>1&&iv<40){dispI=dispI?dispI*0.95+iv*0.05:iv;dispReady=true;}}if(dispI){if(!dispGrid||Math.abs(t-dispGrid)>2*dispI)dispGrid=t+dispI;else{dispGrid+=dispI;dispGrid+=0.05*(t+dispI-dispGrid);}dispT=dispGrid;}tickPrev=t;nativeRaf(probe);};nativeRaf(probe);
+    /* VSync on: Chromium keeps the refresh interval it picked at startup, so after the window moves to a slower monitor rAF still ticks at the old rate. Ask the host for the current monitor's rate and, when rAF runs clearly faster, pace the game at that rate instead. */
+    let displayHz=0;const pollHz=()=>rpc('refresh-hz-get').then(s=>{displayHz=s.hz>0?s.hz:0;}).catch(()=>{});pollHz();setInterval(pollHz,1000);
+    const effCap=()=>vsyncOn?(displayHz>0&&dispReady&&dispI>0&&1000/dispI>displayHz*1.15?displayHz:0):cap;
+    const sched=()=>{pumping=true;if(!(effCap()>0)){nativeRaf(pump);return;} /* VSync on: Chromium's own display-paced rAF drives the game and com_maxfps is not applied */mcPump=pump;mc.port2.postMessage(0);};
+    const pump=rafTs=>{pumping=false;if(!queue.size)return;const now=performance.now(),ec=effCap();
+      if(ec>0&&now-lastRun<1000/ec-0.5){sched();return;}
+      if(ec>0&&gpuBusy()){sched();return;}
+      lastRun=ec>0&&now-lastRun<2000/ec?lastRun+1000/ec:now;
+      let ts=now;if(!vsyncOn&&dispReady)ts=dispT;else if(vsyncOn&&Number.isFinite(rafTs))ts=rafTs; /* VSync on: hand the game Chromium's own frame timestamp (vsync-aligned), as an unwrapped requestAnimationFrame would; performance.now() at call time jitters */if(ts<lastTs)ts=lastTs;lastTs=ts; /* never step backwards, also when VSync is switched on at runtime */
+      const batch=[...queue];queue.clear();for(const[,cb]of batch){try{cb(ts);}catch(e){setTimeout(()=>{throw e;});}}fenceFrame();};
+    window.requestAnimationFrame=cb=>{const id=nextId++;queue.set(id,cb);if(!pumping)sched();return id;};
+    window.cancelAnimationFrame=id=>{queue.delete(id);};
+    rpc('max-fps-get').then(s=>{cap=s.value;}).catch(()=>{});rpc('vsync-get').then(s=>{vsyncOn=s.enabled===true;}).catch(()=>{});
+    maxFpsListeners.add?.(s=>{cap=s.value;});vsyncListeners.add?.(s=>{vsyncOn=s.enabled===true;});
+  }
   function renderingSettings(){
     const section=document.getElementById('display-section');if(!section||document.getElementById('qrazy-vsync'))return;
-    const label=document.createElement('label');label.textContent='VSync ';const check=document.createElement('input');check.id='qrazy-vsync';check.type='checkbox';check.disabled=true;label.append(check);section.append(label);
-    const fpsLabel=document.createElement('label');fpsLabel.textContent='Maximum FPS (com_maxfps) ';const fps=document.createElement('input');fps.id='qrazy-max-fps';fps.type='number';fps.min='30';fps.max='10000';fps.step='1';fps.disabled=true;fpsLabel.append(fps);section.append(fpsLabel);
-    const error=document.createElement('p');error.style.color='#fbbf24';error.hidden=true;section.append(error);
-    const showVsync=s=>{check.checked=s.enabled;},showFps=s=>{fps.value=String(s.value);};
-    vsync.onChange(showVsync);maxFps.onChange(showFps);
+    const error=document.createElement('p');error.style.color='#fbbf24';error.hidden=true;
     async function change(input,action,refresh){input.disabled=true;error.hidden=true;try{await action();}catch(e){error.textContent=e.message;error.hidden=false;}finally{try{await refresh();}finally{input.disabled=false;}}}
-    check.addEventListener('change',e=>{if(e.isTrusted)void change(check,()=>vsync.setEnabled(check.checked),async()=>showVsync(await vsync.getState()));});
-    fps.addEventListener('change',e=>{if(e.isTrusted)void change(fps,()=>maxFps.setValue(Number(fps.value)),async()=>showFps(await maxFps.getState()));});
-    Promise.all([vsync.getState(),maxFps.getState()]).then(([v,m])=>{showVsync(v);showFps(m);check.disabled=fps.disabled=false;}).catch(e=>{error.textContent=e.message;error.hidden=false;});
+    const note=document.createElement('p');note.style.color='#fbbf24';note.textContent='Restart Qrazy to apply this change.';note.hidden=true;const restart={native:false,vsync:false},refreshNote=()=>{note.hidden=!(restart.native||restart.vsync);};
+    {
+      const label=document.createElement('label');label.textContent='VSync ';const check=document.createElement('input');check.id='qrazy-vsync';check.type='checkbox';check.disabled=true;label.append(check);section.append(label);
+      const fpsLabel=document.createElement('label');fpsLabel.textContent='Maximum FPS (com_maxfps) ';const fps=document.createElement('input');fps.id='qrazy-max-fps';fps.type='number';fps.min='30';fps.max='10000';fps.step='1';fps.disabled=true;fpsLabel.append(fps);section.append(fpsLabel);
+      const showVsync=s=>{check.checked=s.enabled;if(nativeWindow){restart.vsync=!!s.restartRequired;refreshNote();}},showFps=s=>{fps.value=String(s.value);};
+      vsync.onChange(showVsync);maxFps.onChange(showFps);
+      check.addEventListener('change',e=>{if(e.isTrusted)void change(check,()=>vsync.setEnabled(check.checked),async()=>showVsync(await vsync.getState()));});
+      fps.addEventListener('change',e=>{if(e.isTrusted)void change(fps,()=>maxFps.setValue(Number(fps.value)),async()=>showFps(await maxFps.getState()));});
+      Promise.all([vsync.getState(),maxFps.getState()]).then(([v,m])=>{showVsync(v);showFps(m);check.disabled=fps.disabled=false;}).catch(e=>{error.textContent=e.message;error.hidden=false;});
+    }
+    section.append(note,error);
   }
   window.addEventListener('DOMContentLoaded',renderingSettings,{once:true});
   const rawMouse = Object.freeze({
@@ -540,8 +573,9 @@
   });
   Object.defineProperty(window, 'qrazyDesktop', { configurable: false, writable: false, value: Object.freeze({
     version: 1, prototype: true,
-    rawMouseCapability: Object.freeze({ supported: null, backend: 'sdl3-wayland', reason: 'Compositor capture and hardware behaviour require manual verification; capture() reports the SDL request result.' }),
-    rawMouse,
+    windowMode: nativeWindow ? 'native' : 'offscreen',
+    ...(nativeWindow ? {} : { rawMouseCapability: Object.freeze({ supported: null, backend: 'sdl3-wayland', reason: 'Compositor capture and hardware behaviour require manual verification; capture() reports the SDL request result.' }),
+    rawMouse }),
     updates,
     updates,
     information: Object.freeze(information),
@@ -556,6 +590,18 @@
     fullscreen: Object.freeze({ getState: async () => (await rpc('fullscreen-state')).fullscreen, toggle: async () => (await rpc('fullscreen-toggle')).fullscreen, onChange: fn => subscribe(fullscreen, fn) })
   }) });
   window.addEventListener('pagehide', release);
+  /* Native mode: tell the host when the page holds pointer lock so it can route Escape through the page (see OnPreKeyEvent). */
+  if (nativeWindow) {
+    const reportLock = () => { rpc('pointer-lock-state', { locked: !!document.pointerLockElement }).catch(() => {}); };
+    /* Chromium refuses requestPointerLock without transient user activation (after alt-tab, long idle, programmatic re-lock). Have the host send a trusted unbound key first, for every request path. */
+    const nativeRequest = Element.prototype.requestPointerLock;
+    Element.prototype.requestPointerLock = function (...args) {
+      if (navigator.userActivation && navigator.userActivation.isActive) return nativeRequest.apply(this, args);
+      const element = this;
+      return rpc('pointer-lock-activate').catch(() => {}).then(() => nativeRequest.apply(element, args));
+    };
+    document.addEventListener('pointerlockchange', reportLock); window.addEventListener('pagehide', () => { rpc('pointer-lock-state', { locked: false }).catch(() => {}); });
+  }
   // Element blur bubbles through capture listeners; it is not window focus loss.
   window.addEventListener('blur', event => { if(event.target===window)release(); });
   return function dispatch(json) {
@@ -579,7 +625,8 @@
       if (captured) { captured = false; emit(states, { captured: false }); }
     } else if (message.type === 'focus') {
       window.dispatchEvent(new Event(message.focused ? 'focus' : 'blur'));
-    } else if (message.type === 'fullscreen') emit(fullscreen, message.value);
+    } else if (message.type === 'escape') { if (document.pointerLockElement) document.exitPointerLock(); }
+    else if (message.type === 'fullscreen') emit(fullscreen, message.value);
     else if (message.type === 'button') {
       // CEF's native click API covers only three buttons. The existing game accepts
       // document mouse events for side buttons; these events are deliberately synthetic.

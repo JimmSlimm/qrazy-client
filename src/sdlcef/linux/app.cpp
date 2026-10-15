@@ -44,7 +44,7 @@ SDL_Window* window = nullptr;
 SDL_GLContext glcontext = nullptr;
 bool closing = false, closed = false, captured = false, hidden_check = false;
 int generation = 0, frames = 0, copies = 0, errors = 0, presentations = 0;
-double copy_ms = 0, swap_ms = 0;
+double copy_ms = 0, swap_ms = 0, pump_ms = 0;unsigned passes = 0;
 std::string bridge_source;
 std::string close_action;
 std::string installed_title="Qrazy";
@@ -492,6 +492,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   }
   Uint64 presentation_started=SDL_GetTicksNS();
   unsigned presentation_count=0;
+  unsigned begin_count=0;int paint_mark=0;unsigned lp_passes=0;double lp_pump=0,lp_copy=0,lp_swap=0;unsigned trace_n=0,trace_passes=0,trace_req=0,trace_present=0;int trace_frames=0;double trace_pump=0,trace_copy=0,trace_swap=0;Uint64 trace_at=SDL_GetTicksNS();
   void PresentationTick() { /* experimental pacing only: measured successful swaps per second, sent about twice a second */
     if(!pacing.active)return;
     const Uint64 now=SDL_GetTicksNS(),elapsed=now-presentation_started;
@@ -499,12 +500,56 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     auto data=Dict();data->SetString("type","presentation-rate");
     data->SetDouble("fps",presentation_count*1e9/static_cast<double>(elapsed));
     data->SetDouble("intervalMs",elapsed/1e6);data->SetInt("presents",static_cast<int>(presentation_count));
+    data->SetDouble("requestedFps",begin_count*1e9/static_cast<double>(elapsed));
+    data->SetDouble("paintedFps",(frames-paint_mark)*1e9/static_cast<double>(elapsed));
+    data->SetInt("cap",pacing.max_fps);data->SetInt("target",request_target);data->SetInt("cefRate",browser?browser->GetHost()->GetWindowlessFrameRate():-1);
+    data->SetDouble("passFps",(passes-lp_passes)*1e9/static_cast<double>(elapsed));
+    data->SetDouble("pumpMs",(pump_ms-lp_pump)*1e9/static_cast<double>(elapsed));
+    data->SetDouble("copyMs",(copy_ms-lp_copy)*1e9/static_cast<double>(elapsed));
+    data->SetDouble("swapMs",(swap_ms-lp_swap)*1e9/static_cast<double>(elapsed));
+    lp_passes=passes;lp_pump=pump_ms;lp_copy=copy_ms;lp_swap=swap_ms;
+    trace_req+=begin_count;trace_present+=presentation_count;
+    if(++trace_n%4==0){ /* experimental pacing only: one log line about every 2 seconds, per-second averages */
+      const double sec=(now-trace_at)/1e9;
+      std::fprintf(stderr,"QRAZY pacing-trace tgt=%d passes=%.0f req=%.0f paint=%.0f present=%.0f pump-ms/s=%.0f copy-ms/s=%.0f swap-ms/s=%.0f\n",request_target,
+                   (passes-trace_passes)/sec,trace_req/sec,(frames-trace_frames)/sec,trace_present/sec,(pump_ms-trace_pump)/sec,(copy_ms-trace_copy)/sec,(swap_ms-trace_swap)/sec);
+      trace_at=now;trace_passes=passes;trace_frames=frames;trace_pump=pump_ms;trace_copy=copy_ms;trace_swap=swap_ms;trace_req=0;trace_present=0;
+    }
+    begin_count=0;paint_mark=frames;
     Send(data);presentation_count=0;presentation_started=now;
+  }
+  /* Level 4: request begin-frames at the rate CEF actually delivers (+30% to probe for more), never above the player's cap. */
+  Uint64 last_request_ns=0;
+  int request_target=0,adapt_rate=0,adapt_mark=0,adapt_ring_i=0,adapt_ring_n=0;Uint64 adapt_at=0;double adapt_ring[10]={};
+  int AdaptiveTarget(int cap) {
+    const int floor_rate=std::min(cap,240);
+    const Uint64 now=SDL_GetTicksNS();
+    if(!adapt_at){adapt_at=now;adapt_mark=frames;adapt_rate=floor_rate;return adapt_rate;}
+    if(now-adapt_at>=100000000ull){
+      const double painted=(frames-adapt_mark)*1e9/static_cast<double>(now-adapt_at);
+      if(pacing.active_level>=5){ /* level 5: capacity = best delivery rate of the last second; ask 25% above it */
+        adapt_ring[adapt_ring_i]=painted;adapt_ring_i=(adapt_ring_i+1)%10;if(adapt_ring_n<10)++adapt_ring_n;
+        double best=0;for(int i=0;i<adapt_ring_n;++i)best=std::max(best,adapt_ring[i]);
+        adapt_rate=std::clamp(static_cast<int>((best*1.25+20)/10)*10,floor_rate,cap);
+      } else adapt_rate=std::clamp(static_cast<int>((painted*1.3+30)/10)*10,floor_rate,cap);
+      adapt_at=now;adapt_mark=frames;
+    }
+    return std::clamp(adapt_rate,floor_rate,cap);
   }
   void RequestFrame() { /* experimental only; request after input and presentation */
     if(!pacing.active)return;
-    pacing_clock.Configure(pacing.Target(render_rate));
+    request_target=pacing.Target(render_rate);
+    if(pacing.active_level>=4)request_target=AdaptiveTarget(request_target);
+    pacing_clock.Configure(request_target);
+    pacing_clock.SetCatchUp(pacing.active_level>=8);
+    const Uint64 request_now=SDL_GetTicksNS();
+    /* Level 8: owed catch-up requests are spaced at least a third of a period apart so Chromium does not see them back to back. */
+    const bool spaced=pacing.active_level>=8&&request_now-last_request_ns<1000000000ull/static_cast<Uint64>(std::max(request_target,30))/3;
+    pacing_clock.Hold(spaced);
+    if(spaced)return;
     if(!browser||closing||!pacing_clock.Take())return;
+    last_request_ns=request_now;
+    ++begin_count;
     browser->GetHost()->SendExternalBeginFrame();
   }
   void RenderSettingsChanged() {
@@ -600,13 +645,20 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     else if (op == "experimental-get") result->SetDictionary("data", pacing.State());
     else if (op == "experimental-set") {
       /* Saved for the next start only; nothing changes in the running client. */
-      bool valid = !hidden_check && data_payload && data_payload->GetType("enabled") == VTYPE_BOOL;
+      const bool has_level = data_payload && data_payload->GetType("level") == VTYPE_INT;
+      bool valid = !hidden_check && data_payload && (has_level ? data_payload->GetInt("level") >= 0 && data_payload->GetInt("level") <= kMaxLevel : data_payload->GetType("enabled") == VTYPE_BOOL);
       if (valid) {
-        const bool previous = pacing.enabled;
-        pacing.enabled = data_payload->GetBool("enabled");
-        if (!pacing.Save()) { pacing.enabled = previous; valid = false; }
+        const bool previous = pacing.enabled; const int previous_level = pacing.level;
+        pacing.level = has_level ? data_payload->GetInt("level") : (data_payload->GetBool("enabled") ? 1 : 0);
+        pacing.enabled = pacing.level >= 1;
+        if (!pacing.Save()) { pacing.enabled = previous; pacing.level = previous_level; valid = false; }
+        else if (pacing.active && pacing.level >= 1) { /* levels switch live; only on/off needs a restart */
+          pacing.active_level = pacing.level;
+          if (browser) browser->GetHost()->SetWindowlessFrameRate(pacing.Target(render_rate));
+          if (SDL_GL_MakeCurrent(window, glcontext)) SDL_GL_SetSwapInterval(pacing.SwapInterval());
+        }
       }
-      if (!valid) { result->SetBool("ok", false); result->SetString("error", "Experimental frame pacing setting could not be saved"); }
+      if (!valid) { result->SetBool("ok", false); result->SetString("error", has_level ? "Experimental level must be a whole number from 0 to " + std::to_string(kMaxLevel) + " in this client" : "Experimental frame pacing setting could not be saved"); }
       else result->SetDictionary("data", pacing.State());
     }
     else if (op == "vsync-get" || op == "max-fps-get" || op == "vsync-set" || op == "max-fps-set") {
@@ -619,9 +671,9 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
       } else {
         const ExperimentalPacing previous = pacing;
         if (is_vsync) pacing.vsync = data_payload->GetBool("enabled"); else pacing.max_fps = data_payload->GetInt("value");
-        int actual = -1; const int wanted = pacing.vsync ? 1 : 0;
+        int actual = -1; const int wanted = pacing.SwapInterval();
         if (!SDL_GL_MakeCurrent(window, glcontext) || !SDL_GL_SetSwapInterval(wanted) || !SDL_GL_GetSwapInterval(&actual) || actual != wanted || !pacing.Save()) {
-          pacing = previous; SDL_GL_SetSwapInterval(pacing.vsync ? 1 : 0);
+          pacing = previous; SDL_GL_SetSwapInterval(pacing.SwapInterval());
           result->SetBool("ok", false); result->SetString("error", "Rendering setting could not be applied and saved");
         } else {
           browser->GetHost()->SetWindowlessFrameRate(pacing.Target(render_rate));
@@ -850,7 +902,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     pacing.Load(prototype_profile);
     if(pacing.enabled) {
       pacing.active=pacing_clock.Start();
-      if(pacing.active){pacing.MarkRunning();std::fprintf(stderr,"QRAZY EXPERIMENTAL frame pacing active (opt-in, unverified on this hardware)\n");}
+      if(pacing.active){pacing.active_level=std::max(1,pacing.level);pacing.MarkRunning();std::fprintf(stderr,"QRAZY EXPERIMENTAL frame pacing active (opt-in, unverified on this hardware)\n");}
       else std::fprintf(stderr,"QRAZY experimental pacing clock unavailable; normal pacing used\n");
     }
   }
@@ -869,7 +921,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
   if (!render_rate) { std::fprintf(stderr, "QRAZY display refresh unavailable; refusing arbitrary FPS fallback\n"); return 5; }
   if (!hidden_check) {
     SDL_StartTextInput(window);
-    int interval = 0; const int wanted = (pacing.active && !pacing.vsync) ? 0 : 1; /* VSync stays required unless experimental pacing is active */
+    int interval = 0; const int wanted = pacing.SwapInterval(); /* VSync stays required unless experimental pacing is active */
     if (!SDL_GL_SetSwapInterval(wanted) || !SDL_GL_GetSwapInterval(&interval) || interval != wanted) {
       std::fprintf(stderr, "QRAZY VSync swap interval %d unavailable: %s\n", wanted, SDL_GetError());
       if (wanted == 1 || !SDL_GL_SetSwapInterval(1) || !SDL_GL_GetSwapInterval(&interval) || interval != 1) return 5;
@@ -898,9 +950,13 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     auto inspect_at = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     bool inspected=false;
     bool close_sent = false;
+    auto last_present = std::chrono::steady_clock::now();
     auto refresh_at = std::chrono::steady_clock::now();
     while (!closed) {
+      ++passes;
+      const auto pump_begin=std::chrono::steady_clock::now();
       CefDoMessageLoopWork();client->PumpDesktop();client->PumpRetry();
+      pump_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-pump_begin).count();
       // Also catch refresh changes that do not move or resize the window.
       if (std::chrono::steady_clock::now() >= refresh_at) {
         int rate = DisplayRenderRate();
@@ -1009,7 +1065,12 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
         else std::snprintf(status,sizeof(status),"ATTEMPT %u - PLEASE WAIT",server_retry.attempt);
         RecoveryCard(client->recovering?"GAME CONNECTION FAILED":"CONNECTING TO GAME",status);
       }
-      if (native_card || client->Draw()) {
+      /* Level 2: present at most once per the player's own frame period; newer frames replace older ones while waiting. Not with VSync on: the display already paces presentation and the limiter would only skip frames. */
+      const auto present_now=std::chrono::steady_clock::now();
+      const int present_rate=pacing.vsync?std::min(render_rate,pacing.max_fps):pacing.Target(render_rate);
+      const bool present_due=pacing.active_level<2||(pacing.vsync&&pacing.active_level!=7)||present_now-last_present>=std::chrono::nanoseconds(900000000ll/std::clamp(present_rate,30,10000));
+      if (native_card || (present_due && client->Draw())) {
+        last_present=present_now;
         ++presentations;
         if (!hidden_check) {
           auto begin=std::chrono::steady_clock::now();
@@ -1023,7 +1084,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
       }
       client->PresentationTick();
       client->RequestFrame();
-      if(pacing.active)pacing_clock.Wait();
+      if(pacing.active)pacing_clock.Wait(std::chrono::microseconds(pacing.active_level>=3?250:1000));
       else SDL_Delay(1);
     }
     desktop_worker.Reset();if(!hidden_check){saved_window.Observe();saved_window.Save();}

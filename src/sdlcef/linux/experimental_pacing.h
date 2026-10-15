@@ -10,10 +10,14 @@
 #include <thread>
 #include <mutex>
 
+// Highest experiment level this build knows. Level 1 = timer clock; 2 = 1 + present limiter; 3 = 2 + faster input polling; 4 = 3 + begin-frame rate follows what CEF delivers; 5 = 4 using the best delivery rate of the last second; 6 = 5 plus, with VSync on, ask 20% above the refresh rate; 7 = 6 without the blocking buffer swap (presents from our own timer); 8 = 6 plus catch-up (a tick missed while the loop was blocked is owed, up to 2).
+constexpr int kMaxLevel=8;
 struct ExperimentalPacing {
   bool enabled=false; // saved preference for the next start
   bool active=false;  // this process runs the experimental clock
   bool vsync=true;
+  int level=0;        // saved experiment level for the next start (0 off, see kMaxLevel)
+  int active_level=0; // level this process runs
   int max_fps=250;
   std::filesystem::path file,running;
   void Load(const std::filesystem::path& profile) {
@@ -23,18 +27,20 @@ struct ExperimentalPacing {
       auto value=CefParseJSON(text,JSON_PARSER_RFC);auto d=value&&value->GetType()==VTYPE_DICTIONARY?value->GetDictionary():nullptr;
       if(d) {
         if(d->GetType("enabled")==VTYPE_BOOL)enabled=d->GetBool("enabled");
+        level=enabled?1:0;
+        if(d->GetType("level")==VTYPE_INT){int n=d->GetInt("level");if(n>=0&&n<=kMaxLevel){level=n;enabled=n>=1;}}
         if(d->GetType("vsync")==VTYPE_BOOL)vsync=d->GetBool("vsync");
         if(d->GetType("com_maxfps")==VTYPE_INT){int n=d->GetInt("com_maxfps");if(n>=30&&n<=10000)max_fps=n;}
       }
     }
     std::error_code error;
     if(std::filesystem::exists(running,error)) {
-      if(enabled){enabled=false;vsync=true;Save();std::fprintf(stderr,"QRAZY experimental pacing turned off: the previous run did not exit cleanly\n");}
+      if(enabled){enabled=false;level=0;vsync=true;Save();std::fprintf(stderr,"QRAZY experimental pacing turned off: the previous run did not exit cleanly\n");}
       std::filesystem::remove(running,error);
     }
   }
   bool Save() const {
-    auto d=CefDictionaryValue::Create();d->SetBool("enabled",enabled);d->SetBool("vsync",vsync);d->SetInt("com_maxfps",max_fps);
+    auto d=CefDictionaryValue::Create();d->SetBool("enabled",enabled);d->SetInt("level",level);d->SetBool("vsync",vsync);d->SetInt("com_maxfps",max_fps);
     auto v=CefValue::Create();v->SetDictionary(d);const auto text=CefWriteJSON(v,JSON_WRITER_DEFAULT).ToString();
     auto temporary=file;temporary+=".tmp";
     {std::ofstream out(temporary,std::ios::binary|std::ios::trunc);out<<text;out.flush();if(!out)return false;}
@@ -42,9 +48,14 @@ struct ExperimentalPacing {
   }
   void MarkRunning() const {std::ofstream out(running,std::ios::binary|std::ios::trunc);out<<"1";}
   void MarkClean() const {std::error_code error;std::filesystem::remove(running,error);}
-  int Target(int refresh) const {return vsync?std::min(refresh,max_fps):max_fps;}
+  // 0 = swap returns immediately (the Wayland compositor still syncs to the display); 1 = swap blocks until the display refresh.
+  int SwapInterval() const {return active&&(!vsync||active_level==7)?0:1;}
+  int Target(int refresh) const {
+    if(vsync&&active_level>=6)return std::min(max_fps,(refresh*6+4)/5); // headroom: Chromium drops a frame when two arrive closer than its frame period
+    return vsync?std::min(refresh,max_fps):max_fps;
+  }
   CefRefPtr<CefDictionaryValue> State() const {
-    auto d=CefDictionaryValue::Create();d->SetBool("enabled",enabled);d->SetBool("active",active);d->SetBool("restartRequired",enabled!=active);return d;
+    auto d=CefDictionaryValue::Create();d->SetBool("enabled",enabled);d->SetBool("active",active);d->SetInt("level",level);d->SetInt("maxLevel",kMaxLevel);d->SetInt("activeLevel",active?active_level:0);d->SetBool("restartRequired",enabled!=active);return d;
   }
   CefRefPtr<CefDictionaryValue> VSyncState() const {
     auto d=CefDictionaryValue::Create();d->SetBool("enabled",vsync);d->SetBool("activeEnabled",vsync);d->SetBool("restartRequired",false);d->SetBool("canDisable",true);return d;
@@ -60,7 +71,7 @@ class TimerBeginClock {
   using Clock=std::chrono::steady_clock;
   std::mutex mutex_;
   std::condition_variable changed_,tick_;
-  bool running_=false,pending_=false;
+  bool running_=false,hold_=false;int owed_=0,owed_cap_=1;
   long long period_ns_=4000000;
   unsigned generation_=0;
   std::thread thread_;
@@ -85,27 +96,30 @@ class TimerBeginClock {
             next=Clock::now()+std::chrono::nanoseconds(period_ns_);
             continue;
           }
-          pending_=true;tick_.notify_one();
+          if(owed_<owed_cap_){++owed_;}
+          tick_.notify_one();
           next=NextDeadline(next,Clock::now(),period_ns_);
         }
     });
     return thread_.joinable();
   }
-  bool Take(){std::lock_guard<std::mutex> lock(mutex_);bool tick=pending_;pending_=false;return tick;}
+  bool Take(){std::lock_guard<std::mutex> lock(mutex_);if(owed_>0){--owed_;return true;}return false;}
+  void Hold(bool on){std::lock_guard<std::mutex> lock(mutex_);hold_=on;} // an owed tick is held back (spacing): do not wake the idle wait for it
+  void SetCatchUp(bool on){std::lock_guard<std::mutex> lock(mutex_);owed_cap_=on?2:1;if(owed_>owed_cap_)owed_=owed_cap_;}
   void Configure(int fps){
     std::lock_guard<std::mutex> lock(mutex_);
     const long long period=1000000000ll/std::clamp(fps,30,10000);
     if(period==period_ns_)return;
-    period_ns_=period;++generation_;pending_=false;changed_.notify_one();
+    period_ns_=period;++generation_;owed_=0;changed_.notify_one();
   }
-  void Wait(){
+  void Wait(std::chrono::microseconds poll=std::chrono::microseconds(1000)){
     std::unique_lock<std::mutex> lock(mutex_);
     // Keep the existing <=1 ms polling interval for CEF/SDL events, but a frame
     // tick wakes us immediately instead of waiting for a whole extra millisecond.
-    tick_.wait_for(lock,std::chrono::milliseconds(1),[&]{return pending_||!running_;});
+    tick_.wait_for(lock,poll,[&]{return (owed_>0&&!hold_)||!running_;});
   }
   void Stop(){
-    {std::lock_guard<std::mutex> lock(mutex_);running_=false;pending_=false;changed_.notify_one();tick_.notify_one();}
+    {std::lock_guard<std::mutex> lock(mutex_);running_=false;owed_=0;changed_.notify_one();tick_.notify_one();}
     if(thread_.joinable())thread_.join();
   }
 };

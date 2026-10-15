@@ -28,6 +28,8 @@
 #include "../demo_download.h"
 #include "include/cef_dialog_handler.h"
 #include "include/cef_context_menu_handler.h"
+#include "include/cef_command_handler.h"
+#include "include/cef_id_mappers.h"
 #include "include/cef_sandbox_win.h"
 #include "include/wrapper/cef_helpers.h"
 #include "borrowed_texture.h"
@@ -58,14 +60,42 @@ bool ConfineCapturedCursor() {
      clip.left>=bounds.left&&clip.top>=bounds.top&&clip.right<=bounds.right&&clip.bottom<=bounds.bottom)return true;
   return ClipCursor(&bounds)!=FALSE;
 }
+// The client's frame loop must not run below normal priority. Something outside our code was found lowering it to
+// BelowNormal with priority boost off, so set it at startup and re-check periodically.
+void EnsureNormalPriority() {
+  const HANDLE self=GetCurrentProcess();
+  const DWORD cls=GetPriorityClass(self);
+  if(cls==IDLE_PRIORITY_CLASS||cls==BELOW_NORMAL_PRIORITY_CLASS)SetPriorityClass(self,NORMAL_PRIORITY_CLASS);
+  BOOL disabled=FALSE;
+  if(GetProcessPriorityBoost(self,&disabled)&&disabled)SetProcessPriorityBoost(self,FALSE);
+}
 int generation=0,render_rate=0;
 #include "render_preferences.h"
 RenderPreferences render_preferences;
+// Opt-in windowed mode: CEF owns a child HWND that presents and receives input itself. The SDL window then only hosts it and the native status cards.
+bool native_window=false,startup_vsync=true,pointer_locked=false; /* pointer_locked: the page reports Chromium pointer lock (native mode only) */
+// In native mode the child HWND holds keyboard focus, so SDL reports the top-level window as unfocused; use the OS foreground instead.
+bool Focused(){return native_window?GetForegroundWindow()==hwnd:SDL_GetKeyboardFocus()==window;}
 std::string bridge_source;
 QrazyWindows::AssetWorker asset_worker;
 Production::Worker updater_worker;bool install_requested=false;Uint64 update_gesture=0;
 #include "bridge_binding.h"
 #include "window_state.h"
+// Native mode: clicks land in the CEF child, which SDL never sees, so the update-button gesture is taken from the real OS mouse message.
+// Chrome style shows a "To show your cursor, press Esc" bubble (a Chromium popup widget) when pointer lock starts and CEF has no setting for it.
+// Right after a lock begins, hide visible Chromium popup widgets of this thread; the SDL window and the browser child (not WS_POPUP) are left alone.
+BOOL CALLBACK HideLockBubbleWindow(HWND candidate,LPARAM){
+  wchar_t name[64]={};
+  if(candidate!=hwnd&&IsWindowVisible(candidate)&&(GetWindowLongPtrW(candidate,GWL_STYLE)&WS_POPUP)&&GetClassNameW(candidate,name,64)&&std::wstring(name).rfind(L"Chrome_WidgetWin",0)==0){
+    /* An empty window region keeps the popup alive for Chromium (hiding it made it flicker as Chromium re-showed it) but nothing is drawn. */
+    HRGN probe=CreateRectRgn(0,0,0,0);const int kind=GetWindowRgn(candidate,probe);DeleteObject(probe);
+    if(kind!=NULLREGION)SetWindowRgn(candidate,CreateRectRgn(0,0,0,0),FALSE);
+  }
+  return TRUE;
+}
+bool lock_was_held=false;Uint64 lock_started_ns=0;
+HHOOK gesture_hook=nullptr;
+LRESULT CALLBACK GestureHook(int code,WPARAM message,LPARAM data){if(code>=0&&(message==WM_LBUTTONDOWN||message==WM_NCLBUTTONDOWN)&&GetForegroundWindow()==hwnd)update_gesture=SDL_GetTicksNS();return CallNextHookEx(nullptr,code,message,data);}
 struct DialogResult {int id;unsigned epoch;bool save,error=false;std::string path,text;std::chrono::steady_clock::time_point expires=std::chrono::steady_clock::now()+std::chrono::minutes(5);};
 std::mutex dialog_mutex;std::deque<DialogResult> dialog_results;std::atomic<bool> dialog_active{false};
 void SDLCALL FileChosen(void* userdata,const char* const* files,int) {
@@ -149,7 +179,7 @@ class Texture {
 };
 class Client final : public DesktopPolicy::RecoveryState,public CefClient,public CefRenderHandler,
   public CefLifeSpanHandler,public CefRequestHandler,public CefLoadHandler,public CefDisplayHandler,
-  public CefDownloadHandler,public CefDialogHandler,public CefContextMenuHandler {
+  public CefDownloadHandler,public CefDialogHandler,public CefContextMenuHandler,public CefKeyboardHandler,public CefCommandHandler {
  public:
   CefRefPtr<CefBrowser> browser;
   Texture view,popup;
@@ -160,18 +190,51 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   Uint64 load_started=SDL_GetTicks();
   Uint64 presentation_started=SDL_GetTicksNS();
   unsigned presentation_count=0;
-  Uint64 frame_sent=0;
+  // Without VSync the begin-frame rate is adaptive: every kRateWindowNs the paints that came back are compared with the
+  // begin-frames sent. While paints keep up the allowed rate grows; when they fall behind (a GPU-bound spot) it drops to just
+  // above the paint rate, so the pipeline is not flooded. With VSync the display-paced clock bounds the rate and this is idle.
+  static constexpr Uint64 kRateWindowNs=200000000ull;
+  static constexpr double kRateFloor=60.0,kRateCeiling=20000.0;
+  double allowed_rate=kRateCeiling,tokens=0,known_good=0; // known_good: the paint rate last sustained without falling behind
+  Uint64 rate_window_start=0,last_token_ns=0;
+  unsigned window_sent=0,window_paints=0;
+  bool RateAllows(Uint64 now) {
+    if(render_preferences.vsync){allowed_rate=kRateCeiling;tokens=0;last_token_ns=now;rate_window_start=now;window_sent=window_paints=0;return true;}
+    if(!rate_window_start){rate_window_start=last_token_ns=now;}
+    tokens=std::min(4.0,tokens+allowed_rate*static_cast<double>(now-last_token_ns)/1e9);last_token_ns=now;
+    if(now-rate_window_start>=kRateWindowNs){
+      const double seconds=static_cast<double>(now-rate_window_start)/1e9,sent=window_sent/seconds,paints=window_paints/seconds;
+      if(sent>=20.0){
+        if(paints>=0.9*sent){
+          if(paints>=0.95*sent)known_good=std::max(known_good*0.99,sent);
+          // Climb quickly back to the last sustainable rate, but only gently above it, so a GPU-bound spot is not overshot and flooded.
+          const double step=sent<known_good?std::min(sent*1.5,known_good*1.25):sent*1.25;
+          allowed_rate=std::min(kRateCeiling,std::max(allowed_rate,step));
+        }else{
+          known_good=std::min(known_good,paints*1.1);
+          allowed_rate=std::max(kRateFloor,paints*1.1);
+        }
+      }
+      rate_window_start=now;window_sent=window_paints=0;
+    }
+    return tokens>=1.0;
+  }
   void RequestFrame(DisplayBeginClock& clock) {
-    clock.Configure(render_preferences.vsync,render_preferences.max_fps);
+    if(native_window)return; // Chromium paces its own presentation in windowed mode
+    clock.Configure(render_preferences.vsync,render_preferences.max_fps,render_rate);
     if(!browser||closing)return;
+    const Uint64 rate_now=SDL_GetTicksNS();
+    if(!RateAllows(rate_now))return;
     if(!clock.Take())return;
-    const Uint64 now=SDL_GetTicksNS();
-    const int target=render_preferences.CefTarget(render_rate);
-    const bool paced_by_display=render_preferences.vsync&&render_preferences.max_fps>=render_rate;
-    if(target<1||(!paced_by_display&&now-frame_sent<1000000000ull/static_cast<Uint64>(target)))return;
-    frame_sent=now;browser->GetHost()->SendExternalBeginFrame();
+    // The clock already ticks at the target rate with absolute deadlines. A second elapsed-time gate here dropped ticks
+    // whenever this loop noticed them late (the loop only looks every ~1.7 ms), so caps below the loop rate came out low.
+    if(render_preferences.CefTarget(render_rate)<1)return;
+    if(!render_preferences.vsync)tokens-=1.0;
+    ++window_sent;
+    browser->GetHost()->SendExternalBeginFrame();
   }
   void PresentationTick(){
+    if(native_window)return; // there are no SDL presents to count; the game keeps its own FPS figure
     const Uint64 now=SDL_GetTicksNS(),elapsed=now-presentation_started;
     if(elapsed<500000000ull)return;
     auto data=CefDictionaryValue::Create();data->SetString("type","presentation-rate");
@@ -201,10 +264,59 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   SDL_Cursor* cursor=nullptr;
   ~Client() override{if(cursor){SDL_SetCursor(SDL_GetDefaultCursor());SDL_DestroyCursor(cursor);}}
   bool OnCursorChange(CefRefPtr<CefBrowser>,CefCursorHandle,cef_cursor_type_t type,const CefCursorInfo&) override {
+    if(native_window)return false; // Chromium sets the cursor on its own window
     SDL_SystemCursor shape=type==CT_HAND?SDL_SYSTEM_CURSOR_POINTER:type==CT_IBEAM?SDL_SYSTEM_CURSOR_TEXT:type==CT_CROSS?SDL_SYSTEM_CURSOR_CROSSHAIR:SDL_SYSTEM_CURSOR_DEFAULT;
     auto next=SDL_CreateSystemCursor(shape);if(next){SDL_SetCursor(next);if(cursor)SDL_DestroyCursor(cursor);cursor=next;}return true;
   }
-  void OnAfterCreated(CefRefPtr<CefBrowser> value) override {browser=value;browser->GetHost()->SetFocus(SDL_GetKeyboardFocus()==window);browser->GetHost()->SetAudioMuted(true);}
+  void OnAfterCreated(CefRefPtr<CefBrowser> value) override {browser=value;ResizeChild(true);browser->GetHost()->SetFocus(Focused());browser->GetHost()->SetAudioMuted(true);}
+  // Native mode: keep the CEF child filling the SDL window's client area (physical pixels).
+  int child_width=0,child_height=0;
+  void ResizeChild(bool force=false){
+    if(!native_window||!browser)return;
+    HWND child=browser->GetHost()->GetWindowHandle();RECT area{};
+    if(!child||!GetClientRect(hwnd,&area)||area.right<=0||area.bottom<=0)return;
+    if(!force&&area.right==child_width&&area.bottom==child_height)return;
+    child_width=area.right;child_height=area.bottom;SetWindowPos(child,nullptr,0,0,child_width,child_height,SWP_NOZORDER|SWP_NOACTIVATE);browser->GetHost()->WasResized();
+  }
+  CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override{return this;}
+  CefRefPtr<CefCommandHandler> GetCommandHandler() override{return this;}
+  // Native mode (Chrome style): the client offers none of Chrome's own commands (DevTools, reload, zoom, fullscreen, history, print, tab/window commands);
+  // only clipboard commands stay. Command ids are looked up by name so they follow the CEF version.
+  bool OnChromeCommand(CefRefPtr<CefBrowser>,int command,cef_window_open_disposition_t) override{
+    if(!native_window)return false;
+    static const int allowed[]={cef_id_for_command_id_name("IDC_CUT"),cef_id_for_command_id_name("IDC_COPY"),cef_id_for_command_id_name("IDC_PASTE")};
+    for(int id:allowed)if(id==command)return false;
+    return true;
+  }
+  // Native mode only: the child HWND gets the keys, so client hotkeys are taken here before the page sees them.
+  // Browser accelerators of windowed Chromium that this client never offered: DevTools, reload, caret browsing, find, print/save/view-source,
+  // tab/window keys, page zoom and history keys. The offscreen path never turned keys into these, so they are consumed after the page saw them.
+  static bool DevToolsShortcut(const CefKeyEvent& event){
+    const int key=event.windows_key_code;const bool ctrl=!!(event.modifiers&EVENTFLAG_CONTROL_DOWN),shift=!!(event.modifiers&EVENTFLAG_SHIFT_DOWN),alt=!!(event.modifiers&EVENTFLAG_ALT_DOWN);
+    if(key==VK_F12||key==VK_F11||key==VK_F5||key==VK_F3||key==VK_F7)return true; /* F11 is the browser's fullscreen key; this client uses Alt+Enter and the game's button, and F11 stays bindable in the game */
+    if(ctrl&&shift&&(key=='I'||key=='J'||key=='C'||key=='R'||key=='N'||key=='T'))return true;
+    if(ctrl&&!alt&&(key=='R'||key=='P'||key=='S'||key=='U'||key=='F'||key=='G'||key=='W'||key=='T'||key=='N'||key=='0'||key==VK_NUMPAD0||key==VK_OEM_PLUS||key==VK_OEM_MINUS||key==VK_ADD||key==VK_SUBTRACT))return true;
+    return alt&&!ctrl&&(key==VK_LEFT||key==VK_RIGHT);
+  }
+
+  // DevTools is not offered by this client. In offscreen mode the host never turns keys into browser accelerators; in windowed mode Chromium
+  // would, and F12 crashed inside libcef. The page still sees the key first (the game may bind it); only the accelerator is consumed.
+  /* Escape key-up is consumed after the page has seen it: the game re-locks the pointer from that very key-up (menu resume), and Chromium's own
+     handling of the same Escape would then release the fresh lock again within milliseconds (seen in the diagnostic log). */
+  bool OnKeyEvent(CefRefPtr<CefBrowser>,const CefKeyEvent& event,CefEventHandle) override {return native_window&&(DevToolsShortcut(event)||(event.windows_key_code==VK_ESCAPE&&event.type==KEYEVENT_KEYUP));}
+  bool OnPreKeyEvent(CefRefPtr<CefBrowser>,const CefKeyEvent& event,CefEventHandle,bool* is_keyboard_shortcut) override {
+    if(!native_window||closing)return false;
+    const bool down=event.type==KEYEVENT_RAWKEYDOWN||event.type==KEYEVENT_KEYDOWN,alt=!!(event.modifiers&EVENTFLAG_ALT_DOWN),first=down&&!(event.modifiers&EVENTFLAG_IS_REPEAT);
+    /* Chromium exits pointer lock itself on Escape and then refuses a new lock for a while (same as in a browser). While the page holds the lock, take the
+       Escape press here and let the page release the lock by script instead; the key-up still reaches the page. */
+    if(pointer_locked&&event.windows_key_code==VK_ESCAPE&&down&&!(event.modifiers&(EVENTFLAG_ALT_DOWN|EVENTFLAG_CONTROL_DOWN))){if(first){auto data=Dict();data->SetString("type","escape");Send(data);}return true;}
+    if(DevToolsShortcut(event)){*is_keyboard_shortcut=true;return false;}
+    if(first&&(event.windows_key_code==VK_RETURN||event.windows_key_code==VK_SPACE))update_gesture=SDL_GetTicksNS();
+    if(alt&&!(event.modifiers&EVENTFLAG_CONTROL_DOWN)&&event.windows_key_code==VK_F4){if(first){Release("shortcut-close");closing=true;}return true;}
+    if(alt&&event.windows_key_code==VK_RETURN){if(first)SDL_SetWindowFullscreen(window,!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN));return true;}
+    return false;
+  }
+  void OnFullscreenModeChange(CefRefPtr<CefBrowser>,bool fullscreen) override{if(native_window&&!closing&&fullscreen!=!!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN))SDL_SetWindowFullscreen(window,fullscreen);}
   void OnBeforeClose(CefRefPtr<CefBrowser>) override {Release("close");browser=nullptr;closed=true;}
   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
   void OnBeforeContextMenu(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame>,CefRefPtr<CefContextMenuParams> params,CefRefPtr<CefMenuModel> model) override {
@@ -234,7 +346,7 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   }
   bool OnFileDialog(CefRefPtr<CefBrowser> value,FileDialogMode mode,const CefString&,const CefString&,const std::vector<CefString>& filters,const std::vector<CefString>&,const std::vector<CefString>&,CefRefPtr<CefFileDialogCallback> callback) override{
     bool images=!filters.empty();for(const auto& filter:filters)if(filter.ToString().rfind("image/",0)!=0)images=false;
-    if((static_cast<int>(mode)&0xFF)!=static_cast<int>(FILE_DIALOG_OPEN)||!images||closing||recovering||loading||captured||SDL_GetKeyboardFocus()!=window||DemoDownload::active||!value||!Trusted(value->GetMainFrame()->GetURL())||dialog_active.exchange(true)){callback->Cancel();return true;}
+    if((static_cast<int>(mode)&0xFF)!=static_cast<int>(FILE_DIALOG_OPEN)||!images||closing||recovering||loading||captured||!Focused()||DemoDownload::active||!value||!Trusted(value->GetMainFrame()->GetURL())||dialog_active.exchange(true)){callback->Cancel();return true;}
     static const SDL_DialogFileFilter image_filter={"Images","png;jpg;jpeg;gif;webp;bmp"};
     SDL_ShowOpenFileDialog(ImageChosen,new CefRefPtr<CefFileDialogCallback>(callback),window,&image_filter,1,nullptr,false);return true;
   }
@@ -252,10 +364,10 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     SDL_SetWindowRelativeMouseMode(window,false);SDL_EnableScreenSaver();
     if(captured)ClipCursor(nullptr);
     if(!captured)return;captured=false;++generation;
-    if(SDL_GetKeyboardFocus()==window)SDL_StartTextInput(window);
+    if(Focused())SDL_StartTextInput(window);
     auto data=Dict();data->SetString("type","state");data->SetString("reason",reason);Send(data);
   }
-  void Reset(const char* reason){Release(reason);asset_worker.Reset();popup_visible=false;selection.clear();composing=false;if(browser){browser->GetHost()->ImeCancelComposition();browser->GetHost()->SetAudioMuted(true);}}
+  void Reset(const char* reason){pointer_locked=false;Release(reason);asset_worker.Reset();popup_visible=false;selection.clear();composing=false;if(browser){browser->GetHost()->ImeCancelComposition();browser->GetHost()->SetAudioMuted(true);}}
   void Fail(bool retryable=false){Reset("failure");FailLoad();if(retryable)server_retry.Failure(SDL_GetTicks());else server_retry.Stop();SDL_SetWindowTitle(window,client_title.c_str());dirty=true;}
   void Retry(){if(!browser||closing||fatal||handoff_waiting||!server_retry.Attempt(SDL_GetTicks()))return;Reset("retry");BeginLoad();load_started=SDL_GetTicks();browser->GetMainFrame()->LoadURL(kOrigin);}
   void TickRetry(){
@@ -266,13 +378,15 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     if(server_retry.Due(now))Retry();
   }
   bool RetryButton(float x,float y){
-    if((!recovering&&!server_retry.active)||closing||fatal||handoff_waiting||SDL_GetKeyboardFocus()!=window)return false;
+    if((!recovering&&!server_retry.active)||closing||fatal||handoff_waiting||!Focused())return false;
     int w=0,h=0,pw=0,ph=0;SDL_GetWindowSize(window,&w,&h);SDL_GetRenderOutputSize(renderer,&pw,&ph);
     if(w<=0||h<=0)return false;x*=static_cast<float>(pw)/w;y*=static_cast<float>(ph)/h;
     if(x<40||x>260||y<200||y>248)return false;
     if(!server_retry.pending)Retry();return true;
   }
   bool OnBeforeBrowse(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,CefRefPtr<CefRequest> request,bool gesture,bool) override {
+    /* Native mode: history traversal (Alt+Left/Right, mouse side buttons, gestures) is never wanted; reloads and our own loads are not affected. */
+    if(native_window&&frame->IsMain()&&(request->GetTransitionType()&TT_FORWARD_BACK_FLAG))return true;
     if(handoff_waiting)return !frame->IsMain()||request->GetURL()!="about:blank";
     if(!frame->IsMain())return false;if(!Trusted(request->GetURL())){OpenWebLink(frame,request->GetURL(),gesture);return true;}Reset("navigation");BeginLoad();load_started=SDL_GetTicks();return false;
   }
@@ -280,12 +394,13 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     if(frame->IsMain()&&loading&&!recovering)SDL_SetWindowTitle(window,"Qrazy - connecting");}
   void OnLoadEnd(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,int code) override {
     if(!frame->IsMain()||!loading||recovering||!Trusted(frame->GetURL()))return;
-    if(code>=400){Fail(code==502||code==503||code==504);return;}if(FinishLoad(true,code)){server_retry.Stop();SDL_SetWindowTitle(window,client_title.c_str());browser->GetHost()->SetFocus(SDL_GetKeyboardFocus()==window);browser->GetHost()->SetAudioMuted(SDL_GetKeyboardFocus()!=window);}
+    if(code>=400){Fail(code==502||code==503||code==504);return;}if(FinishLoad(true,code)){server_retry.Stop();SDL_SetWindowTitle(window,client_title.c_str());browser->GetHost()->SetFocus(Focused());browser->GetHost()->SetAudioMuted(!Focused());}
   }
   void OnLoadError(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,ErrorCode code,const CefString&,const CefString& url) override{if(frame->IsMain()&&loading&&!recovering&&Trusted(url)&&code!=ERR_ABORTED)Fail(code==ERR_CONNECTION_REFUSED||code==ERR_CONNECTION_RESET||code==ERR_CONNECTION_CLOSED||code==ERR_CONNECTION_FAILED||code==ERR_CONNECTION_TIMED_OUT||code==ERR_TIMED_OUT||code==ERR_NAME_NOT_RESOLVED||code==ERR_INTERNET_DISCONNECTED||code==ERR_NETWORK_CHANGED);}
   void OnRenderProcessTerminated(CefRefPtr<CefBrowser>,TerminationStatus,int,const CefString&) override{Fail();}
   void OnPaint(CefRefPtr<CefBrowser>,PaintElementType,const RectList&,const void*,int,int) override{fatal=true;closing=true;Release("CPU-paint-rejected");}
   void OnAcceleratedPaint(CefRefPtr<CefBrowser>,PaintElementType type,const RectList&,const CefAcceleratedPaintInfo& info) override {
+    if(type==PET_VIEW)++window_paints;
     bool copied=(type==PET_VIEW?view:popup).Copy(info);
     if(!copied){fatal=true;closing=true;Release("GPU-copy-failed");}else{if(type==PET_POPUP)popup_ready=true;dirty=true;}
   }
@@ -303,10 +418,27 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     int id=args->GetInt(1);if(id<0)return true;std::string op=args->GetString(0);
     auto result=Dict();result->SetBool("ok",true);
     auto payload=CefParseJSON(args->GetString(2),JSON_PARSER_RFC);auto d=payload&&payload->GetType()==VTYPE_DICTIONARY?payload->GetDictionary():nullptr;
-    bool menu=!closing&&!recovering&&!loading&&!captured&&SDL_GetKeyboardFocus()==window;
+    bool menu=!closing&&!recovering&&!loading&&!captured&&Focused();
+    if(op=="native-window-get"){Reply(id,render_preferences.NativeWindowState(native_window));return true;}
+    if(op=="native-window-set"){Reply(id,QrazyWindows::Error("The native window is always on; there is no setting to change"));return true;}
+    if(native_window&&op=="vsync-get"){Reply(id,render_preferences.VSyncState());return true;}
+    if(native_window&&op=="vsync-set"){
+      if(closing||recovering||loading||!Focused()||!d||d->GetType("enabled")!=VTYPE_BOOL){Reply(id,QrazyWindows::Error("Return to the focused game before changing rendering settings"));return true;}
+      const auto previous=render_preferences;render_preferences.vsync=d->GetBool("enabled");
+      if(!render_preferences.Save()){render_preferences=previous;Reply(id,QrazyWindows::Error("Setting could not be saved"));return true;}
+      Reply(id,render_preferences.VSyncState()); /* applies at once: the bridge limiter reads it from the event below */
+      auto event=Dict();event->SetString("type","render-settings");event->SetDictionary("vsync",render_preferences.VSyncState());event->SetDictionary("maxFps",render_preferences.MaxFpsState());Send(event);return true;
+    }
+    if(native_window&&op=="max-fps-set"){ /* native mode: only saved; the bridge enforces it with a MessageChannel-paced requestAnimationFrame limiter */
+      if(closing||recovering||loading||!Focused()||!d||d->GetType("value")!=VTYPE_INT||d->GetInt("value")<30||d->GetInt("value")>10000){Reply(id,QrazyWindows::Error("Return to the focused game and give com_maxfps as an integer from 30 to 10000"));return true;}
+      const auto previous=render_preferences;render_preferences.max_fps=d->GetInt("value");
+      if(!render_preferences.Save()){render_preferences=previous;Reply(id,QrazyWindows::Error("Setting could not be saved"));return true;}
+      Reply(id,render_preferences.MaxFpsState());
+      auto event=Dict();event->SetString("type","render-settings");event->SetDictionary("vsync",render_preferences.VSyncState());event->SetDictionary("maxFps",render_preferences.MaxFpsState());Send(event);return true;
+    }
     if(op=="vsync-get"||op=="max-fps-get"){Reply(id,op=="vsync-get"?render_preferences.VSyncState():render_preferences.MaxFpsState());return true;}
     if(op=="vsync-set"||op=="max-fps-set"){
-      if(closing||recovering||loading||SDL_GetKeyboardFocus()!=window){Reply(id,QrazyWindows::Error("Return to the focused game before changing rendering settings"));return true;}
+      if(closing||recovering||loading||!Focused()){Reply(id,QrazyWindows::Error("Return to the focused game before changing rendering settings"));return true;}
       bool is_vsync=op=="vsync-set";
       if(!d||(is_vsync?d->GetType("enabled")!=VTYPE_BOOL:d->GetType("value")!=VTYPE_INT)||( !is_vsync&&(d->GetInt("value")<30||d->GetInt("value")>10000))){Reply(id,QrazyWindows::Error("Expected a VSync boolean or com_maxfps integer from 30 to 10000"));return true;}
       const auto previous=render_preferences;
@@ -328,7 +460,7 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       result->SetBool("ok",false);result->SetString("error","Desktop storage worker unavailable or busy; normal loading can continue");
     }else if(op=="release"){Release("release");return true;}
     else if(op=="config-import"||op=="config-export") {
-      if((!menu && !(op=="config-export" && !closing && !recovering && !loading && SDL_GetKeyboardFocus()==window)) || DemoDownload::active || dialog_active.exchange(true)){result->SetBool("ok",false);result->SetString("error","Config dialogs require a focused menu and no active dialog");Reply(id,result);return true;}
+      if((!menu && !(op=="config-export" && !closing && !recovering && !loading && Focused())) || DemoDownload::active || dialog_active.exchange(true)){result->SetBool("ok",false);result->SetString("error","Config dialogs require a focused menu and no active dialog");Reply(id,result);return true;}
       auto selected=new DialogResult{id,asset_worker.epoch.load(),op=="config-export"};
       static const SDL_DialogFileFilter filter={"Qrazy configuration","cfg"};
       if(selected->save){std::string name=d?d->GetString("name"):CefString();selected->text=d?d->GetString("text"):CefString();
@@ -354,13 +486,16 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       std::ifstream changes(updater_worker.root/"runtime"/"CHANGES.txt",std::ios::binary);std::string text(16001,'\0');changes.read(text.data(),16001);text.resize(static_cast<size_t>(changes.gcount()));if(!changes.is_open()||changes.bad()||text.size()>16000){Reply(id,QrazyWindows::Error("Release notes unavailable"));return true;}auto value=CefValue::Create();value->SetString(text);Reply(id,QrazyWindows::Success(value));return true;
     }else if(op=="diagnostics") {
       auto report=Dict();report->SetString("platform","Windows SDL3 + CEF");report->SetString("client",client_title);
-      report->SetString("presentationGpu",PresentationGpu());report->SetString("renderer","Direct3D 11");
+      report->SetString("presentationGpu",PresentationGpu());report->SetString("renderer","Direct3D 11");report->SetBool("nativeWindow",native_window);
       report->SetInt("cefTarget",render_preferences.CefTarget(render_rate));report->SetInt("maxFps",render_preferences.max_fps);report->SetBool("sdlVSync",render_preferences.vsync);
       report->SetInt("refreshHz",RefreshRate());int width=0,height=0;SDL_GetWindowSizeInPixels(window,&width,&height);report->SetInt("pixelWidth",width);report->SetInt("pixelHeight",height);
       report->SetDouble("displayScale",SDL_GetWindowDisplayScale(window));SupportGraphics(report);Reply(id,QrazyWindows::Success(QrazyWindows::Value(report)));return true;
-    }else if(op=="clock")result->SetDouble("time",SDL_GetTicksNS()/1e6);
+    }else if(op=="pointer-lock-activate"){if(native_window&&browser){CefKeyEvent k;k.windows_key_code=VK_F24;k.native_key_code=0x76<<16;k.is_system_key=false;k.modifiers=0;k.type=KEYEVENT_RAWKEYDOWN;browser->GetHost()->SendKeyEvent(k);k.type=KEYEVENT_KEYUP;browser->GetHost()->SendKeyEvent(k);}
+    }else if(op=="pointer-lock-state"){pointer_locked=native_window&&d&&d->GetType("locked")==VTYPE_BOOL&&d->GetBool("locked");
+    }else if(op=="refresh-hz-get")result->SetInt("hz",RefreshRate());
+    else if(op=="clock")result->SetDouble("time",SDL_GetTicksNS()/1e6);
     else if(op=="capture") {
-      const char* why=closing?"closing":recovering?"recovering":loading?"loading":dialog_active?"dialog":SDL_GetKeyboardFocus()!=window?"no-keyboard-focus":nullptr;
+      const char* why=native_window?"native-window-mode":closing?"closing":recovering?"recovering":loading?"loading":dialog_active?"dialog":!Focused()?"no-keyboard-focus":nullptr;
       // The free cursor may have left the window during chat/console. The window
       // still has keyboard focus, so bring the cursor back before capturing.
       if(!why&&SDL_GetMouseFocus()!=window){int w=0,h=0;SDL_GetWindowSize(window,&w,&h);SDL_WarpMouseInWindow(window,w/2.f,h/2.f);}
@@ -372,7 +507,7 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       result->SetBool("ok",ok);result->SetInt("generation",++generation);
     }else if(op=="quit"){Release("quit");closing=true;}
     else if(op=="refresh-game") {
-      bool ok=browser&&!closing&&!fatal&&!handoff_waiting&&!loading&&SDL_GetKeyboardFocus()==window;
+      bool ok=browser&&!closing&&!fatal&&!handoff_waiting&&!loading&&Focused();
       result->SetBool("ok",ok);
       if(ok){server_retry.Stop();Reset("refresh");BeginLoad();load_started=SDL_GetTicks();server_retry.Start(load_started);server_retry.Attempt(load_started);browser->ReloadIgnoreCache();}
     }
@@ -418,14 +553,16 @@ int Run(HINSTANCE instance,void* sandbox) {
   updater_worker.root=base;
   auto profile=base/kProfile;std::error_code error;std::filesystem::create_directories(profile,error);
   if(error||!QrazyWindows::NoReparse(profile))return 2;ProfileLock lock;if(!lock.Acquire(profile/"host.lock"))return 2;
-  render_preferences.Load(profile);
+  render_preferences.Load(profile);native_window=render_preferences.native_window;startup_vsync=render_preferences.vsync;
   asset_worker.Start(profile);
   SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER,"1");SDL_SetHint(SDL_HINT_MOUSE_AUTO_CAPTURE,"0");
   SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE,"0");SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SPEED_SCALE,"1");
+  EnsureNormalPriority();
   if(!SDL_Init(SDL_INIT_VIDEO))return 3;
   window=SDL_CreateWindow(client_title.c_str(),1280,800,SDL_WINDOW_RESIZABLE|SDL_WINDOW_HIGH_PIXEL_DENSITY);
   if(!window){SDL_Quit();return 3;}
   hwnd=static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(window),SDL_PROP_WINDOW_WIN32_HWND_POINTER,nullptr));
+  if(native_window)gesture_hook=SetWindowsHookExW(WH_MOUSE,GestureHook,nullptr,GetCurrentThreadId());
   saved_window.profile=profile;saved_window.Restore();
   // Start ordinary windows maximized, including previously saved small windows.
   // A saved fullscreen session still restores fullscreen.
@@ -470,15 +607,34 @@ int Run(HINSTANCE instance,void* sandbox) {
     if(transitioning&&!peer.Start(base))result=8;
     CefRefPtr<Client> client=new Client;
     DisplayBeginClock frame_clock;
-    frame_clock.Configure(render_preferences.vsync,render_preferences.max_fps);
-    if(!frame_clock.Start(hwnd))result=5;
+    frame_clock.Configure(render_preferences.vsync,render_preferences.max_fps,render_rate);
+    if(!native_window&&!frame_clock.Start(hwnd))result=5;
     client->handoff_waiting=transitioning;
-    if(!client->view.Initialize(device)||!client->popup.Initialize(device))result=5;
-    CefWindowInfo info;info.SetAsWindowless(hwnd);info.shared_texture_enabled=true;info.external_begin_frame_enabled=true;
+    if(!native_window&&(!client->view.Initialize(device)||!client->popup.Initialize(device)))result=5;
+    CefWindowInfo info;CefRefPtr<CefDictionaryValue> mode; /* extra_info reaches the render process; null in offscreen mode */
+    if(native_window){mode=CefDictionaryValue::Create();RECT area{};GetClientRect(hwnd,&area);info.SetAsChild(hwnd,CefRect(0,0,std::max<LONG>(1,area.right),std::max<LONG>(1,area.bottom)));mode->SetBool("nativeWindow",true);}
+    else{info.SetAsWindowless(hwnd);info.shared_texture_enabled=true;info.external_begin_frame_enabled=true;}
     CefBrowserSettings bs;bs.windowless_frame_rate=render_preferences.CefTarget(render_rate);bs.background_color=CefColorSetARGB(255,0,0,0);
-    if(result||!CefBrowserHost::CreateBrowser(info,client,transitioning?"about:blank":kOrigin,bs,nullptr,request_context)){if(!result)result=5;}
-    bool close_sent=false;auto refresh=std::chrono::steady_clock::now();SDL_StartTextInput(window);
+    if(result||!CefBrowserHost::CreateBrowser(info,client,transitioning?"about:blank":kOrigin,bs,mode,request_context)){
+      /* No silent fallback to offscreen: a native-window failure has to be reported so it can be fixed. */
+      if(!result&&native_window)SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,"Qrazy","Qrazy could not create its game window (error 5).\n\nPlease report this in the Qrazy Discord and include your graphics card, graphics driver version and Windows version.",window);
+      if(!result)result=5;
+    }
+    bool close_sent=false,child_hidden=false,child_enabled=true;Uint64 zoom_checked=0,close_sent_ns=0;auto refresh=std::chrono::steady_clock::now();if(!native_window)SDL_StartTextInput(window);
     auto update_display=[&](){
+      if(native_window){
+        /* Chromium's child window never sees the parent move between monitors, so its vsync interval (and rAF rate) stays on the old display's refresh. Tell it, and nudge the child size so the compositor re-evaluates the display. */
+        static SDL_DisplayID last_display=0;static int last_rate=0;
+        SDL_DisplayID now_display=SDL_GetDisplayForWindow(window);int now_rate=RefreshRate();
+        if(last_display&&(now_display!=last_display||now_rate!=last_rate)&&client->browser){
+          client->browser->GetHost()->NotifyScreenInfoChanged();
+          HWND child=client->browser->GetHost()->GetWindowHandle();RECT area{};
+          if(child&&GetClientRect(hwnd,&area)&&area.right>1&&area.bottom>1){SetWindowPos(child,nullptr,0,0,area.right-1,area.bottom,SWP_NOZORDER|SWP_NOACTIVATE);client->browser->GetHost()->WasResized();client->ResizeChild(true);}
+        }
+        last_display=now_display;last_rate=now_rate;
+        if(now_rate)render_rate=now_rate;
+        return;
+      }
       if(!frame_clock.UpdateDisplay(hwnd)){client->fatal=true;closing=true;return;}
       int rate=RefreshRate();if(rate&&rate!=render_rate){render_rate=rate;if(client->browser)client->browser->GetHost()->SetWindowlessFrameRate(render_preferences.CefTarget(rate));}
     };
@@ -521,7 +677,7 @@ int Run(HINSTANCE instance,void* sandbox) {
         auto response=CefParseJSON(job.text,JSON_PARSER_RFC);auto reply=response&&response->GetType()==VTYPE_DICTIONARY?response->GetDictionary():QrazyWindows::Error("Update helper failed; no installation was started");
         if(!job.ok)reply=QrazyWindows::Error("Update verification or staging failed. The installed runtime is unchanged; retry Update to download again.");
         if(job.operation=="prepare"&&job.ok&&reply->GetBool("ok")){
-          if(client->loading||client->recovering||captured||SDL_GetKeyboardFocus()!=window){client->Reply(job.id,QrazyWindows::Error("Return to the focused menu and confirm installation again"));continue;}
+          if(client->loading||client->recovering||captured||!Focused()){client->Reply(job.id,QrazyWindows::Error("Return to the focused menu and confirm installation again"));continue;}
           install_requested=true;client->Release("update-install");closing=true;
         }
         client->Reply(job.id,reply);
@@ -532,27 +688,32 @@ int Run(HINSTANCE instance,void* sandbox) {
         if(closing||choice.epoch!=asset_worker.epoch.load())continue;
         if(choice.error||std::chrono::steady_clock::now()>=choice.expires){client->Reply(choice.id,QrazyWindows::Error("Config dialog failed or expired"));continue;}
         if(choice.path.empty()){auto cancelled=Dict();cancelled->SetBool("cancelled",true);client->Reply(choice.id,QrazyWindows::Success(QrazyWindows::Value(cancelled)));continue;}
-        if(client->loading||client->recovering||captured||SDL_GetKeyboardFocus()!=window){client->Reply(choice.id,QrazyWindows::Error("Return to the focused menu and select the config action again"));continue;}
+        if(client->loading||client->recovering||captured||!Focused()){client->Reply(choice.id,QrazyWindows::Error("Return to the focused menu and select the config action again"));continue;}
         auto list=CefListValue::Create();list->SetString(0,choice.path);if(choice.save)list->SetString(1,choice.text);
         if(!asset_worker.Submit(choice.id,choice.save?"config-write":"config-read",list))client->Reply(choice.id,QrazyWindows::Error("Config worker unavailable or busy"));
       }
-      if(std::chrono::steady_clock::now()>=refresh){update_display();refresh=std::chrono::steady_clock::now()+std::chrono::seconds(1);}
+      if(std::chrono::steady_clock::now()>=refresh){EnsureNormalPriority();update_display();client->ResizeChild();refresh=std::chrono::steady_clock::now()+std::chrono::seconds(1);}
       SDL_Event e;auto move_batch=CefListValue::Create(); /* captured-mouse samples from this pass go out as one message */
       while(SDL_PollEvent(&e)) {
         if(e.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED||e.type==SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED||e.type==SDL_EVENT_DISPLAY_ADDED||e.type==SDL_EVENT_DISPLAY_REMOVED)update_display();
-        if(((e.type==SDL_EVENT_MOUSE_BUTTON_DOWN&&e.button.button==SDL_BUTTON_LEFT)||(e.type==SDL_EVENT_KEY_DOWN&&(e.key.key==SDLK_RETURN||e.key.key==SDLK_SPACE)))&&SDL_GetKeyboardFocus()==window)update_gesture=SDL_GetTicksNS();
+        if(((e.type==SDL_EVENT_MOUSE_BUTTON_DOWN&&e.button.button==SDL_BUTTON_LEFT)||(e.type==SDL_EVENT_KEY_DOWN&&(e.key.key==SDLK_RETURN||e.key.key==SDLK_SPACE)))&&Focused())update_gesture=SDL_GetTicksNS();
         if(e.type==SDL_EVENT_QUIT||e.type==SDL_EVENT_WINDOW_CLOSE_REQUESTED)closing=true;
-        if(e.type==SDL_EVENT_WINDOW_FOCUS_LOST||e.type==SDL_EVENT_WINDOW_MINIMIZED) {
+        /* In native mode SDL reports focus loss whenever the CEF child takes keyboard focus; only a real loss of the foreground counts. */
+        if((e.type==SDL_EVENT_WINDOW_FOCUS_LOST&&!(native_window&&Focused()))||e.type==SDL_EVENT_WINDOW_MINIMIZED) {
           client->Release("focus");client->selection.clear();client->composing=false;if(client->browser){client->browser->GetHost()->ImeCancelComposition();client->browser->GetHost()->SetAudioMuted(true);client->browser->GetHost()->SetFocus(false);}
           auto d=Dict();d->SetString("type","focus");d->SetBool("focused",false);client->Send(d);
         }
-        if(e.type==SDL_EVENT_WINDOW_FOCUS_GAINED){if(client->browser){client->browser->GetHost()->SetFocus(true);client->browser->GetHost()->SetAudioMuted(client->loading||client->recovering);}SDL_StartTextInput(window);auto d=Dict();d->SetString("type","focus");d->SetBool("focused",true);client->Send(d);}
-        if(e.type==SDL_EVENT_WINDOW_RESIZED||e.type==SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED||e.type==SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED||e.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED){if(client->browser){client->browser->GetHost()->NotifyScreenInfoChanged();client->browser->GetHost()->WasResized();}client->dirty=true;}
+        if(e.type==SDL_EVENT_WINDOW_FOCUS_GAINED){if(client->browser){if(!child_hidden)client->browser->GetHost()->SetFocus(true);client->browser->GetHost()->SetAudioMuted(client->loading||client->recovering);}if(!native_window)SDL_StartTextInput(window);
+          /* Chromium refuses requestPointerLock without user activation (the page's capture restore after alt-tab runs on this focus message, often seconds after the last input). A trusted F24 press (unbound, never Escape) grants activation first. */
+          if(native_window&&client->browser){CefKeyEvent k;k.windows_key_code=VK_F24;k.native_key_code=0x76<<16;k.is_system_key=false;k.modifiers=0;k.type=KEYEVENT_RAWKEYDOWN;client->browser->GetHost()->SendKeyEvent(k);k.type=KEYEVENT_KEYUP;client->browser->GetHost()->SendKeyEvent(k);}
+          auto d=Dict();d->SetString("type","focus");d->SetBool("focused",true);client->Send(d);}
+        if(e.type==SDL_EVENT_WINDOW_RESIZED||e.type==SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED||e.type==SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED||e.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED){if(native_window)client->ResizeChild();else if(client->browser){client->browser->GetHost()->NotifyScreenInfoChanged();client->browser->GetHost()->WasResized();}client->dirty=true;}
+        if(native_window&&(e.type==SDL_EVENT_WINDOW_MAXIMIZED||e.type==SDL_EVENT_WINDOW_RESTORED||e.type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN||e.type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN))client->ResizeChild();
         if(e.type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN||e.type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)client->FullscreenState();
         if(e.type==SDL_EVENT_WINDOW_MOVED||e.type==SDL_EVENT_WINDOW_RESIZED||e.type==SDL_EVENT_WINDOW_MAXIMIZED||e.type==SDL_EVENT_WINDOW_RESTORED||e.type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN||e.type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)saved_window.Observe();
         if(e.type==SDL_EVENT_KEY_DOWN||e.type==SDL_EVENT_KEY_UP)Keyboard(client.get(),e.key);
         if(e.type==SDL_EVENT_MOUSE_BUTTON_DOWN&&e.button.button==SDL_BUTTON_LEFT&&client->RetryButton(e.button.x,e.button.y))continue;
-        if(!client->browser||!DesktopPolicy::AllowInput(closing,client->recovering,client->loading))continue;
+        if(!client->browser||native_window||!DesktopPolicy::AllowInput(closing,client->recovering,client->loading))continue;
         if(e.type==SDL_EVENT_TEXT_EDITING&&!captured) {
           CefString text(e.edit.text);auto utf=text.ToString16();
           auto index=[&](int points){size_t pos=0;for(int i=0;i<std::max(0,points)&&pos<utf.size();++i){char16_t ch=utf[pos++];if(ch>=0xd800&&ch<=0xdbff&&pos<utf.size()&&utf[pos]>=0xdc00&&utf[pos]<=0xdfff)++pos;}return static_cast<uint32_t>(pos);};
@@ -565,8 +726,30 @@ int Run(HINSTANCE instance,void* sandbox) {
       }
       if(move_batch->GetSize()&&client->browser){auto d=Dict();d->SetString("type","move");d->SetList("samples",move_batch);client->Send(d);}
       if(captured&&!ConfineCapturedCursor())client->Release("cursor-confinement-lost");
-      if(closing&&client->browser&&!close_sent){client->Release("close");client->browser->GetHost()->CloseBrowser(true);close_sent=true;}
-      if(client->dirty||client->loading||client->recovering)render_frame();
+      if(closing&&client->browser&&!close_sent){client->Release("close");client->browser->GetHost()->CloseBrowser(true);close_sent=true;close_sent_ns=SDL_GetTicksNS();}
+      if(native_window&&close_sent&&!closed&&SDL_GetTicksNS()-close_sent_ns>5000000000ull){std::fprintf(stderr,"PROTOTYPE native browser did not close in 5 s; exiting\n");closed=true;} /* last resort so a stuck windowed close cannot leave a window that ignores input */
+      if(native_window&&client->browser) {
+        /* Cards are drawn by SDL under the CEF child, so the child is hidden only while one is showing (recovery or server retry). Ordinary loading keeps the page visible and running. */
+        const bool card=client->recovering||client->server_retry.active;
+        HWND child=client->browser->GetHost()->GetWindowHandle();
+        if(child&&card!=child_hidden) {
+          child_hidden=card;ShowWindow(child,card?SW_HIDE:SW_SHOW);
+          if(card){SetFocus(hwnd);client->dirty=true;}else{client->ResizeChild(true);client->browser->GetHost()->SetFocus(Focused());}
+        }
+        /* Same input gate as offscreen mode (no input while loading or recovering): a disabled child window receives no mouse or keys. */
+        const bool allow=DesktopPolicy::AllowInput(false,client->recovering,client->loading); /* closing does not disable the child: a close that stalls must not also leave a dead window */
+        if(child&&allow!=child_enabled){
+          child_enabled=allow;EnableWindow(child,allow);
+          if(!allow)SetFocus(hwnd);else if(!child_hidden)client->browser->GetHost()->SetFocus(Focused());
+        }
+        /* Ctrl+wheel zoom reaches the page as in a browser; undo any zoom within 50 ms (offscreen mode stripped Ctrl from wheel events and reset zoom on load). */
+        const Uint64 zoom_now=SDL_GetTicksNS();
+        if(pointer_locked&&!lock_was_held)lock_started_ns=zoom_now;
+        lock_was_held=pointer_locked;
+        if(pointer_locked&&zoom_now-lock_started_ns<10000000000ull)EnumThreadWindows(GetCurrentThreadId(),HideLockBubbleWindow,0);
+        if(zoom_now-zoom_checked>=50000000ull){zoom_checked=zoom_now;if(client->browser->GetHost()->GetZoomLevel()!=0.0)client->browser->GetHost()->SetZoomLevel(0.0);}
+        if(card&&(client->dirty||client->loading||client->recovering))render_frame();
+      }else if(client->dirty||client->loading||client->recovering)render_frame();
       if(frame_clock.Failed()){client->fatal=true;closing=true;}
       client->RequestFrame(frame_clock);
       SDL_Delay(1);
@@ -574,6 +757,7 @@ int Run(HINSTANCE instance,void* sandbox) {
     saved_window.Observe();saved_window.Save();if(client->fatal)result=6;
     if(!result){CefRefPtr<CookieFlushed> flushed=new CookieFlushed;bool requested=CefCookieManager::GetGlobalManager(nullptr)->FlushStore(flushed);auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);while(requested&&!flushed->done&&std::chrono::steady_clock::now()<deadline){CefDoMessageLoopWork();SDL_Delay(1);}std::fprintf(stderr,"PROTOTYPE cookie flush completed=%d\n",flushed->done);if(!requested||!flushed->done)result=7;}
   }
+  if(gesture_hook)UnhookWindowsHookEx(gesture_hook);
   updater_worker.Stop();asset_worker.Stop();CefShutdown();app=nullptr;SDL_DestroyRenderer(renderer);SDL_DestroyWindow(window);SDL_Quit();return !result&&install_requested?Production::InstallExit:result;
 }
 } // namespace
