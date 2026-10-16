@@ -575,7 +575,7 @@
     const message = JSON.parse(json);
     if (message.type === 'presentation-rate') {
       if (Number.isFinite(message.fps) && message.fps >= 0) { presentedFps = message.fps;
-        if (Number.isFinite(message.requestedFps) && Number.isFinite(message.paintedFps)) presentDetail = ' (cap ' + message.cap + (message.target ? ', tgt ' + message.target : '') + ', cef ' + message.cefRate + ', req ' + Math.round(message.requestedFps) + ', paint ' + Math.round(message.paintedFps) + (Number.isFinite(message.passFps) ? ', loop ' + Math.round(message.passFps) + ', pump ' + Math.round(message.pumpMs) + ', copy ' + Math.round(message.copyMs) + ', swap ' + Math.round(message.swapMs) : '') + ')';
+        if (Number.isFinite(message.requestedFps) && Number.isFinite(message.paintedFps)) presentDetail = ' (cap ' + message.cap + (message.target ? ', tgt ' + message.target : '') + ', cef ' + message.cefRate + ', req ' + Math.round(message.requestedFps) + ', paint ' + Math.round(message.paintedFps) + (Number.isFinite(message.gapMed) ? ', gap ' + message.gapMed.toFixed(1) + '/' + message.gapMax.toFixed(1) : '') + (Number.isFinite(message.passFps) ? ', loop ' + Math.round(message.passFps) + ', pump ' + Math.round(message.pumpMs) + ', copy ' + Math.round(message.copyMs) + ', swap ' + Math.round(message.swapMs) : '') + ')';
         updatePresentationLabel(); }
       return;
     }

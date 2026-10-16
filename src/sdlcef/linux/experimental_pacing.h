@@ -10,8 +10,8 @@
 #include <thread>
 #include <mutex>
 
-// Highest experiment level this build knows. Level 1 = timer clock; 2 = 1 + present limiter; 3 = 2 + faster input polling; 4 = 3 + begin-frame rate follows what CEF delivers; 5 = 4 using the best delivery rate of the last second; 6 = 5 plus, with VSync on, ask 20% above the refresh rate; 7 = 6 without the blocking buffer swap (presents from our own timer); 8 = 6 plus catch-up (a tick missed while the loop was blocked is owed, up to 2).
-constexpr int kMaxLevel=8;
+// Highest experiment level this build knows. Level 1 = timer clock; 2 = 1 + present limiter; 3 = 2 + faster input polling; 4 = 3 + begin-frame rate follows what CEF delivers; 5 = 4 using the best delivery rate of the last second; 6 = 5 plus, with VSync on, ask 20% above the refresh rate; 7 = 6 without the blocking buffer swap (presents from our own timer).
+constexpr int kMaxLevel=7;
 struct ExperimentalPacing {
   bool enabled=false; // saved preference for the next start
   bool active=false;  // this process runs the experimental clock
@@ -71,7 +71,7 @@ class TimerBeginClock {
   using Clock=std::chrono::steady_clock;
   std::mutex mutex_;
   std::condition_variable changed_,tick_;
-  bool running_=false,hold_=false;int owed_=0,owed_cap_=1;
+  bool running_=false,pending_=false;
   long long period_ns_=4000000;
   unsigned generation_=0;
   std::thread thread_;
@@ -96,30 +96,27 @@ class TimerBeginClock {
             next=Clock::now()+std::chrono::nanoseconds(period_ns_);
             continue;
           }
-          if(owed_<owed_cap_){++owed_;}
-          tick_.notify_one();
+          pending_=true;tick_.notify_one();
           next=NextDeadline(next,Clock::now(),period_ns_);
         }
     });
     return thread_.joinable();
   }
-  bool Take(){std::lock_guard<std::mutex> lock(mutex_);if(owed_>0){--owed_;return true;}return false;}
-  void Hold(bool on){std::lock_guard<std::mutex> lock(mutex_);hold_=on;} // an owed tick is held back (spacing): do not wake the idle wait for it
-  void SetCatchUp(bool on){std::lock_guard<std::mutex> lock(mutex_);owed_cap_=on?2:1;if(owed_>owed_cap_)owed_=owed_cap_;}
+  bool Take(){std::lock_guard<std::mutex> lock(mutex_);bool tick=pending_;pending_=false;return tick;}
   void Configure(int fps){
     std::lock_guard<std::mutex> lock(mutex_);
     const long long period=1000000000ll/std::clamp(fps,30,10000);
     if(period==period_ns_)return;
-    period_ns_=period;++generation_;owed_=0;changed_.notify_one();
+    period_ns_=period;++generation_;pending_=false;changed_.notify_one();
   }
   void Wait(std::chrono::microseconds poll=std::chrono::microseconds(1000)){
     std::unique_lock<std::mutex> lock(mutex_);
     // Keep the existing <=1 ms polling interval for CEF/SDL events, but a frame
     // tick wakes us immediately instead of waiting for a whole extra millisecond.
-    tick_.wait_for(lock,poll,[&]{return (owed_>0&&!hold_)||!running_;});
+    tick_.wait_for(lock,poll,[&]{return pending_||!running_;});
   }
   void Stop(){
-    {std::lock_guard<std::mutex> lock(mutex_);running_=false;owed_=0;changed_.notify_one();tick_.notify_one();}
+    {std::lock_guard<std::mutex> lock(mutex_);running_=false;pending_=false;changed_.notify_one();tick_.notify_one();}
     if(thread_.joinable())thread_.join();
   }
 };

@@ -1,4 +1,5 @@
 // Windows host implementation in progress. No game/input/physics implementation.
+#include <cctype>
 #include <windows.h>
 #include <intrin.h>
 #include <psapi.h>
@@ -338,17 +339,46 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   bool CanDownload(CefRefPtr<CefBrowser> value,const CefString& url,const CefString& method) override {return !closing && value && Trusted(value->GetMainFrame()->GetURL()) && method=="GET" && DemoDownload::TrustedBlob(url.ToString());}
   bool OnBeforeDownload(CefRefPtr<CefBrowser> value,CefRefPtr<CefDownloadItem> item,const CefString& name,CefRefPtr<CefBeforeDownloadCallback> callback) override {if(!closing && !dialog_active && value && Trusted(value->GetMainFrame()->GetURL()) && DemoDownload::TrustedBlob(item->GetOriginalUrl().ToString()) && DemoDownload::ExportName(name.ToString())) {Release("export-save");DemoDownload::Save(window,name.ToString(),callback);}return true;}
   void OnDownloadUpdated(CefRefPtr<CefBrowser>,CefRefPtr<CefDownloadItem> item,CefRefPtr<CefDownloadItemCallback> callback) override {if(!DemoDownload::TrustedBlob(item->GetOriginalUrl().ToString()))callback->Cancel();}
-  // Only single-file image pickers (spray slots) from the trusted page are allowed; everything else is cancelled.
-  static void SDLCALL ImageChosen(void* userdata,const char* const* files,int) {
-    std::unique_ptr<CefRefPtr<CefFileDialogCallback>> callback(static_cast<CefRefPtr<CefFileDialogCallback>*>(userdata));
-    if(files&&files[0])(*callback)->Continue({CefString(std::string(files[0]))});else (*callback)->Cancel();
+  // Single-file pickers from the trusted page are allowed; the dialog filter is derived from the page's accept list
+  // (".ext" entries and a few known MIME types). Unparseable or risky entries cancel the dialog.
+  struct PickerState{CefRefPtr<CefFileDialogCallback> callback;std::string pattern;SDL_DialogFileFilter filter;};
+  static void SDLCALL PickerChosen(void* userdata,const char* const* files,int) {
+    std::unique_ptr<PickerState> state(static_cast<PickerState*>(userdata));
+    if(files&&files[0])state->callback->Continue({CefString(std::string(files[0]))});else state->callback->Cancel();
     dialog_active=false;
   }
+  static bool BuildPickerPattern(const std::vector<CefString>& filters,std::string& pattern){
+    static const char* denied[]={"exe","dll","bat","cmd","com","scr","msi","ps1","vbs","js","jse","wsf","lnk","reg","hta","jar","sh","pif","cpl"};
+    std::vector<std::string> exts;
+    auto add=[&](const std::string& e)->bool{
+      if(e.empty()||e.size()>8)return false;
+      for(char c:e)if(!std::isalnum(static_cast<unsigned char>(c)))return false;
+      for(const char* d:denied)if(e==d)return false;
+      for(const auto& x:exts)if(x==e)return true;
+      exts.push_back(e);return true;
+    };
+    if(filters.empty())return false;
+    for(const auto& entry:filters){
+      std::string f=entry.ToString();for(char& c:f)c=static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if(f.size()>1&&f[0]=='.'){if(!add(f.substr(1)))return false;}
+      else if(f=="image/*"){for(const char* e:{"png","jpg","jpeg","gif","webp","bmp"})add(e);}
+      else if(f=="image/png"){add("png");}
+      else if(f=="image/jpeg"){add("jpg");add("jpeg");}
+      else if(f=="image/gif"){add("gif");}
+      else if(f=="image/webp"){add("webp");}
+      else if(f=="image/bmp"){add("bmp");}
+      else if(f=="model/gltf-binary"){add("glb");}
+      else return false;
+    }
+    if(exts.empty())return false;
+    for(size_t i=0;i<exts.size();i++){if(i)pattern+=';';pattern+=exts[i];}
+    return true;
+  }
   bool OnFileDialog(CefRefPtr<CefBrowser> value,FileDialogMode mode,const CefString&,const CefString&,const std::vector<CefString>& filters,const std::vector<CefString>&,const std::vector<CefString>&,CefRefPtr<CefFileDialogCallback> callback) override{
-    bool images=!filters.empty();for(const auto& filter:filters)if(filter.ToString().rfind("image/",0)!=0)images=false;
-    if((static_cast<int>(mode)&0xFF)!=static_cast<int>(FILE_DIALOG_OPEN)||!images||closing||recovering||loading||captured||!Focused()||DemoDownload::active||!value||!Trusted(value->GetMainFrame()->GetURL())||dialog_active.exchange(true)){callback->Cancel();return true;}
-    static const SDL_DialogFileFilter image_filter={"Images","png;jpg;jpeg;gif;webp;bmp"};
-    SDL_ShowOpenFileDialog(ImageChosen,new CefRefPtr<CefFileDialogCallback>(callback),window,&image_filter,1,nullptr,false);return true;
+    std::string pattern;
+    if((static_cast<int>(mode)&0xFF)!=static_cast<int>(FILE_DIALOG_OPEN)||!BuildPickerPattern(filters,pattern)||closing||recovering||loading||captured||!Focused()||DemoDownload::active||!value||!Trusted(value->GetMainFrame()->GetURL())||dialog_active.exchange(true)){callback->Cancel();return true;}
+    auto* state=new PickerState{callback,std::move(pattern),{}};state->filter={"Files",state->pattern.c_str()};
+    SDL_ShowOpenFileDialog(PickerChosen,state,window,&state->filter,1,nullptr,false);return true;
   }
   void OnTextSelectionChanged(CefRefPtr<CefBrowser>,const CefString& text,const CefRange&) override{selection=text.ToString().substr(0,1048576);}
   void OnImeCompositionRangeChanged(CefRefPtr<CefBrowser>,const CefRange&,const RectList& bounds) override {

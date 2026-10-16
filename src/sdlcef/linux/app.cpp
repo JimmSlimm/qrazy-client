@@ -492,7 +492,9 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   }
   Uint64 presentation_started=SDL_GetTicksNS();
   unsigned presentation_count=0;
-  unsigned begin_count=0;int paint_mark=0;unsigned lp_passes=0;double lp_pump=0,lp_copy=0,lp_swap=0;unsigned trace_n=0,trace_passes=0,trace_req=0,trace_present=0;int trace_frames=0;double trace_pump=0,trace_copy=0,trace_swap=0;Uint64 trace_at=SDL_GetTicksNS();
+  unsigned begin_count=0;int paint_mark=0;Uint64 gap_last=0;float gap_p99_last=0,gap_max_last=0;std::vector<float> gap_ms;
+  void NotePresent(){const Uint64 t=SDL_GetTicksNS();if(gap_last&&gap_ms.size()<4096)gap_ms.push_back(static_cast<float>((t-gap_last)/1e6));gap_last=t;}
+  unsigned lp_passes=0;double lp_pump=0,lp_copy=0,lp_swap=0;unsigned trace_n=0,trace_passes=0,trace_req=0,trace_present=0;int trace_frames=0;double trace_pump=0,trace_copy=0,trace_swap=0;Uint64 trace_at=SDL_GetTicksNS();
   void PresentationTick() { /* experimental pacing only: measured successful swaps per second, sent about twice a second */
     if(!pacing.active)return;
     const Uint64 now=SDL_GetTicksNS(),elapsed=now-presentation_started;
@@ -503,6 +505,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     data->SetDouble("requestedFps",begin_count*1e9/static_cast<double>(elapsed));
     data->SetDouble("paintedFps",(frames-paint_mark)*1e9/static_cast<double>(elapsed));
     data->SetInt("cap",pacing.max_fps);data->SetInt("target",request_target);data->SetInt("cefRate",browser?browser->GetHost()->GetWindowlessFrameRate():-1);
+    if(!gap_ms.empty()){std::sort(gap_ms.begin(),gap_ms.end());gap_p99_last=gap_ms[gap_ms.size()/2]; /* median of the half-second window */gap_max_last=gap_ms.back();data->SetDouble("gapMed",gap_p99_last);data->SetDouble("gapMax",gap_max_last);gap_ms.clear();}
     data->SetDouble("passFps",(passes-lp_passes)*1e9/static_cast<double>(elapsed));
     data->SetDouble("pumpMs",(pump_ms-lp_pump)*1e9/static_cast<double>(elapsed));
     data->SetDouble("copyMs",(copy_ms-lp_copy)*1e9/static_cast<double>(elapsed));
@@ -511,15 +514,14 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     trace_req+=begin_count;trace_present+=presentation_count;
     if(++trace_n%4==0){ /* experimental pacing only: one log line about every 2 seconds, per-second averages */
       const double sec=(now-trace_at)/1e9;
-      std::fprintf(stderr,"QRAZY pacing-trace tgt=%d passes=%.0f req=%.0f paint=%.0f present=%.0f pump-ms/s=%.0f copy-ms/s=%.0f swap-ms/s=%.0f\n",request_target,
-                   (passes-trace_passes)/sec,trace_req/sec,(frames-trace_frames)/sec,trace_present/sec,(pump_ms-trace_pump)/sec,(copy_ms-trace_copy)/sec,(swap_ms-trace_swap)/sec);
+      std::fprintf(stderr,"QRAZY pacing-trace tgt=%d passes=%.0f req=%.0f paint=%.0f present=%.0f pump-ms/s=%.0f copy-ms/s=%.0f swap-ms/s=%.0f gap=%.1f/%.1f\n",request_target,
+                   (passes-trace_passes)/sec,trace_req/sec,(frames-trace_frames)/sec,trace_present/sec,(pump_ms-trace_pump)/sec,(copy_ms-trace_copy)/sec,(swap_ms-trace_swap)/sec,gap_p99_last,gap_max_last);
       trace_at=now;trace_passes=passes;trace_frames=frames;trace_pump=pump_ms;trace_copy=copy_ms;trace_swap=swap_ms;trace_req=0;trace_present=0;
     }
     begin_count=0;paint_mark=frames;
     Send(data);presentation_count=0;presentation_started=now;
   }
   /* Level 4: request begin-frames at the rate CEF actually delivers (+30% to probe for more), never above the player's cap. */
-  Uint64 last_request_ns=0;
   int request_target=0,adapt_rate=0,adapt_mark=0,adapt_ring_i=0,adapt_ring_n=0;Uint64 adapt_at=0;double adapt_ring[10]={};
   int AdaptiveTarget(int cap) {
     const int floor_rate=std::min(cap,240);
@@ -541,14 +543,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     request_target=pacing.Target(render_rate);
     if(pacing.active_level>=4)request_target=AdaptiveTarget(request_target);
     pacing_clock.Configure(request_target);
-    pacing_clock.SetCatchUp(pacing.active_level>=8);
-    const Uint64 request_now=SDL_GetTicksNS();
-    /* Level 8: owed catch-up requests are spaced at least a third of a period apart so Chromium does not see them back to back. */
-    const bool spaced=pacing.active_level>=8&&request_now-last_request_ns<1000000000ull/static_cast<Uint64>(std::max(request_target,30))/3;
-    pacing_clock.Hold(spaced);
-    if(spaced)return;
     if(!browser||closing||!pacing_clock.Take())return;
-    last_request_ns=request_now;
     ++begin_count;
     browser->GetHost()->SendExternalBeginFrame();
   }
@@ -950,7 +945,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     auto inspect_at = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     bool inspected=false;
     bool close_sent = false;
-    auto last_present = std::chrono::steady_clock::now();
+    auto last_present = std::chrono::steady_clock::now(), next_present = last_present;
     auto refresh_at = std::chrono::steady_clock::now();
     while (!closed) {
       ++passes;
@@ -1068,9 +1063,12 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
       /* Level 2: present at most once per the player's own frame period; newer frames replace older ones while waiting. Not with VSync on: the display already paces presentation and the limiter would only skip frames. */
       const auto present_now=std::chrono::steady_clock::now();
       const int present_rate=pacing.vsync?std::min(render_rate,pacing.max_fps):pacing.Target(render_rate);
-      const bool present_due=pacing.active_level<2||(pacing.vsync&&pacing.active_level!=7)||present_now-last_present>=std::chrono::nanoseconds(900000000ll/std::clamp(present_rate,30,10000));
+      const auto present_period=std::chrono::nanoseconds(1000000000ll/std::clamp(present_rate,30,10000));
+      const bool exact_pacing=pacing.vsync&&pacing.active_level==7; /* level 7: present on exact refresh deadlines, lateness carried into the next one */
+      const bool present_due=pacing.active_level<2||(pacing.vsync&&!exact_pacing)||(exact_pacing?present_now>=next_present:present_now-last_present>=present_period*9/10);
       if (native_card || (present_due && client->Draw())) {
         last_present=present_now;
+        if(exact_pacing){next_present+=present_period;if(next_present<present_now)next_present=present_now+present_period;}
         ++presentations;
         if (!hidden_check) {
           auto begin=std::chrono::steady_clock::now();
@@ -1079,7 +1077,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
             std::fprintf(stderr, "QRAZY SDL swap failed: %s\n", SDL_GetError());
           }
           swap_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
-          if(errors==0)++client->presentation_count;
+          if(errors==0){++client->presentation_count;client->NotePresent();}
         }
       }
       client->PresentationTick();

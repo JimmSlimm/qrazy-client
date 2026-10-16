@@ -1,6 +1,15 @@
 {
   "releases": [
     {
+      "version": "0.5.2",
+      "date": "2026-10-16",
+      "added": [],
+      "changed": [
+        "Windows: file pickers opened by the game (such as for custom models) now show the file types the game asks for, instead of only image files."
+      ],
+      "fixed": []
+    },
+    {
       "version": "0.5.1",
       "date": "2026-10-15",
       "added": [
