@@ -1,6 +1,8 @@
 #pragma once
 #include <atomic>
+#include <cctype>
 #include <memory>
+#include <string>
 #include "include/cef_task.h"
 #include "include/cef_download_handler.h"
 #include <SDL3/SDL.h>
@@ -21,6 +23,7 @@ class SaveTask final : public CefTask {
  public:
   CefRefPtr<CefBeforeDownloadCallback> callback;
   std::string path;
+  std::string extension;
   explicit SaveTask(CefRefPtr<CefBeforeDownloadCallback> value):callback(value){}
   void Execute() override {if(!path.empty())callback->Continue(path,false);active=false;}
  private:
@@ -28,12 +31,21 @@ class SaveTask final : public CefTask {
 };
 inline void SDLCALL Chosen(void* userdata,const char* const* files,int) {
   std::unique_ptr<CefRefPtr<SaveTask>> task(static_cast<CefRefPtr<SaveTask>*>(userdata));
-  if(files&&files[0])(*task)->path=files[0];
+  if(files&&files[0]) {
+    auto& path=(*task)->path;
+    const auto& extension=(*task)->extension;
+    path=files[0];
+    bool has=path.size()>extension.size();
+    for(size_t i=0;has&&i<extension.size();++i)
+      has=std::tolower(static_cast<unsigned char>(path[path.size()-extension.size()+i]))==std::tolower(static_cast<unsigned char>(extension[i]));
+    if(!has)path+=extension;
+  }
   if(!CefPostTask(TID_UI,*task))active=false;
 }
 inline void Save(SDL_Window* window,const std::string& name,CefRefPtr<CefBeforeDownloadCallback> callback) {
   if(active.exchange(true))return;
   auto task=new CefRefPtr<SaveTask>(new SaveTask(callback));
+  (*task)->extension=name.substr(name.rfind('.'));
   static const SDL_DialogFileFilter filter{"Qrazy exports","qdemo;cfg;json"};
   SDL_ShowSaveFileDialog(Chosen,task,window,&filter,1,name.c_str());
 }

@@ -10,8 +10,12 @@
 #include <thread>
 #include <mutex>
 
-// Highest experiment level this build knows. Level 1 = timer clock; 2 = 1 + present limiter; 3 = 2 + faster input polling; 4 = 3 + begin-frame rate follows what CEF delivers; 5 = 4 using the best delivery rate of the last second; 6 = 5 plus, with VSync on, ask 20% above the refresh rate; 7 = 6 without the blocking buffer swap (presents from our own timer).
-constexpr int kMaxLevel=7;
+// 0 = off, 1 = experimental pacing: timer-driven frame requests with a sleep-then-spin timer (precise wake-ups).
+// 2 = level 1 plus the frame copy on its own thread (shared GL context) so the main thread never waits for the GPU.
+// 3 = level 1 plus a 32 MB V8 young generation (fewer garbage-collection pauses; startup flag), without level 2's copy thread.
+// Levels above 2 are each level 1 plus ONE independent experiment (not cumulative).
+// Saved levels above kMaxLevel read as 1. Any level change needs a restart.
+constexpr int kMaxLevel=3;
 struct ExperimentalPacing {
   bool enabled=false; // saved preference for the next start
   bool active=false;  // this process runs the experimental clock
@@ -49,13 +53,13 @@ struct ExperimentalPacing {
   void MarkRunning() const {std::ofstream out(running,std::ios::binary|std::ios::trunc);out<<"1";}
   void MarkClean() const {std::error_code error;std::filesystem::remove(running,error);}
   // 0 = swap returns immediately (the Wayland compositor still syncs to the display); 1 = swap blocks until the display refresh.
-  int SwapInterval() const {return active&&(!vsync||active_level==7)?0:1;}
+  int SwapInterval() const {return active?0:1;}
   int Target(int refresh) const {
-    if(vsync&&active_level>=6)return std::min(max_fps,(refresh*6+4)/5); // headroom: Chromium drops a frame when two arrive closer than its frame period
+    if(vsync&&active)return std::min(max_fps,(refresh*6+4)/5); // headroom: Chromium drops a frame when two arrive closer than its frame period
     return vsync?std::min(refresh,max_fps):max_fps;
   }
   CefRefPtr<CefDictionaryValue> State() const {
-    auto d=CefDictionaryValue::Create();d->SetBool("enabled",enabled);d->SetBool("active",active);d->SetInt("level",level);d->SetInt("maxLevel",kMaxLevel);d->SetInt("activeLevel",active?active_level:0);d->SetBool("restartRequired",enabled!=active);return d;
+    auto d=CefDictionaryValue::Create();d->SetBool("enabled",enabled);d->SetBool("active",active);d->SetInt("level",level);d->SetInt("maxLevel",kMaxLevel);d->SetInt("activeLevel",active?active_level:0);d->SetBool("restartRequired",enabled!=active||(active&&level!=active_level));return d;
   }
   CefRefPtr<CefDictionaryValue> VSyncState() const {
     auto d=CefDictionaryValue::Create();d->SetBool("enabled",vsync);d->SetBool("activeEnabled",vsync);d->SetBool("restartRequired",false);d->SetBool("canDisable",true);return d;
@@ -71,7 +75,7 @@ class TimerBeginClock {
   using Clock=std::chrono::steady_clock;
   std::mutex mutex_;
   std::condition_variable changed_,tick_;
-  bool running_=false,pending_=false;
+  bool running_=false,pending_=false,spin_=false;
   long long period_ns_=4000000;
   unsigned generation_=0;
   std::thread thread_;
@@ -90,11 +94,20 @@ class TimerBeginClock {
         unsigned generation=generation_;
         auto next=Clock::now()+std::chrono::nanoseconds(period_ns_);
         while(running_) {
-          if(changed_.wait_until(lock,next,[&]{return !running_||generation!=generation_;})) {
+          // Level 3: sleep until 0.3 ms before the deadline, then spin to it, so a late wake-up cannot delay the tick.
+          const auto lead=std::chrono::microseconds(spin_?300:0);
+          if(changed_.wait_until(lock,next-lead,[&]{return !running_||generation!=generation_;})) {
             if(!running_)break;
             generation=generation_;
             next=Clock::now()+std::chrono::nanoseconds(period_ns_);
             continue;
+          }
+          if(lead.count()) {
+            lock.unlock();
+            while(Clock::now()<next){}
+            lock.lock();
+            if(!running_)break;
+            if(generation!=generation_)continue;
           }
           pending_=true;tick_.notify_one();
           next=NextDeadline(next,Clock::now(),period_ns_);
@@ -102,6 +115,7 @@ class TimerBeginClock {
     });
     return thread_.joinable();
   }
+  void SetSpin(bool on){std::lock_guard<std::mutex> lock(mutex_);spin_=on;}
   bool Take(){std::lock_guard<std::mutex> lock(mutex_);bool tick=pending_;pending_=false;return tick;}
   void Configure(int fps){
     std::lock_guard<std::mutex> lock(mutex_);

@@ -15,7 +15,13 @@
 #include <sstream>
 #include <map>
 #include <vector>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <unistd.h>
 #include <cstring>
+#include <strings.h>
 #include <fcntl.h>
 #include <csignal>
 #include <sys/stat.h>
@@ -44,7 +50,7 @@ SDL_Window* window = nullptr;
 SDL_GLContext glcontext = nullptr;
 bool closing = false, closed = false, captured = false, hidden_check = false;
 int generation = 0, frames = 0, copies = 0, errors = 0, presentations = 0;
-double copy_ms = 0, swap_ms = 0, pump_ms = 0;unsigned passes = 0;
+double copy_ms = 0, swap_ms = 0, pump_ms = 0, import_ms = 0, wait_ms = 0;unsigned passes = 0;
 std::string bridge_source;
 std::string close_action;
 std::string installed_title="Qrazy";
@@ -68,7 +74,8 @@ std::deque<DialogResult> dialog_results;
 std::atomic<bool> dialog_active{false};
 void SDLCALL FileChosen(void* userdata,const char* const* files,int) {
   std::unique_ptr<DialogResult> result(static_cast<DialogResult*>(userdata));
-  result->error=!files;result->path.clear();if(files&&files[0])result->path=files[0];
+  result->error=!files;result->path.clear();
+  if(files&&files[0]){result->path=files[0];if(result->save){const std::string& p=result->path;if(p.size()<4||strcasecmp(p.c_str()+p.size()-4,".cfg")!=0)result->path+=".cfg";}}
   std::lock_guard<std::mutex> lock(dialog_mutex);dialog_results.push_back(std::move(*result));dialog_active=false;
 }
 class CookieFlushed final : public CefCompletionCallback {
@@ -155,6 +162,9 @@ class App final : public CefApp, public CefRenderProcessHandler, public CefBrows
     if (process_type.empty()) {
       line->AppendSwitchWithValue("use-angle", amd_mesa_renderer ? "vulkan" : "gl-egl");
       line->AppendSwitch("disable-software-rasterizer");
+      /* Level 3: a 32 MB V8 young generation makes minor-GC pauses rarer (the game allocates ~25 MB/s; the Windows native mode measured
+         9-14 ms hitches at the heap drops). The browser copies js-flags to its renderers; it applies at startup. */
+      if (pacing.active && pacing.active_level == 3) line->AppendSwitchWithValue("js-flags", "--min-semi-space-size=32 --max-semi-space-size=32");
       if (amd_mesa_renderer) {
         // VA-API warming can create radeonsi command/shader workers before
         // sandbox initialization even when ANGLE itself uses Vulkan.
@@ -212,7 +222,10 @@ class Texture {
   int width = 0, height = 0;
   bool ready = false;
  public:
-  ~Texture() { if (texture) glDeleteTextures(1, &texture); if (program) glDeleteProgram(program); }
+  bool external_ = false; /* level 2: the texture belongs to the copy thread */
+  void Adopt(GLuint adopted, int w, int h) { external_ = true; texture = adopted; width = w; height = h; ready = true; }
+  void Detach() { if (external_) { external_ = false; texture = 0; width = 0; height = 0; ready = false; } } /* the copy thread took its textures away */
+  ~Texture() { if (texture && !external_) glDeleteTextures(1, &texture); if (program) glDeleteProgram(program); }
   bool Copy(const CefAcceleratedPaintInfo& info) {
     if (!SDL_GL_MakeCurrent(window, glcontext)) return false;
     auto create = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
@@ -231,13 +244,15 @@ class Texture {
       EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, static_cast<EGLint>(info.modifier >> 32)});
     attrs.push_back(EGL_NONE);
     auto display = eglGetCurrentDisplay();
+    const auto import_begin = std::chrono::steady_clock::now();
     auto image = create(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs.data());
-    if (image == EGL_NO_IMAGE_KHR) { std::fprintf(stderr, "QRAZY DMA-BUF import failed EGL=%x modifier=%llx\n", eglGetError(), static_cast<unsigned long long>(info.modifier)); return false; }
+    if (image == EGL_NO_IMAGE_KHR) { std::fprintf(stderr, "QRAZY DMA-BUF import failed EGL=%x modifier=%llx%c", eglGetError(), static_cast<unsigned long long>(info.modifier), 10); return false; }
     GLuint source = 0, fbo = 0;
     glGenTextures(1, &source); glBindTexture(GL_TEXTURE_2D, source); bind(GL_TEXTURE_2D, image);
     glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
     bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    import_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - import_begin).count();
     if (ok) {
       if (!texture) glGenTextures(1, &texture);
       glBindTexture(GL_TEXTURE_2D, texture);
@@ -251,13 +266,20 @@ class Texture {
       glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, rect.x, rect.y, width, height);
       // Safe first prototype: copy completion before CEF reuses its pool buffer.
       // A later fenced ring needs an explicit producer/consumer lifetime proof.
+      const auto wait_begin = std::chrono::steady_clock::now();
       glFinish(); ok = glGetError() == GL_NO_ERROR;
+      wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wait_begin).count();
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0); glDeleteFramebuffers(1, &fbo); glDeleteTextures(1, &source); destroy(display, image);
     ready = ok; return ok;
   }
   bool Draw(const CefRect* area = nullptr, bool force = false) {
     if (!texture || (!ready && !force)) return false;
+    static const GLfloat full[4] = {0, 0, 1, 1};
+    return DrawTex(texture, width, height, area, full);
+  }
+  /* Draws `tex` (source size sw x sh, sampled over the uv rectangle {u0,v0,u1,v1}) into the current framebuffer. */
+  bool DrawTex(GLuint tex, int sw, int sh, const CefRect* area, const GLfloat* uv) {
     if (!program) {
       auto compile = [](GLenum type, const char* code) {
         GLuint shader = glCreateShader(type); glShaderSource(shader, 1, &code, nullptr); glCompileShader(shader);
@@ -278,18 +300,143 @@ class Texture {
       glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     } else { glViewport(0, 0, pw, ph); glDisable(GL_BLEND); }
     glUseProgram(program);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, texture); glUniform1i(glGetUniformLocation(program, "tex"), 0);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex); glUniform1i(glGetUniformLocation(program, "tex"), 0);
     // A frame within a pixel or two of the window is a rounding artifact, not a real resize: sample it
     // unfiltered so fractional display scales stay sharp. Larger mismatches (live resize) keep bilinear.
-    const bool nearest = area || (std::abs(width - pw) <= 2 && std::abs(height - ph) <= 2);
+    const bool nearest = area || (std::abs(sw - pw) <= 2 && std::abs(sh - ph) <= 2);
     const GLint filter = nearest ? GL_NEAREST : GL_LINEAR;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-    const GLfloat quad[] = {-1,1,0,0, -1,-1,0,1, 1,1,1,0, 1,-1,1,1};
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    const GLfloat quad[] = {-1,1,uv[0],uv[1], -1,-1,uv[0],uv[3], 1,1,uv[2],uv[1], 1,-1,uv[2],uv[3]};
     glBindBuffer(GL_ARRAY_BUFFER, 0); glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(GLfloat), quad);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*sizeof(GLfloat), quad+2); glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     ready = false; return glGetError() == GL_NO_ERROR;
   }
+};
+
+
+/* Level 2: the frame copy runs on its own thread with a shared, surfaceless GL context, so the thread that pumps CEF, sends frame
+   requests and presents never waits for the GPU. The shared buffer's file descriptor is duplicated (that keeps the dma-buf alive); the
+   kernel's implicit sync orders our read against Chromium's next write to the same buffer. The newest frame wins. */
+class AsyncCopier {
+ public:
+  struct Job { int fd = -1, coded_w = 0, coded_h = 0, x = 0, y = 0, w = 0, h = 0; EGLint fourcc = 0; uint64_t modifier = 0; uint32_t offset = 0, stride = 0; };
+  std::atomic<long long> import_ns{0}, wait_ns{0};
+  ~AsyncCopier() { Stop(); }
+  bool Running() const { return running_; }
+  bool Failing() const { return failures_ >= 5; } /* five failed copies in a row: the caller falls back to the normal copy */
+  /* Call on the thread where the SDL GL context is current. */
+  bool Start() {
+    if (running_) return true;
+    display_ = eglGetCurrentDisplay(); shared_ = eglGetCurrentContext();
+    if (display_ == EGL_NO_DISPLAY || shared_ == EGL_NO_CONTEXT) return false;
+    const char* extensions = eglQueryString(display_, EGL_EXTENSIONS);
+    if (!extensions || !std::strstr(extensions, "EGL_KHR_surfaceless_context")) { std::fprintf(stderr, "QRAZY async copy unavailable: no surfaceless EGL context%c", 10); return false; }
+    EGLint config_id = 0, version = 2, count = 0;
+    if (!eglQueryContext(display_, shared_, EGL_CONFIG_ID, &config_id)) return false;
+    eglQueryContext(display_, shared_, EGL_CONTEXT_CLIENT_VERSION, &version);
+    const EGLint pick[] = {EGL_CONFIG_ID, config_id, EGL_NONE};
+    EGLConfig config = nullptr;
+    if (!eglChooseConfig(display_, pick, &config, 1, &count) || count < 1) return false;
+    const EGLint attribs[] = {EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE};
+    context_ = eglCreateContext(display_, config, shared_, attribs);
+    if (context_ == EGL_NO_CONTEXT) { std::fprintf(stderr, "QRAZY async copy: shared context failed EGL=%x%c", eglGetError(), 10); return false; }
+    stop_ = false; running_ = true;
+    thread_ = std::thread([this] { Run(); });
+    std::fprintf(stderr, "QRAZY async frame copy active (level 2)%c", 10);
+    return true;
+  }
+  void Stop() {
+    if (!running_) return;
+    { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; if (has_job_) { close(job_.fd); has_job_ = false; } }
+    wake_.notify_one();
+    if (thread_.joinable()) thread_.join();
+    if (context_ != EGL_NO_CONTEXT) { eglDestroyContext(display_, context_); context_ = EGL_NO_CONTEXT; }
+    running_ = false;
+  }
+  /* Takes ownership of job.fd. A pending job the worker has not started is replaced and its descriptor closed. */
+  void Submit(const Job& job) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (has_job_) { close(job_.fd); }
+      job_ = job; has_job_ = true;
+    }
+    wake_.notify_one();
+  }
+  /* Main thread: the newest finished frame, if it has not been taken yet. */
+  bool TakeFresh(GLuint& texture, int& w, int& h) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!fresh_) return false;
+    fresh_ = false; in_use_ = front_; texture = textures_[front_]; w = sizes_[front_][0]; h = sizes_[front_][1];
+    return true;
+  }
+ private:
+  void Run() {
+    eglBindAPI(EGL_OPENGL_ES_API);
+    if (!eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, context_)) {
+      std::fprintf(stderr, "QRAZY async copy: eglMakeCurrent failed EGL=%x%c", eglGetError(), 10); return;
+    }
+    auto create = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
+    auto destroy = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+    auto bind = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+    glGenTextures(3, textures_);
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!stop_) {
+      wake_.wait(lock, [this] { return stop_ || has_job_; });
+      if (stop_) break;
+      const Job job = job_; has_job_ = false;
+      int back = 0; while (back == front_ || back == in_use_) ++back; /* three textures: one is always free */
+      lock.unlock();
+      const bool ok = create && destroy && bind && CopyOne(job, back, create, destroy, bind);
+      close(job.fd);
+      if (ok) { failures_ = 0; } else { ++failures_; }
+      lock.lock();
+      if (ok) { front_ = back; fresh_ = true; }
+    }
+    glDeleteTextures(3, textures_);
+    eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  }
+  bool CopyOne(const Job& job, int back, PFNEGLCREATEIMAGEKHRPROC create, PFNEGLDESTROYIMAGEKHRPROC destroy, PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind) {
+    if (std::getenv("QRAZY_TEST_ASYNC_COPY_FAIL")) { return false; } /* test hook: exercises the fallback to the normal copy */
+    const auto begin = std::chrono::steady_clock::now();
+    std::vector<EGLint> attrs = {EGL_WIDTH, job.coded_w, EGL_HEIGHT, job.coded_h, EGL_LINUX_DRM_FOURCC_EXT, job.fourcc, EGL_DMA_BUF_PLANE0_FD_EXT, job.fd,
+      EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(job.offset), EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(job.stride)};
+    if (job.modifier != UINT64_C(0x00ffffffffffffff)) attrs.insert(attrs.end(), {
+      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, static_cast<EGLint>(job.modifier & 0xffffffff),
+      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, static_cast<EGLint>(job.modifier >> 32)});
+    attrs.push_back(EGL_NONE);
+    EGLImageKHR image = create(display_, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs.data());
+    if (image == EGL_NO_IMAGE_KHR) return false;
+    GLuint source = 0, fbo = 0;
+    glGenTextures(1, &source); glBindTexture(GL_TEXTURE_2D, source); bind(GL_TEXTURE_2D, image);
+    glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
+    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    const auto copy_begin = std::chrono::steady_clock::now();
+    if (ok) {
+      glBindTexture(GL_TEXTURE_2D, textures_[back]);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      if (sizes_[back][0] != job.w || sizes_[back][1] != job.h) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, job.w, job.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        sizes_[back][0] = job.w; sizes_[back][1] = job.h;
+      }
+      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, job.x, job.y, job.w, job.h);
+      glFinish(); ok = glGetError() == GL_NO_ERROR;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0); glDeleteFramebuffers(1, &fbo); glDeleteTextures(1, &source); destroy(display_, image);
+    const auto end = std::chrono::steady_clock::now();
+    import_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(copy_begin - begin).count();
+    wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end - copy_begin).count();
+    return ok;
+  }
+  EGLDisplay display_ = EGL_NO_DISPLAY; EGLContext context_ = EGL_NO_CONTEXT, shared_ = EGL_NO_CONTEXT;
+  std::thread thread_; std::mutex mutex_; std::condition_variable wake_;
+  std::atomic<bool> running_{false};
+  std::atomic<unsigned> failures_{0};
+  bool stop_ = false, has_job_ = false, fresh_ = false;
+  Job job_; GLuint textures_[3] = {0, 0, 0}; int sizes_[3][2] = {{0, 0}, {0, 0}, {0, 0}}; int front_ = 0, in_use_ = -1;
 };
 
 class Client final : public DesktopPolicy::RecoveryState, public CefClient, public CefRenderHandler, public CefLifeSpanHandler,
@@ -298,6 +445,8 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   CefRefPtr<CefBrowser> browser;
   Texture view;
   Texture popup;
+  AsyncCopier copier; /* level 6; declared after the textures so it stops first */
+  bool copier_failed = false;
   CefRect popup_rect;
   bool popup_visible = false, dirty = false;
   SDL_Cursor* cursor = nullptr;
@@ -494,7 +643,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   unsigned presentation_count=0;
   unsigned begin_count=0;int paint_mark=0;Uint64 gap_last=0;float gap_p99_last=0,gap_max_last=0;std::vector<float> gap_ms;
   void NotePresent(){const Uint64 t=SDL_GetTicksNS();if(gap_last&&gap_ms.size()<4096)gap_ms.push_back(static_cast<float>((t-gap_last)/1e6));gap_last=t;}
-  unsigned lp_passes=0;double lp_pump=0,lp_copy=0,lp_swap=0;unsigned trace_n=0,trace_passes=0,trace_req=0,trace_present=0;int trace_frames=0;double trace_pump=0,trace_copy=0,trace_swap=0;Uint64 trace_at=SDL_GetTicksNS();
+  unsigned lp_passes=0;double lp_pump=0,lp_copy=0,lp_swap=0,lp_import=0,lp_wait=0;unsigned trace_n=0,trace_passes=0,trace_req=0,trace_present=0;int trace_frames=0;double trace_pump=0,trace_copy=0,trace_swap=0;Uint64 trace_at=SDL_GetTicksNS();
   void PresentationTick() { /* experimental pacing only: measured successful swaps per second, sent about twice a second */
     if(!pacing.active)return;
     const Uint64 now=SDL_GetTicksNS(),elapsed=now-presentation_started;
@@ -510,6 +659,10 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     data->SetDouble("pumpMs",(pump_ms-lp_pump)*1e9/static_cast<double>(elapsed));
     data->SetDouble("copyMs",(copy_ms-lp_copy)*1e9/static_cast<double>(elapsed));
     data->SetDouble("swapMs",(swap_ms-lp_swap)*1e9/static_cast<double>(elapsed));
+    if (copier.Running()) { import_ms = copier.import_ns.load() / 1e6; wait_ms = copier.wait_ns.load() / 1e6; } /* level 6: the copy thread's own times */
+    data->SetDouble("impMs",(import_ms-lp_import)*1e9/static_cast<double>(elapsed));
+    data->SetDouble("waitMs",(wait_ms-lp_wait)*1e9/static_cast<double>(elapsed));
+    lp_import=import_ms;lp_wait=wait_ms;
     lp_passes=passes;lp_pump=pump_ms;lp_copy=copy_ms;lp_swap=swap_ms;
     trace_req+=begin_count;trace_present+=presentation_count;
     if(++trace_n%4==0){ /* experimental pacing only: one log line about every 2 seconds, per-second averages */
@@ -521,7 +674,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     begin_count=0;paint_mark=frames;
     Send(data);presentation_count=0;presentation_started=now;
   }
-  /* Level 4: request begin-frames at the rate CEF actually delivers (+30% to probe for more), never above the player's cap. */
+  /* Request begin-frames at the best rate CEF delivered in the last second (+25%), never above the player's cap. */
   int request_target=0,adapt_rate=0,adapt_mark=0,adapt_ring_i=0,adapt_ring_n=0;Uint64 adapt_at=0;double adapt_ring[10]={};
   int AdaptiveTarget(int cap) {
     const int floor_rate=std::min(cap,240);
@@ -529,11 +682,9 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     if(!adapt_at){adapt_at=now;adapt_mark=frames;adapt_rate=floor_rate;return adapt_rate;}
     if(now-adapt_at>=100000000ull){
       const double painted=(frames-adapt_mark)*1e9/static_cast<double>(now-adapt_at);
-      if(pacing.active_level>=5){ /* level 5: capacity = best delivery rate of the last second; ask 25% above it */
-        adapt_ring[adapt_ring_i]=painted;adapt_ring_i=(adapt_ring_i+1)%10;if(adapt_ring_n<10)++adapt_ring_n;
-        double best=0;for(int i=0;i<adapt_ring_n;++i)best=std::max(best,adapt_ring[i]);
-        adapt_rate=std::clamp(static_cast<int>((best*1.25+20)/10)*10,floor_rate,cap);
-      } else adapt_rate=std::clamp(static_cast<int>((painted*1.3+30)/10)*10,floor_rate,cap);
+      adapt_ring[adapt_ring_i]=painted;adapt_ring_i=(adapt_ring_i+1)%10;if(adapt_ring_n<10)++adapt_ring_n;
+      double best=0;for(int i=0;i<adapt_ring_n;++i)best=std::max(best,adapt_ring[i]);
+      adapt_rate=std::clamp(static_cast<int>((best*1.25+20)/10)*10,floor_rate,cap);
       adapt_at=now;adapt_mark=frames;
     }
     return std::clamp(adapt_rate,floor_rate,cap);
@@ -541,7 +692,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   void RequestFrame() { /* experimental only; request after input and presentation */
     if(!pacing.active)return;
     request_target=pacing.Target(render_rate);
-    if(pacing.active_level>=4)request_target=AdaptiveTarget(request_target);
+    request_target=AdaptiveTarget(request_target);
     pacing_clock.Configure(request_target);
     if(!browser||closing||!pacing_clock.Take())return;
     ++begin_count;
@@ -647,12 +798,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
         pacing.level = has_level ? data_payload->GetInt("level") : (data_payload->GetBool("enabled") ? 1 : 0);
         pacing.enabled = pacing.level >= 1;
         if (!pacing.Save()) { pacing.enabled = previous; pacing.level = previous_level; valid = false; }
-        else if (pacing.active && pacing.level >= 1) { /* levels switch live; only on/off needs a restart */
-          pacing.active_level = pacing.level;
-          if (browser) browser->GetHost()->SetWindowlessFrameRate(pacing.Target(render_rate));
-          if (SDL_GL_MakeCurrent(window, glcontext)) SDL_GL_SetSwapInterval(pacing.SwapInterval());
-        }
-      }
+      } /* any level change, and on/off, needs a restart (the copy thread and timer are set up at startup) */
       if (!valid) { result->SetBool("ok", false); result->SetString("error", has_level ? "Experimental level must be a whole number from 0 to " + std::to_string(kMaxLevel) + " in this client" : "Experimental frame pacing setting could not be saved"); }
       else result->SetDictionary("data", pacing.State());
     }
@@ -703,12 +849,36 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   }
   void OnAcceleratedPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&, const CefAcceleratedPaintInfo& info) override {
     ++frames;
+    /* Level 2: hand the view frame to the copy thread and return at once; the thread copies it and the main thread draws the newest result. */
+    if (type == PET_VIEW && pacing.active && pacing.active_level == 2 && !hidden_check) {
+      if (!copier_failed && !copier.Running() && !(SDL_GL_MakeCurrent(window, glcontext) && copier.Start())) {
+        copier_failed = true; std::fprintf(stderr, "QRAZY async frame copy unavailable; normal copy used%c", 10);
+      }
+      if (copier.Running() && copier.Failing()) {
+        copier.Stop(); view.Detach(); copier_failed = true;
+        std::fprintf(stderr, "QRAZY async frame copy failed repeatedly; normal copy used%c", 10);
+      }
+      const auto& plane = info.planes[0];
+      if (copier.Running() && info.plane_count == 1 && plane.offset <= INT32_MAX && plane.stride <= INT32_MAX &&
+          (info.format == CEF_COLOR_TYPE_RGBA_8888 || info.format == CEF_COLOR_TYPE_BGRA_8888)) {
+        AsyncCopier::Job job; job.fd = dup(plane.fd);
+        if (job.fd >= 0) {
+          job.coded_w = info.extra.coded_size.width; job.coded_h = info.extra.coded_size.height;
+          job.x = info.extra.visible_rect.x; job.y = info.extra.visible_rect.y; job.w = info.extra.visible_rect.width; job.h = info.extra.visible_rect.height;
+          job.fourcc = info.format == CEF_COLOR_TYPE_BGRA_8888 ? 0x34325241 : 0x34324241;
+          job.modifier = info.modifier; job.offset = static_cast<uint32_t>(plane.offset); job.stride = static_cast<uint32_t>(plane.stride);
+          copier.Submit(job);
+          return;
+        }
+      }
+    }
     const auto begin = std::chrono::steady_clock::now();
     if ((type==PET_VIEW ? view : popup).Copy(info)) { ++copies; dirty=true; }
     else { ++errors; Release("graphics-error"); closing = true; }
     copy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-begin).count();
   }
   bool Draw() {
+    if (copier.Running()) { GLuint fresh = 0; int w = 0, h = 0; if (copier.TakeFresh(fresh, w, h)) { view.Adopt(fresh, w, h); ++copies; dirty = true; } }
     if (!dirty) return false;
     dirty=false;
     if (!view.Draw(nullptr,true)) { ++errors; return false; }
@@ -897,7 +1067,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     pacing.Load(prototype_profile);
     if(pacing.enabled) {
       pacing.active=pacing_clock.Start();
-      if(pacing.active){pacing.active_level=std::max(1,pacing.level);pacing.MarkRunning();std::fprintf(stderr,"QRAZY EXPERIMENTAL frame pacing active (opt-in, unverified on this hardware)\n");}
+      if(pacing.active){pacing.active_level=std::max(1,pacing.level);pacing_clock.SetSpin(true);pacing.MarkRunning();std::fprintf(stderr,"QRAZY EXPERIMENTAL frame pacing active (opt-in, unverified on this hardware)\n");}
       else std::fprintf(stderr,"QRAZY experimental pacing clock unavailable; normal pacing used\n");
     }
   }
@@ -1064,8 +1234,8 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
       const auto present_now=std::chrono::steady_clock::now();
       const int present_rate=pacing.vsync?std::min(render_rate,pacing.max_fps):pacing.Target(render_rate);
       const auto present_period=std::chrono::nanoseconds(1000000000ll/std::clamp(present_rate,30,10000));
-      const bool exact_pacing=pacing.vsync&&pacing.active_level==7; /* level 7: present on exact refresh deadlines, lateness carried into the next one */
-      const bool present_due=pacing.active_level<2||(pacing.vsync&&!exact_pacing)||(exact_pacing?present_now>=next_present:present_now-last_present>=present_period*9/10);
+      const bool exact_pacing=pacing.active&&pacing.vsync; /* VSync on: present on exact refresh deadlines, lateness carried into the next one */
+      const bool present_due=!pacing.active||(exact_pacing?present_now>=next_present:present_now-last_present>=present_period*9/10);
       if (native_card || (present_due && client->Draw())) {
         last_present=present_now;
         if(exact_pacing){next_present+=present_period;if(next_present<present_now)next_present=present_now+present_period;}
@@ -1082,7 +1252,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
       }
       client->PresentationTick();
       client->RequestFrame();
-      if(pacing.active)pacing_clock.Wait(std::chrono::microseconds(pacing.active_level>=3?250:1000));
+      if(pacing.active)pacing_clock.Wait(std::chrono::microseconds(250));
       else SDL_Delay(1);
     }
     desktop_worker.Reset();if(!hidden_check){saved_window.Observe();saved_window.Save();}

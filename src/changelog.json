@@ -1,6 +1,17 @@
 {
   "releases": [
     {
+      "version": "0.5.3",
+      "date": "2026-10-20",
+      "added": [],
+      "changed": [
+        "Windows: the game view now runs on its own processing thread, separate from the client window. In theory this should be better for input lag."
+      ],
+      "fixed": [
+        "Windows: files saved from the game (configs, demos, HUD exports) now get the right file extension even when you type a name without one."
+      ]
+    },
+    {
       "version": "0.5.2",
       "date": "2026-10-16",
       "added": [],
