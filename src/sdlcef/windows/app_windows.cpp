@@ -73,6 +73,7 @@ void EnsureNormalPriority() {
 int generation=0,render_rate=0;
 #include "render_preferences.h"
 RenderPreferences render_preferences;
+#include "net_diag.h"
 // Opt-in windowed mode: CEF owns a child HWND that presents and receives input itself. The SDL window then only hosts it and the native status cards.
 bool native_window=false,startup_vsync=true;std::atomic<bool> pointer_locked{false}; /* pointer_locked: the page reports Chromium pointer lock (native mode only) */
 /* Multi-threaded CEF message loop (native window only, not during the login handoff): CEF's UI thread is then separate from this (SDL) thread, so raw input
@@ -710,6 +711,7 @@ int Run(HINSTANCE instance,void* sandbox) {
   auto profile=base/kProfile;std::error_code error;std::filesystem::create_directories(profile,error);
   if(error||!QrazyWindows::NoReparse(profile))return 2;ProfileLock lock;if(!lock.Acquire(profile/"host.lock"))return 2;
   RefreshLauncher(base,root);
+  NetDiag::Start(profile);
   render_preferences.Load(profile);native_window=render_preferences.native_window;startup_vsync=render_preferences.vsync;
   { /* CEF's own UI thread, so raw input never waits for this loop. Not for the offscreen backup, and not for the login handoff, whose gate must run on CEF's UI thread inside this loop. */
     std::error_code handoff_probe;mt_loop=native_window&&!std::filesystem::exists(base/L".qrazy-transition",handoff_probe);
@@ -781,17 +783,21 @@ int Run(HINSTANCE instance,void* sandbox) {
       if(!result)result=5;
     }
     bool close_sent=false,child_hidden=false,child_enabled=true;Uint64 zoom_checked=0,close_sent_ns=0;auto refresh=std::chrono::steady_clock::now();if(!native_window)SDL_StartTextInput(window);
+    /* Chromium's child window never sees the parent change monitor, scale or refresh, so it can keep rendering at a stale scale (blurry) or vsync rate. Tell it, and nudge the child size so the compositor re-evaluates the display. */
+    auto resync_child=[&](){
+      if(!native_window||!client->browser)return;
+      client->Host([](CefRefPtr<CefBrowserHost> host){host->NotifyScreenInfoChanged();});
+      RECT area{};
+      if(GetClientRect(hwnd,&area)&&area.right>1&&area.bottom>1){const int width=area.right-1,height=area.bottom;client->Host([width,height](CefRefPtr<CefBrowserHost> host){HWND child=host->GetWindowHandle();if(child){SetWindowPos(child,nullptr,0,0,width,height,SWP_NOZORDER|SWP_NOACTIVATE);host->WasResized();}});client->ResizeChild(true);}
+    };
+    auto startup_resync=std::chrono::steady_clock::now()+std::chrono::milliseconds(1500);int startup_resyncs=3; /* the first layout can land before the window has settled on its monitor */
     auto update_display=[&](){
       if(native_window){
-        /* Chromium's child window never sees the parent move between monitors, so its vsync interval (and rAF rate) stays on the old display's refresh. Tell it, and nudge the child size so the compositor re-evaluates the display. */
-        static SDL_DisplayID last_display=0;static int last_rate=0;
-        SDL_DisplayID now_display=SDL_GetDisplayForWindow(window);int now_rate=RefreshRate();
-        if(last_display&&(now_display!=last_display||now_rate!=last_rate)&&client->browser){
-          client->Host([](CefRefPtr<CefBrowserHost> host){host->NotifyScreenInfoChanged();});
-          RECT area{};
-          if(GetClientRect(hwnd,&area)&&area.right>1&&area.bottom>1){const int width=area.right-1,height=area.bottom;client->Host([width,height](CefRefPtr<CefBrowserHost> host){HWND child=host->GetWindowHandle();if(child){SetWindowPos(child,nullptr,0,0,width,height,SWP_NOZORDER|SWP_NOACTIVATE);host->WasResized();}});client->ResizeChild(true);}
-        }
-        last_display=now_display;last_rate=now_rate;
+        static SDL_DisplayID last_display=0;static int last_rate=0;static float last_scale=0;
+        SDL_DisplayID now_display=SDL_GetDisplayForWindow(window);int now_rate=RefreshRate();float now_scale=CefScale();
+        if(last_display&&(now_display!=last_display||now_rate!=last_rate||now_scale!=last_scale))resync_child();
+        else if(startup_resyncs>0&&client->browser&&!captured&&std::chrono::steady_clock::now()>=startup_resync){--startup_resyncs;startup_resync=std::chrono::steady_clock::now()+std::chrono::seconds(2);resync_child();}
+        last_display=now_display;last_rate=now_rate;last_scale=now_scale;
         if(now_rate)render_rate=now_rate;
         return;
       }
@@ -867,8 +873,11 @@ int Run(HINSTANCE instance,void* sandbox) {
           /* Chromium refuses requestPointerLock without user activation (the page's capture restore after alt-tab runs on this focus message, often seconds after the last input). A trusted F24 press (unbound, never Escape) grants activation first. */
           if(native_window)client->Host(Client::ActivateKey);
           auto d=Dict();d->SetString("type","focus");d->SetBool("focused",true);client->Send(d);}
-        if(e.type==SDL_EVENT_WINDOW_RESIZED||e.type==SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED||e.type==SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED||e.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED){if(native_window)client->ResizeChild();else if(client->browser){client->browser->GetHost()->NotifyScreenInfoChanged();client->browser->GetHost()->WasResized();}client->dirty=true;}
-        if(native_window&&(e.type==SDL_EVENT_WINDOW_MAXIMIZED||e.type==SDL_EVENT_WINDOW_RESTORED||e.type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN||e.type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN))client->ResizeChild();
+        if(e.type==SDL_EVENT_WINDOW_RESIZED||e.type==SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED||e.type==SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED||e.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED){if(native_window){
+          if(e.type==SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED||e.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED)resync_child();
+          else client->ResizeChild();
+        }else if(client->browser){client->browser->GetHost()->NotifyScreenInfoChanged();client->browser->GetHost()->WasResized();}client->dirty=true;}
+        if(native_window&&(e.type==SDL_EVENT_WINDOW_MAXIMIZED||e.type==SDL_EVENT_WINDOW_RESTORED||e.type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN||e.type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)){client->ResizeChild();if(e.type!=SDL_EVENT_WINDOW_MAXIMIZED)resync_child();}
         if(e.type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN||e.type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)client->FullscreenState();
         if(e.type==SDL_EVENT_WINDOW_MOVED||e.type==SDL_EVENT_WINDOW_RESIZED||e.type==SDL_EVENT_WINDOW_MAXIMIZED||e.type==SDL_EVENT_WINDOW_RESTORED||e.type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN||e.type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)saved_window.Observe();
         if(e.type==SDL_EVENT_KEY_DOWN||e.type==SDL_EVENT_KEY_UP)Keyboard(client.get(),e.key);
@@ -918,7 +927,7 @@ int Run(HINSTANCE instance,void* sandbox) {
     if(!result){CefRefPtr<CookieFlushed> flushed=new CookieFlushed;bool requested=CefCookieManager::GetGlobalManager(nullptr)->FlushStore(flushed);auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);while(requested&&!flushed->done&&std::chrono::steady_clock::now()<deadline){if(!mt_loop)CefDoMessageLoopWork();else SDL_PumpEvents();SDL_Delay(1);}std::fprintf(stderr,"PROTOTYPE cookie flush completed=%d\n",static_cast<int>(flushed->done.load()));if(!requested||!flushed->done)result=7;}
   }
   if(gesture_hook)UnhookWindowsHookEx(gesture_hook);
-  updater_worker.Stop();asset_worker.Stop();CefShutdown();app=nullptr;SDL_DestroyRenderer(renderer);SDL_DestroyWindow(window);SDL_Quit();return !result&&install_requested?Production::InstallExit:result;
+  NetDiag::Stop();updater_worker.Stop();asset_worker.Stop();CefShutdown();app=nullptr;SDL_DestroyRenderer(renderer);SDL_DestroyWindow(window);SDL_Quit();return !result&&install_requested?Production::InstallExit:result;
 }
 } // namespace
 CEF_BOOTSTRAP_EXPORT int RunWinMain(HINSTANCE instance,LPWSTR,int,void* sandbox,cef_version_info_t*){return Run(instance,sandbox);}

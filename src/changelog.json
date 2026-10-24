@@ -1,6 +1,19 @@
 {
   "releases": [
     {
+      "version": "0.5.4",
+      "date": "2026-10-24",
+      "added": [],
+      "changed": [
+        "Linux: with VSync off, the client now uses its own frame timing and a smaller garbage-collection pause, and the FPS counter shows frames actually shown. Set VSync with r_swapinterval and restart Qrazy; Maximum FPS (com_maxfps) is available too. VSync on is unchanged. If Qrazy closes unexpectedly with VSync off, VSync is turned back on at the next start.",
+        "The Tab overlay no longer shows YOU and WATCHING text, so the top cards and player rows keep the same height when the highlight moves. The highlighted background remains."
+      ],
+      "fixed": [
+        "The game view could stay blurry or at the wrong refresh rate after moving Qrazy to another monitor or changing display scaling; it now refreshes itself.",
+        "Spectating no longer pulls Qrazy to the front when the game re-locks the mouse while the window is in the background."
+      ]
+    },
+    {
       "version": "0.5.3",
       "date": "2026-10-20",
       "added": [],

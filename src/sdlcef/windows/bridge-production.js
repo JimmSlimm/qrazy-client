@@ -77,10 +77,6 @@
       } else time.textContent = recordTime;
       const name = add(card, 'div', '', 'font-size:14px;color:#b8c8dc;overflow-wrap:anywhere');
       if (record?.state === 'ready') coloredName(name, record); else name.textContent = 'Awaiting game data';
-      if (active) {
-        const footer = add(card, 'div', '', 'margin-top:auto;padding-top:6px');
-        add(footer, 'div', selection.source === 'pov' ? 'WATCHING' : 'YOU', 'font-size:10px;font-weight:700;letter-spacing:1px;color:#b8a96a;display:inline-block');
-      }
     }
     const columns = add(box, 'div', '', 'display:grid;gap:14px');
     let table = null, body = null;
@@ -101,15 +97,12 @@
         const self = ['Multiplayer', 'Solo'].includes(data.mode) && row.you;
         const highlight = watching ? 'WATCHING' : self ? 'YOU' : null;
         if (highlight) {
-          tr.style.cssText = 'background:#1d2535;box-shadow:inset 2px 0 #8a7a45';
+          tr.style.cssText = 'background:#1d2535';
           tr.setAttribute('aria-label', `${row.name} \u2014 ${highlight}`);
         }
         [row.name, row.pb || '\u2014', row.sessionBest || '\u2014', row.ping || '\u2014'].forEach((cell, i) => {
           const td = add(tr, 'td', i === 0 ? '' : cell, `text-align:${i ? 'right' : 'left'};padding:8px 12px;border-bottom:1px solid #26354b;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;${i ? 'white-space:nowrap' : ''}`);
-          if (i === 0) {
-            playerName(td, row);
-            if (highlight) add(td, 'div', highlight, 'font-size:10px;font-weight:700;letter-spacing:1px;color:#b8a96a;display:inline-block;margin-top:2px');
-          }
+          if (i === 0) playerName(td, row);
           if (i === 1 && row.pb && row.pb !== '\u2014') comparison(td, row.pbWrComparison);
           if (i === 2 && row.sessionBest && row.sessionBest !== '\u2014') comparison(td, row.sessionWrComparison);
         });
@@ -607,6 +600,8 @@
     /* Chromium refuses requestPointerLock without transient user activation (after alt-tab, long idle, programmatic re-lock). Have the host send a trusted unbound key first, for every request path. */
     const nativeRequest = Element.prototype.requestPointerLock;
     Element.prototype.requestPointerLock = function (...args) {
+      /* Never lock while the window is in the background (e.g. spectating, the game enters free-spectate on a map change): Chromium would take focus to honor it. */
+      if (!document.hasFocus()) { document.dispatchEvent(new Event('pointerlockerror')); return Promise.reject(new DOMException('Window is not focused', 'InvalidStateError')); }
       if (navigator.userActivation && navigator.userActivation.isActive) return nativeRequest.apply(this, args);
       const element = this;
       return rpc('pointer-lock-activate').catch(() => {}).then(() => nativeRequest.apply(element, args));

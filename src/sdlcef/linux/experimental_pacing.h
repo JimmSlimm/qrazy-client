@@ -10,18 +10,11 @@
 #include <thread>
 #include <mutex>
 
-// 0 = off, 1 = experimental pacing: timer-driven frame requests with a sleep-then-spin timer (precise wake-ups).
-// 2 = level 1 plus the frame copy on its own thread (shared GL context) so the main thread never waits for the GPU.
-// 3 = level 1 plus a 32 MB V8 young generation (fewer garbage-collection pauses; startup flag), without level 2's copy thread.
-// Levels above 2 are each level 1 plus ONE independent experiment (not cumulative).
-// Saved levels above kMaxLevel read as 1. Any level change needs a restart.
-constexpr int kMaxLevel=3;
+// VSync on (default): the original pacing. VSync off: timer-driven frame requests with a sleep-then-spin timer, an adaptive
+// request rate, a present limiter and a 32 MB V8 young generation (startup flag). The saved VSync setting applies on the next start.
 struct ExperimentalPacing {
-  bool enabled=false; // saved preference for the next start
-  bool active=false;  // this process runs the experimental clock
-  bool vsync=true;
-  int level=0;        // saved experiment level for the next start (0 off, see kMaxLevel)
-  int active_level=0; // level this process runs
+  bool active=false;  // this process runs the VSync-off pacing
+  bool vsync=true;    // saved preference for the next start
   int max_fps=250;
   std::filesystem::path file,running;
   void Load(const std::filesystem::path& profile) {
@@ -30,21 +23,18 @@ struct ExperimentalPacing {
     if(input.is_open()&&!input.bad()&&text.size()<=4096) {
       auto value=CefParseJSON(text,JSON_PARSER_RFC);auto d=value&&value->GetType()==VTYPE_DICTIONARY?value->GetDictionary():nullptr;
       if(d) {
-        if(d->GetType("enabled")==VTYPE_BOOL)enabled=d->GetBool("enabled");
-        level=enabled?1:0;
-        if(d->GetType("level")==VTYPE_INT){int n=d->GetInt("level");if(n>=0&&n<=kMaxLevel){level=n;enabled=n>=1;}}
         if(d->GetType("vsync")==VTYPE_BOOL)vsync=d->GetBool("vsync");
         if(d->GetType("com_maxfps")==VTYPE_INT){int n=d->GetInt("com_maxfps");if(n>=30&&n<=10000)max_fps=n;}
       }
     }
     std::error_code error;
     if(std::filesystem::exists(running,error)) {
-      if(enabled){enabled=false;level=0;vsync=true;Save();std::fprintf(stderr,"QRAZY experimental pacing turned off: the previous run did not exit cleanly\n");}
+      if(!vsync){vsync=true;Save();std::fprintf(stderr,"QRAZY VSync turned back on: the previous run did not exit cleanly\n");}
       std::filesystem::remove(running,error);
     }
   }
   bool Save() const {
-    auto d=CefDictionaryValue::Create();d->SetBool("enabled",enabled);d->SetInt("level",level);d->SetBool("vsync",vsync);d->SetInt("com_maxfps",max_fps);
+    auto d=CefDictionaryValue::Create();d->SetBool("vsync",vsync);d->SetInt("com_maxfps",max_fps);
     auto v=CefValue::Create();v->SetDictionary(d);const auto text=CefWriteJSON(v,JSON_WRITER_DEFAULT).ToString();
     auto temporary=file;temporary+=".tmp";
     {std::ofstream out(temporary,std::ios::binary|std::ios::trunc);out<<text;out.flush();if(!out)return false;}
@@ -54,15 +44,9 @@ struct ExperimentalPacing {
   void MarkClean() const {std::error_code error;std::filesystem::remove(running,error);}
   // 0 = swap returns immediately (the Wayland compositor still syncs to the display); 1 = swap blocks until the display refresh.
   int SwapInterval() const {return active?0:1;}
-  int Target(int refresh) const {
-    if(vsync&&active)return std::min(max_fps,(refresh*6+4)/5); // headroom: Chromium drops a frame when two arrive closer than its frame period
-    return vsync?std::min(refresh,max_fps):max_fps;
-  }
-  CefRefPtr<CefDictionaryValue> State() const {
-    auto d=CefDictionaryValue::Create();d->SetBool("enabled",enabled);d->SetBool("active",active);d->SetInt("level",level);d->SetInt("maxLevel",kMaxLevel);d->SetInt("activeLevel",active?active_level:0);d->SetBool("restartRequired",enabled!=active||(active&&level!=active_level));return d;
-  }
+  int Target(int refresh) const {return active?max_fps:refresh;}
   CefRefPtr<CefDictionaryValue> VSyncState() const {
-    auto d=CefDictionaryValue::Create();d->SetBool("enabled",vsync);d->SetBool("activeEnabled",vsync);d->SetBool("restartRequired",false);d->SetBool("canDisable",true);return d;
+    auto d=CefDictionaryValue::Create();d->SetBool("enabled",vsync);d->SetBool("activeEnabled",!active);d->SetBool("restartRequired",vsync==active);d->SetBool("canDisable",true);return d;
   }
   CefRefPtr<CefDictionaryValue> MaxFpsState() const {
     auto d=CefDictionaryValue::Create();d->SetInt("value",max_fps);d->SetInt("minimum",30);d->SetInt("maximum",10000);d->SetInt("defaultValue",250);return d;

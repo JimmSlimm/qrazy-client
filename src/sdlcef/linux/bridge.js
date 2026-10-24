@@ -75,10 +75,6 @@
       } else time.textContent = recordTime;
       const name = add(card, 'div', '', 'font-size:14px;color:#b8c8dc;overflow-wrap:anywhere');
       if (record?.state === 'ready') coloredName(name, record); else name.textContent = 'Awaiting game data';
-      if (active) {
-        const footer = add(card, 'div', '', 'margin-top:auto;padding-top:6px');
-        add(footer, 'div', selection.source === 'pov' ? 'WATCHING' : 'YOU', 'font-size:10px;font-weight:700;letter-spacing:1px;color:#b8a96a;display:inline-block');
-      }
     }
     const columns = add(box, 'div', '', 'display:grid;gap:14px');
     let table = null, body = null;
@@ -99,15 +95,12 @@
         const self = ['Multiplayer', 'Solo'].includes(data.mode) && row.you;
         const highlight = watching ? 'WATCHING' : self ? 'YOU' : null;
         if (highlight) {
-          tr.style.cssText = 'background:#1d2535;box-shadow:inset 2px 0 #8a7a45';
+          tr.style.cssText = 'background:#1d2535';
           tr.setAttribute('aria-label', `${row.name} \u2014 ${highlight}`);
         }
         [row.name, row.pb || '\u2014', row.sessionBest || '\u2014', row.ping || '\u2014'].forEach((cell, i) => {
           const td = add(tr, 'td', i === 0 ? '' : cell, `text-align:${i ? 'right' : 'left'};padding:8px 12px;border-bottom:1px solid #26354b;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;${i ? 'white-space:nowrap' : ''}`);
-          if (i === 0) {
-            playerName(td, row);
-            if (highlight) add(td, 'div', highlight, 'font-size:10px;font-weight:700;letter-spacing:1px;color:#b8a96a;display:inline-block;margin-top:2px');
-          }
+          if (i === 0) playerName(td, row);
           if (i === 1 && row.pb && row.pb !== '\u2014') comparison(td, row.pbWrComparison);
           if (i === 2 && row.sessionBest && row.sessionBest !== '\u2014') comparison(td, row.sessionWrComparison);
         });
@@ -511,18 +504,8 @@
     observer.observe(label,{childList:true,characterData:true,subtree:true});
     window.addEventListener('pagehide',()=>observer.disconnect(),{once:true});updatePresentationLabel();
   });
-  // Experimental frame pacing (opt-in, takes effect after a restart). vsync/maxFps exist only while it is active, so the
-  // game's r_swapinterval / com_maxfps cvars stay hidden on a normal start.
+  // VSync and Maximum FPS settings (saved; VSync off takes effect after a restart).
   const vsyncListeners = new Set(), maxFpsListeners = new Set();
-  const experimental = Object.freeze({
-    version: 1,
-    getState: async () => (await rpc('experimental-get')).data,
-    setEnabled: async value => {
-      if (typeof value === 'boolean') return (await rpc('experimental-set', { enabled: value })).data;
-      if (!Number.isInteger(value) || value < 0) throw new TypeError('Expected a boolean or a whole number level');
-      return (await rpc('experimental-set', { level: value })).data;
-    }
-  });
   const vsync = Object.freeze({
     getState: async () => (await rpc('vsync-get')).data,
     setEnabled: async enabled => { if (typeof enabled !== 'boolean') throw new TypeError('VSync must be a boolean'); return (await rpc('vsync-set', { enabled })).data; },
@@ -564,8 +547,7 @@
     graphics: Object.freeze({ getState: async () => (await rpc('diagnostics')).data }),
     config: Object.freeze({ version: 1, importFile: async () => (await rpc('config-import')).data, exportFile: async (name, text) => (await rpc('config-export', {name,text})).data }),
     quit: () => rpc('quit'),
-    experimental,
-    ...(host.pacing === true ? { vsync, maxFps } : {}),
+    vsync, maxFps,
     fullscreen: Object.freeze({ getState: async () => (await rpc('fullscreen-state')).fullscreen, toggle: async () => (await rpc('fullscreen-toggle')).fullscreen, onChange: fn => subscribe(fullscreen, fn) })
   }) });
   window.addEventListener('pagehide', release);
@@ -575,7 +557,6 @@
     const message = JSON.parse(json);
     if (message.type === 'presentation-rate') {
       if (Number.isFinite(message.fps) && message.fps >= 0) { presentedFps = message.fps;
-        if (Number.isFinite(message.requestedFps) && Number.isFinite(message.paintedFps)) presentDetail = ' (cap ' + message.cap + (message.target ? ', tgt ' + message.target : '') + ', cef ' + message.cefRate + ', req ' + Math.round(message.requestedFps) + ', paint ' + Math.round(message.paintedFps) + (Number.isFinite(message.gapMed) ? ', gap ' + message.gapMed.toFixed(1) + '/' + message.gapMax.toFixed(1) : '') + (Number.isFinite(message.passFps) ? ', loop ' + Math.round(message.passFps) + ', pump ' + Math.round(message.pumpMs) + ', copy ' + Math.round(message.copyMs) + ', swap ' + Math.round(message.swapMs) + (Number.isFinite(message.impMs) ? ', imp ' + Math.round(message.impMs) + ', wait ' + Math.round(message.waitMs) : '') : '') + ')';
         updatePresentationLabel(); }
       return;
     }

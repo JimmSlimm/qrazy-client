@@ -43,7 +43,9 @@ class App final : public CefApp, public CefRenderProcessHandler {
   void OnBrowserCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefDictionaryValue> extra_info) override { native_browsers[browser->GetIdentifier()] = extra_info && extra_info->GetType("nativeWindow") == VTYPE_BOOL && extra_info->GetBool("nativeWindow"); }
   void OnBrowserDestroyed(CefRefPtr<CefBrowser> browser) override { native_browsers.erase(browser->GetIdentifier()); }
   CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override { return this; }
-  void OnBeforeCommandLineProcessing(const CefString&, CefRefPtr<CefCommandLine> line) override {
+  void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> line) override {
+    /* Opt-in via profile/net-log.on (see net_diag.h); browser process only, fixed values, nothing user-controlled. */
+    if(process_type.empty()&&!NetDiag::net_log_path.empty()){line->AppendSwitchWithValue("log-net-log",NetDiag::net_log_path);line->AppendSwitchWithValue("net-log-capture-mode","Default");}
     // Deliberately no user-controlled switches in the browser process launch path.
     // Extensions are outside this game's trust boundary, including distro auto-installed ones.
     line->AppendSwitch("disable-extensions");

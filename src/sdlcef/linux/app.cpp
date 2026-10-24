@@ -120,7 +120,7 @@ class Native final : public CefV8Handler {
     if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 3 || !args[2]->IsString() || args[2]->GetStringValue().length()>1500000 ||
         !args[0]->IsString() || !args[1]->IsInt()) { exception = "Unauthorized native bridge call"; return true; }
     const auto op = args[0]->GetStringValue().ToString();
-    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-notice" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog" && op != "experimental-get" && op != "experimental-set" && op != "vsync-get" && op != "vsync-set" && op != "max-fps-get" && op != "max-fps-set") {
+    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-notice" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog" && op != "vsync-get" && op != "vsync-set" && op != "max-fps-get" && op != "max-fps-set") {
       exception = "Unknown native operation"; return true;
     }
     auto message = CefProcessMessage::Create("qrazy-command-v1");
@@ -164,7 +164,7 @@ class App final : public CefApp, public CefRenderProcessHandler, public CefBrows
       line->AppendSwitch("disable-software-rasterizer");
       /* Level 3: a 32 MB V8 young generation makes minor-GC pauses rarer (the game allocates ~25 MB/s; the Windows native mode measured
          9-14 ms hitches at the heap drops). The browser copies js-flags to its renderers; it applies at startup. */
-      if (pacing.active && pacing.active_level == 3) line->AppendSwitchWithValue("js-flags", "--min-semi-space-size=32 --max-semi-space-size=32");
+      if (pacing.active) line->AppendSwitchWithValue("js-flags", "--min-semi-space-size=32 --max-semi-space-size=32");
       if (amd_mesa_renderer) {
         // VA-API warming can create radeonsi command/shader workers before
         // sandbox initialization even when ANGLE itself uses Vulkan.
@@ -316,137 +316,12 @@ class Texture {
 };
 
 
-/* Level 2: the frame copy runs on its own thread with a shared, surfaceless GL context, so the thread that pumps CEF, sends frame
-   requests and presents never waits for the GPU. The shared buffer's file descriptor is duplicated (that keeps the dma-buf alive); the
-   kernel's implicit sync orders our read against Chromium's next write to the same buffer. The newest frame wins. */
-class AsyncCopier {
- public:
-  struct Job { int fd = -1, coded_w = 0, coded_h = 0, x = 0, y = 0, w = 0, h = 0; EGLint fourcc = 0; uint64_t modifier = 0; uint32_t offset = 0, stride = 0; };
-  std::atomic<long long> import_ns{0}, wait_ns{0};
-  ~AsyncCopier() { Stop(); }
-  bool Running() const { return running_; }
-  bool Failing() const { return failures_ >= 5; } /* five failed copies in a row: the caller falls back to the normal copy */
-  /* Call on the thread where the SDL GL context is current. */
-  bool Start() {
-    if (running_) return true;
-    display_ = eglGetCurrentDisplay(); shared_ = eglGetCurrentContext();
-    if (display_ == EGL_NO_DISPLAY || shared_ == EGL_NO_CONTEXT) return false;
-    const char* extensions = eglQueryString(display_, EGL_EXTENSIONS);
-    if (!extensions || !std::strstr(extensions, "EGL_KHR_surfaceless_context")) { std::fprintf(stderr, "QRAZY async copy unavailable: no surfaceless EGL context%c", 10); return false; }
-    EGLint config_id = 0, version = 2, count = 0;
-    if (!eglQueryContext(display_, shared_, EGL_CONFIG_ID, &config_id)) return false;
-    eglQueryContext(display_, shared_, EGL_CONTEXT_CLIENT_VERSION, &version);
-    const EGLint pick[] = {EGL_CONFIG_ID, config_id, EGL_NONE};
-    EGLConfig config = nullptr;
-    if (!eglChooseConfig(display_, pick, &config, 1, &count) || count < 1) return false;
-    const EGLint attribs[] = {EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE};
-    context_ = eglCreateContext(display_, config, shared_, attribs);
-    if (context_ == EGL_NO_CONTEXT) { std::fprintf(stderr, "QRAZY async copy: shared context failed EGL=%x%c", eglGetError(), 10); return false; }
-    stop_ = false; running_ = true;
-    thread_ = std::thread([this] { Run(); });
-    std::fprintf(stderr, "QRAZY async frame copy active (level 2)%c", 10);
-    return true;
-  }
-  void Stop() {
-    if (!running_) return;
-    { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; if (has_job_) { close(job_.fd); has_job_ = false; } }
-    wake_.notify_one();
-    if (thread_.joinable()) thread_.join();
-    if (context_ != EGL_NO_CONTEXT) { eglDestroyContext(display_, context_); context_ = EGL_NO_CONTEXT; }
-    running_ = false;
-  }
-  /* Takes ownership of job.fd. A pending job the worker has not started is replaced and its descriptor closed. */
-  void Submit(const Job& job) {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (has_job_) { close(job_.fd); }
-      job_ = job; has_job_ = true;
-    }
-    wake_.notify_one();
-  }
-  /* Main thread: the newest finished frame, if it has not been taken yet. */
-  bool TakeFresh(GLuint& texture, int& w, int& h) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!fresh_) return false;
-    fresh_ = false; in_use_ = front_; texture = textures_[front_]; w = sizes_[front_][0]; h = sizes_[front_][1];
-    return true;
-  }
- private:
-  void Run() {
-    eglBindAPI(EGL_OPENGL_ES_API);
-    if (!eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, context_)) {
-      std::fprintf(stderr, "QRAZY async copy: eglMakeCurrent failed EGL=%x%c", eglGetError(), 10); return;
-    }
-    auto create = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
-    auto destroy = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
-    auto bind = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
-    glGenTextures(3, textures_);
-    std::unique_lock<std::mutex> lock(mutex_);
-    while (!stop_) {
-      wake_.wait(lock, [this] { return stop_ || has_job_; });
-      if (stop_) break;
-      const Job job = job_; has_job_ = false;
-      int back = 0; while (back == front_ || back == in_use_) ++back; /* three textures: one is always free */
-      lock.unlock();
-      const bool ok = create && destroy && bind && CopyOne(job, back, create, destroy, bind);
-      close(job.fd);
-      if (ok) { failures_ = 0; } else { ++failures_; }
-      lock.lock();
-      if (ok) { front_ = back; fresh_ = true; }
-    }
-    glDeleteTextures(3, textures_);
-    eglMakeCurrent(display_, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-  }
-  bool CopyOne(const Job& job, int back, PFNEGLCREATEIMAGEKHRPROC create, PFNEGLDESTROYIMAGEKHRPROC destroy, PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bind) {
-    if (std::getenv("QRAZY_TEST_ASYNC_COPY_FAIL")) { return false; } /* test hook: exercises the fallback to the normal copy */
-    const auto begin = std::chrono::steady_clock::now();
-    std::vector<EGLint> attrs = {EGL_WIDTH, job.coded_w, EGL_HEIGHT, job.coded_h, EGL_LINUX_DRM_FOURCC_EXT, job.fourcc, EGL_DMA_BUF_PLANE0_FD_EXT, job.fd,
-      EGL_DMA_BUF_PLANE0_OFFSET_EXT, static_cast<EGLint>(job.offset), EGL_DMA_BUF_PLANE0_PITCH_EXT, static_cast<EGLint>(job.stride)};
-    if (job.modifier != UINT64_C(0x00ffffffffffffff)) attrs.insert(attrs.end(), {
-      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, static_cast<EGLint>(job.modifier & 0xffffffff),
-      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, static_cast<EGLint>(job.modifier >> 32)});
-    attrs.push_back(EGL_NONE);
-    EGLImageKHR image = create(display_, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs.data());
-    if (image == EGL_NO_IMAGE_KHR) return false;
-    GLuint source = 0, fbo = 0;
-    glGenTextures(1, &source); glBindTexture(GL_TEXTURE_2D, source); bind(GL_TEXTURE_2D, image);
-    glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
-    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
-    const auto copy_begin = std::chrono::steady_clock::now();
-    if (ok) {
-      glBindTexture(GL_TEXTURE_2D, textures_[back]);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      if (sizes_[back][0] != job.w || sizes_[back][1] != job.h) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, job.w, job.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        sizes_[back][0] = job.w; sizes_[back][1] = job.h;
-      }
-      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, job.x, job.y, job.w, job.h);
-      glFinish(); ok = glGetError() == GL_NO_ERROR;
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0); glDeleteFramebuffers(1, &fbo); glDeleteTextures(1, &source); destroy(display_, image);
-    const auto end = std::chrono::steady_clock::now();
-    import_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(copy_begin - begin).count();
-    wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(end - copy_begin).count();
-    return ok;
-  }
-  EGLDisplay display_ = EGL_NO_DISPLAY; EGLContext context_ = EGL_NO_CONTEXT, shared_ = EGL_NO_CONTEXT;
-  std::thread thread_; std::mutex mutex_; std::condition_variable wake_;
-  std::atomic<bool> running_{false};
-  std::atomic<unsigned> failures_{0};
-  bool stop_ = false, has_job_ = false, fresh_ = false;
-  Job job_; GLuint textures_[3] = {0, 0, 0}; int sizes_[3][2] = {{0, 0}, {0, 0}, {0, 0}}; int front_ = 0, in_use_ = -1;
-};
-
 class Client final : public DesktopPolicy::RecoveryState, public CefClient, public CefRenderHandler, public CefLifeSpanHandler,
                      public CefRequestHandler, public CefDisplayHandler, public CefLoadHandler, public CefDownloadHandler, public CefDialogHandler,public CefContextMenuHandler {
  public:
   CefRefPtr<CefBrowser> browser;
   Texture view;
   Texture popup;
-  AsyncCopier copier; /* level 6; declared after the textures so it stops first */
-  bool copier_failed = false;
   CefRect popup_rect;
   bool popup_visible = false, dirty = false;
   SDL_Cursor* cursor = nullptr;
@@ -659,7 +534,6 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     data->SetDouble("pumpMs",(pump_ms-lp_pump)*1e9/static_cast<double>(elapsed));
     data->SetDouble("copyMs",(copy_ms-lp_copy)*1e9/static_cast<double>(elapsed));
     data->SetDouble("swapMs",(swap_ms-lp_swap)*1e9/static_cast<double>(elapsed));
-    if (copier.Running()) { import_ms = copier.import_ns.load() / 1e6; wait_ms = copier.wait_ns.load() / 1e6; } /* level 6: the copy thread's own times */
     data->SetDouble("impMs",(import_ms-lp_import)*1e9/static_cast<double>(elapsed));
     data->SetDouble("waitMs",(wait_ms-lp_wait)*1e9/static_cast<double>(elapsed));
     lp_import=import_ms;lp_wait=wait_ms;
@@ -788,36 +662,21 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
       result->SetBool("ok", !hidden_check && SDL_SetWindowFullscreen(window, enabled));
       result->SetBool("fullscreen", !!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
     } else if (op == "fullscreen-state") result->SetBool("fullscreen", !!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
-    else if (op == "experimental-get") result->SetDictionary("data", pacing.State());
-    else if (op == "experimental-set") {
-      /* Saved for the next start only; nothing changes in the running client. */
-      const bool has_level = data_payload && data_payload->GetType("level") == VTYPE_INT;
-      bool valid = !hidden_check && data_payload && (has_level ? data_payload->GetInt("level") >= 0 && data_payload->GetInt("level") <= kMaxLevel : data_payload->GetType("enabled") == VTYPE_BOOL);
-      if (valid) {
-        const bool previous = pacing.enabled; const int previous_level = pacing.level;
-        pacing.level = has_level ? data_payload->GetInt("level") : (data_payload->GetBool("enabled") ? 1 : 0);
-        pacing.enabled = pacing.level >= 1;
-        if (!pacing.Save()) { pacing.enabled = previous; pacing.level = previous_level; valid = false; }
-      } /* any level change, and on/off, needs a restart (the copy thread and timer are set up at startup) */
-      if (!valid) { result->SetBool("ok", false); result->SetString("error", has_level ? "Experimental level must be a whole number from 0 to " + std::to_string(kMaxLevel) + " in this client" : "Experimental frame pacing setting could not be saved"); }
-      else result->SetDictionary("data", pacing.State());
-    }
     else if (op == "vsync-get" || op == "max-fps-get" || op == "vsync-set" || op == "max-fps-set") {
       const bool is_vsync = op == "vsync-get" || op == "vsync-set", is_set = op == "vsync-set" || op == "max-fps-set";
-      if (!pacing.active) { result->SetBool("ok", false); result->SetString("error", "Experimental frame pacing is off; enable it and restart the client first"); }
-      else if (!is_set) result->SetDictionary("data", is_vsync ? pacing.VSyncState() : pacing.MaxFpsState());
+      if (!is_set) result->SetDictionary("data", is_vsync ? pacing.VSyncState() : pacing.MaxFpsState());
       else if (closing || recovering || loading || hidden_check || SDL_GetKeyboardFocus() != window) { result->SetBool("ok", false); result->SetString("error", "Return to the focused game before changing rendering settings"); }
       else if (!data_payload || (is_vsync ? data_payload->GetType("enabled") != VTYPE_BOOL : data_payload->GetType("value") != VTYPE_INT) || (!is_vsync && (data_payload->GetInt("value") < 30 || data_payload->GetInt("value") > 10000))) {
         result->SetBool("ok", false); result->SetString("error", "Expected a VSync boolean or com_maxfps integer from 30 to 10000");
       } else {
+        /* Saved for the next start: VSync off runs the timer-driven pacing, which is set up at startup. Only the cap applies at once. */
         const ExperimentalPacing previous = pacing;
         if (is_vsync) pacing.vsync = data_payload->GetBool("enabled"); else pacing.max_fps = data_payload->GetInt("value");
-        int actual = -1; const int wanted = pacing.SwapInterval();
-        if (!SDL_GL_MakeCurrent(window, glcontext) || !SDL_GL_SetSwapInterval(wanted) || !SDL_GL_GetSwapInterval(&actual) || actual != wanted || !pacing.Save()) {
-          pacing = previous; SDL_GL_SetSwapInterval(pacing.SwapInterval());
-          result->SetBool("ok", false); result->SetString("error", "Rendering setting could not be applied and saved");
+        if (!pacing.Save()) {
+          pacing = previous;
+          result->SetBool("ok", false); result->SetString("error", "Rendering setting could not be saved");
         } else {
-          browser->GetHost()->SetWindowlessFrameRate(pacing.Target(render_rate));
+          if (pacing.active && browser) browser->GetHost()->SetWindowlessFrameRate(pacing.Target(render_rate));
           result->SetDictionary("data", is_vsync ? pacing.VSyncState() : pacing.MaxFpsState());
           RenderSettingsChanged();
         }
@@ -849,36 +708,12 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   }
   void OnAcceleratedPaint(CefRefPtr<CefBrowser>, PaintElementType type, const RectList&, const CefAcceleratedPaintInfo& info) override {
     ++frames;
-    /* Level 2: hand the view frame to the copy thread and return at once; the thread copies it and the main thread draws the newest result. */
-    if (type == PET_VIEW && pacing.active && pacing.active_level == 2 && !hidden_check) {
-      if (!copier_failed && !copier.Running() && !(SDL_GL_MakeCurrent(window, glcontext) && copier.Start())) {
-        copier_failed = true; std::fprintf(stderr, "QRAZY async frame copy unavailable; normal copy used%c", 10);
-      }
-      if (copier.Running() && copier.Failing()) {
-        copier.Stop(); view.Detach(); copier_failed = true;
-        std::fprintf(stderr, "QRAZY async frame copy failed repeatedly; normal copy used%c", 10);
-      }
-      const auto& plane = info.planes[0];
-      if (copier.Running() && info.plane_count == 1 && plane.offset <= INT32_MAX && plane.stride <= INT32_MAX &&
-          (info.format == CEF_COLOR_TYPE_RGBA_8888 || info.format == CEF_COLOR_TYPE_BGRA_8888)) {
-        AsyncCopier::Job job; job.fd = dup(plane.fd);
-        if (job.fd >= 0) {
-          job.coded_w = info.extra.coded_size.width; job.coded_h = info.extra.coded_size.height;
-          job.x = info.extra.visible_rect.x; job.y = info.extra.visible_rect.y; job.w = info.extra.visible_rect.width; job.h = info.extra.visible_rect.height;
-          job.fourcc = info.format == CEF_COLOR_TYPE_BGRA_8888 ? 0x34325241 : 0x34324241;
-          job.modifier = info.modifier; job.offset = static_cast<uint32_t>(plane.offset); job.stride = static_cast<uint32_t>(plane.stride);
-          copier.Submit(job);
-          return;
-        }
-      }
-    }
     const auto begin = std::chrono::steady_clock::now();
     if ((type==PET_VIEW ? view : popup).Copy(info)) { ++copies; dirty=true; }
     else { ++errors; Release("graphics-error"); closing = true; }
     copy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-begin).count();
   }
   bool Draw() {
-    if (copier.Running()) { GLuint fresh = 0; int w = 0, h = 0; if (copier.TakeFresh(fresh, w, h)) { view.Adopt(fresh, w, h); ++copies; dirty = true; } }
     if (!dirty) return false;
     dirty=false;
     if (!view.Draw(nullptr,true)) { ++errors; return false; }
@@ -1065,10 +900,10 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     /* Opt-in experimental frame pacing (off by default). The marker file is removed on a clean exit; if it is still there
        next start, the experiment is switched off again. */
     pacing.Load(prototype_profile);
-    if(pacing.enabled) {
+    if(!pacing.vsync) {
       pacing.active=pacing_clock.Start();
-      if(pacing.active){pacing.active_level=std::max(1,pacing.level);pacing_clock.SetSpin(true);pacing.MarkRunning();std::fprintf(stderr,"QRAZY EXPERIMENTAL frame pacing active (opt-in, unverified on this hardware)\n");}
-      else std::fprintf(stderr,"QRAZY experimental pacing clock unavailable; normal pacing used\n");
+      if(pacing.active){pacing_clock.SetSpin(true);pacing.MarkRunning();std::fprintf(stderr,"QRAZY frame pacing for VSync off active\n");}
+      else std::fprintf(stderr,"QRAZY pacing clock unavailable; VSync stays on\n");
     }
   }
   // Configure flags inside CefApp rather than accepting arbitrary runtime security flags.
@@ -1090,7 +925,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     if (!SDL_GL_SetSwapInterval(wanted) || !SDL_GL_GetSwapInterval(&interval) || interval != wanted) {
       std::fprintf(stderr, "QRAZY VSync swap interval %d unavailable: %s\n", wanted, SDL_GetError());
       if (wanted == 1 || !SDL_GL_SetSwapInterval(1) || !SDL_GL_GetSwapInterval(&interval) || interval != 1) return 5;
-      pacing.vsync = true;
+      pacing_clock.Stop(); pacing.active = false; /* run with VSync on this time */
     }
     std::fprintf(stderr, "QRAZY SDL swap interval=%d (presentation timing unmeasured)\n", interval);
   }
@@ -1115,7 +950,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     auto inspect_at = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     bool inspected=false;
     bool close_sent = false;
-    auto last_present = std::chrono::steady_clock::now(), next_present = last_present;
+    auto last_present = std::chrono::steady_clock::now();
     auto refresh_at = std::chrono::steady_clock::now();
     while (!closed) {
       ++passes;
@@ -1153,9 +988,10 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
           auto data=Dict(); data->SetString("type","focus"); data->SetBool("focused",true); client->Send(data);
         }
         if (event.type == SDL_EVENT_WINDOW_RESIZED || event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
-          if (client->browser) client->browser->GetHost()->WasResized();
+          if (client->browser) { client->browser->GetHost()->NotifyScreenInfoChanged(); /* a fractional scale can change the pixel size without a scale event, leaving CEF rendering at the old scale (blurry) */ client->browser->GetHost()->WasResized(); }
         }
         if(event.type==SDL_EVENT_WINDOW_MOVED||event.type==SDL_EVENT_WINDOW_RESIZED||event.type==SDL_EVENT_WINDOW_MAXIMIZED||event.type==SDL_EVENT_WINDOW_RESTORED||event.type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN||event.type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)saved_window.Observe();
+        if((event.type==SDL_EVENT_WINDOW_MAXIMIZED||event.type==SDL_EVENT_WINDOW_RESTORED||event.type==SDL_EVENT_WINDOW_ENTER_FULLSCREEN||event.type==SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)&&client->browser){client->browser->GetHost()->NotifyScreenInfoChanged();client->browser->GetHost()->WasResized();}
         if(event.type==SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED||event.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED){if(client->browser){client->browser->GetHost()->NotifyScreenInfoChanged();client->browser->GetHost()->WasResized();}}
         if(event.type==SDL_EVENT_TEXT_EDITING&&client->browser&&!captured&&!client->recovering&&!client->loading) {
           CefString text(event.edit.text);auto utf16=text.ToString16();
@@ -1232,13 +1068,11 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
       }
       /* Level 2: present at most once per the player's own frame period; newer frames replace older ones while waiting. Not with VSync on: the display already paces presentation and the limiter would only skip frames. */
       const auto present_now=std::chrono::steady_clock::now();
-      const int present_rate=pacing.vsync?std::min(render_rate,pacing.max_fps):pacing.Target(render_rate);
+      const int present_rate=pacing.Target(render_rate);
       const auto present_period=std::chrono::nanoseconds(1000000000ll/std::clamp(present_rate,30,10000));
-      const bool exact_pacing=pacing.active&&pacing.vsync; /* VSync on: present on exact refresh deadlines, lateness carried into the next one */
-      const bool present_due=!pacing.active||(exact_pacing?present_now>=next_present:present_now-last_present>=present_period*9/10);
+      const bool present_due=!pacing.active||present_now-last_present>=present_period*9/10;
       if (native_card || (present_due && client->Draw())) {
         last_present=present_now;
-        if(exact_pacing){next_present+=present_period;if(next_present<present_now)next_present=present_now+present_period;}
         ++presentations;
         if (!hidden_check) {
           auto begin=std::chrono::steady_clock::now();
@@ -1271,7 +1105,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
   pacing_clock.Stop();
   CefShutdown(); app=nullptr; SDL_GL_DestroyContext(glcontext); SDL_DestroyWindow(window); SDL_Quit();
   desktop_worker.Stop();
-  if(pacing.active&&result==0)pacing.MarkClean(); /* anything else leaves the marker, which switches the experiment off next start */
+  if(result==0)pacing.MarkClean(); /* anything else leaves the marker, which switches the experiment off next start */
   if(result==0&&!close_action.empty())return 42; // Launcher installs only after this orderly, flushed shutdown.
   return result;
 }
