@@ -123,7 +123,14 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR command,int) {
   if(!CreateProcessW(exe.c_str(),cmd.data(),nullptr,nullptr,FALSE,0,nullptr,runtime.c_str(),&startup,&process))return Failure(L"Unable to start the verified Qrazy runtime.");
   CloseHandle(process.hThread);WaitForSingleObject(process.hProcess,INFINITE);DWORD code=1;GetExitCodeProcess(process.hProcess,&code);CloseHandle(process.hProcess);
   if(code==Production::InstallExit){Lock host,worker;if(!host.Open(profile/L"host.lock")||!worker.Open(profile/L"desktop-worker.lock"))return Failure(L"Update refused because a Qrazy process still owns the profile. Close it normally and try again.");
-    output.clear();if(!Production::Helper(root,L"install",output))return Failure(L"Update installation failed. Keep the folder intact for recovery on your next manual launch.");
+    output.clear();if(!Production::Helper(root,L"install",output)) {
+      std::wstring text=L"Update installation failed. Keep the folder intact for recovery on your next manual launch.";
+      auto at=output.find("\"reason\":\"");
+      if(at!=std::string::npos){auto from=at+10,to=output.find('"',from);if(to!=std::string::npos&&to>from&&to-from<=160){
+        std::wstring reason;for(auto c:output.substr(from,to-from))reason.push_back(static_cast<unsigned char>(c)<128?static_cast<wchar_t>(c):L'?');
+        text+=L"\n\nReason: "+reason;}}
+      return Failure(text.c_str());
+    }
     MessageBoxW(nullptr,L"Update installed. Open Qrazy manually.",L"Qrazy",MB_OK|MB_ICONINFORMATION);return 0;
   }
   if(code==8)return Failure(L"Session transfer did not finish. Both profiles and the previous client are kept. Reopen Qrazy to recover the previous client and retry.");

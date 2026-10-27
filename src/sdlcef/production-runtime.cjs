@@ -156,14 +156,14 @@ class Runtime {
       }
       if(rows.length<100)break;
     }
-    if(!candidate||candidate.verified.manifest.sequence<=current.manifest.sequence||compare(candidate.verified.manifest.version,current.manifest.version)<=0)return {...this.state(),phase:'current',message:'No newer signed stable SDL/CEF release is available.'};
+    if(!candidate||candidate.verified.manifest.sequence<=current.manifest.sequence||compare(candidate.verified.manifest.version,current.manifest.version)<=0)return {...this.state(),phase:'current',message:'No newer signed stable SDL/CEF release is available (installed runtime: '+current.manifest.version+').'};
     const m=candidate.verified.manifest,disk=fs.statfsSync(this.root),total=m.files.reduce((s,f)=>s+f.size,0);
     if(disk.bavail*disk.bsize-total-m.asset.size<RESERVE)throw Error('Update download and staging need 1 GiB free reserve');
     fs.mkdirSync(this.work);atomic(path.join(this.work,'signed.json'),candidate.envelope);
     const archive=path.join(this.work,'payload.zip');await this.transport('https://github.com/JimmSlimm/qrazy-client/releases/download/'+candidate.tag+'/'+m.asset.name,LIMIT,archive,m.asset);
     await extract(archive,this.next,m);const staged=this.staged();fs.unlinkSync(archive);return this.ready(staged);
   }
-  ready(result) {return {...this.state(),phase:'ready',version:result.manifest.version,identity:result.identity,notes:result.manifest.notes,message:'Update downloaded and verified. Choose Install to confirm closing Qrazy. Open it manually afterward.'};}
+  ready(result) {const state=this.state();return {...state,phase:'ready',version:result.manifest.version,identity:result.identity,notes:result.manifest.notes,message:'Update '+result.manifest.version+' downloaded and verified (installed runtime: '+state.installedVersion+'). Choose Install to confirm closing Qrazy. Open it manually afterward.'};}
   prepare() {const result=this.staged();atomic(path.join(this.work,'request.json'),Buffer.from(JSON.stringify({identity:result.identity})));return this.ready(result);}
   install() {
     // Only native launcher calls this while holding installation and host locks,
@@ -223,4 +223,9 @@ if(require.main===module) (async()=>{
   }
   else throw Error('Unknown updater operation');
   process.stdout.write(JSON.stringify({ok:true,data:result}));
-})().catch(()=>{process.stdout.write(JSON.stringify({ok:false,error:'Update verification or installation failed. Preserve the Qrazy folder and retry only after resolving the incomplete update.'}));process.exitCode=1;});
+})().catch(e=>{
+  // Short, path-free reason so the player can report why it failed; the launcher shows it.
+  const text=e&&e.code?String(e.code)+(e.syscall?' '+e.syscall:''):String(e&&e.message||'unknown');
+  const reason=text.replace(/[^A-Za-z0-9 .:,'_()\/-]/g,'?').slice(0,160);
+  process.stdout.write(JSON.stringify({ok:false,error:'Update verification or installation failed. Preserve the Qrazy folder and retry only after resolving the incomplete update.',reason}));process.exitCode=1;
+});

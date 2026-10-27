@@ -100,7 +100,7 @@ async function update(root,options={}){
     }
     if(rows.length<100)break;
   }
-  if(!candidate||candidate.verified.manifest.sequence<=current.manifest.sequence||compare(candidate.verified.manifest.version,current.manifest.version)<=0)return {...runtime.state(),phase:'current',message:'No newer signed stable SDL/CEF release is available.'};
+  if(!candidate||candidate.verified.manifest.sequence<=current.manifest.sequence||compare(candidate.verified.manifest.version,current.manifest.version)<=0)return {...runtime.state(),phase:'current',message:'No newer signed stable SDL/CEF release is available (installed runtime: '+current.manifest.version+').'};
   return stage(runtime,candidate,options.range||range);
 }
 module.exports={range,stage,update};

@@ -1,6 +1,20 @@
 {
   "releases": [
     {
+      "version": "0.5.5",
+      "date": "2026-10-27",
+      "added": [
+        "The Tab information overlay now shows the current time in its bottom-right corner."
+      ],
+      "changed": [
+        "The \"Loading — please wait\" card at the bottom of the screen is no longer shown while the game loads a map or assets.",
+        "Update messages now show your installed version (for example \"No newer release is available (installed runtime: 0.5.4)\")."
+      ],
+      "fixed": [
+        "Windows: if installing an update fails, Qrazy now shows a short reason in the error message so it can be reported."
+      ]
+    },
+    {
       "version": "0.5.4",
       "date": "2026-10-24",
       "added": [],

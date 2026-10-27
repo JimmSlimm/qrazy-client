@@ -1,11 +1,11 @@
 (function(host) {
   'use strict';
   // Read-only presentation: the game owns data, formatting and Tab eligibility.
-  let informationSnapshot = null, informationHeld = false, informationBox;
+  let informationSnapshot = null, informationHeld = false, informationBox, informationClock = 0;
   const infoText = (value, max = 120) => typeof value === 'string' ? value.slice(0, max) : '';
-  function hideInformation() { informationHeld = false; informationBox?.remove(); informationBox = null; }
+  function hideInformation() { informationHeld = false; clearInterval(informationClock); informationBox?.remove(); informationBox = null; }
   function renderInformation() {
-    informationBox?.remove(); informationBox = null;
+    informationBox?.remove(); informationBox = null; clearInterval(informationClock);
     if (!informationHeld || !informationSnapshot || !document.body) return;
     const data = informationSnapshot;
     const box = document.createElement('section');
@@ -118,7 +118,11 @@
       playerName(chip, row);
     }
     const playerCount = data.mode === 'Solo' ? data.groups.reduce((count, group) => count + group.rows.length, 0) + data.spectators.length : data.multiplayer.total;
-    add(box, 'div', `${playerCount} ${playerCount === 1 ? 'player' : 'players'} \u00b7 Release Tab to return${data.legacy ? ' \u00b7 Category, PB, session-best and WR data need the updated game adapter' : data.mode === 'Solo' ? ' \u00b7 Session best: local untainted finish, not server-verified' : ' \u00b7 Session best: hub-reported, not replay-verified'}`, 'font-size:13px;color:#9eafc5;margin-top:12px');
+    const footer = add(box, 'div', '', 'display:flex;justify-content:space-between;align-items:baseline;gap:16px;font-size:13px;color:#9eafc5;margin-top:12px');
+    add(footer, 'div', `${playerCount} ${playerCount === 1 ? 'player' : 'players'} \u00b7 Release Tab to return${data.legacy ? ' \u00b7 Category, PB, session-best and WR data need the updated game adapter' : data.mode === 'Solo' ? ' \u00b7 Session best: local untainted finish, not server-verified' : ' \u00b7 Session best: hub-reported, not replay-verified'}`, 'min-width:0');
+    const clock = add(footer, 'div', '', 'flex:none;font-variant-numeric:tabular-nums');
+    const tick = () => { clock.textContent = new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'}); };
+    tick(); informationClock = setInterval(tick, 1000);
     document.body.append(box); informationBox = box;
   }
   const information = {
@@ -223,7 +227,7 @@
   function showStatus(value) {
     if (value.phase === 'error') information.clear();
     gameStatusNotice?.remove(); gameStatusNotice = null;
-    if (!['loading','warning','error'].includes(value.phase) || !document.body) return;
+    if (!['warning','error'].includes(value.phase) || !document.body) return;
     const box=document.createElement('section'); box.setAttribute('role','status');box.setAttribute('aria-live','polite');
     box.style.cssText='position:fixed;bottom:32px;left:50%;transform:translateX(-50%);width:calc(100% - 48px);max-width:820px;box-sizing:border-box;z-index:2147483647;background:#0b1424;color:white;border:2px solid #fbbf24;border-left:8px solid #fbbf24;border-radius:10px;padding:22px 28px;font:18px/1.45 system-ui;box-shadow:0 8px 40px #000b;pointer-events:'+ (value.phase==='error'?'auto':'none');
     const title=document.createElement('strong');title.style.cssText='display:block;color:#fbbf24;font-size:22px;margin-bottom:6px';title.textContent=value.phase==='loading'?'Loading — please wait':value.phase==='error'?'Game needs recovery':'Notice';
@@ -440,6 +444,8 @@
       installButton=action('Install downloaded update',async()=>{showUpdate((await rpc('update-install')).data);});installButton.disabled=true;installButton.hidden=true;
       action('Changelog',async()=>{report.textContent=(await rpc('changelog')).data;});
       action('Close panel',async()=>panel.remove());
+      const onEscape=event=>{if(!panel.isConnected)return removeEventListener('keydown',onEscape,true);if(event.key!=='Escape')return;event.preventDefault();event.stopPropagation();panel.remove();removeEventListener('keydown',onEscape,true);};
+      addEventListener('keydown',onEscape,true);
       const diagnostics=document.createElement('details');diagnostics.style.cssText='margin-top:20px';
       const summary=document.createElement('summary');summary.textContent='Diagnostics';diagnostics.append(summary);
       const symptomLabel=document.createElement('label');symptomLabel.textContent='FPS problem details (optional, included when copying):';
