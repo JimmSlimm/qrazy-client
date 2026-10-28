@@ -1,6 +1,6 @@
 #pragma once
-// Opt-in experimental frame pacing for Linux. Off unless the player enables it from the game console; the saved flag
-// applies on the NEXT start. A run that does not exit cleanly clears the flag again, so a broken start cannot repeat.
+// Frame pacing for Linux VSync-off mode (r_swapinterval 0); the saved setting
+// applies on the NEXT start. A run that does not exit cleanly turns VSync back on, so a broken start cannot repeat.
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -12,7 +12,7 @@
 
 // VSync on (default): the original pacing. VSync off: timer-driven frame requests with a sleep-then-spin timer, an adaptive
 // request rate, a present limiter and a 32 MB V8 young generation (startup flag). The saved VSync setting applies on the next start.
-struct ExperimentalPacing {
+struct FramePacing {
   bool active=false;  // this process runs the VSync-off pacing
   bool vsync=true;    // saved preference for the next start
   int max_fps=250;

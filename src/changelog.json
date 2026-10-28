@@ -1,6 +1,18 @@
 {
   "releases": [
     {
+      "version": "0.5.6",
+      "date": "2026-10-28",
+      "added": [
+        "Steam sign-in opens in your normal browser and signs the game in automatically when you finish. Windows and Linux (new on Linux).",
+        "Console command /pacingdump copies recent frame-pacing details to the clipboard, to help diagnose frame rate problems."
+      ],
+      "changed": [],
+      "fixed": [
+        "Attempt to fix the frame rate sometimes staying stuck at a low value (around 130 fps) until you Alt+Tab. Windows: the frame limiter now follows the game's active graphics context. Linux: pacing now re-syncs on load and focus, and when painting falls well short of the target. Not yet confirmed."
+      ]
+    },
+    {
       "version": "0.5.5",
       "date": "2026-10-27",
       "added": [

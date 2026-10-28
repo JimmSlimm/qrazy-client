@@ -87,7 +87,7 @@
         body = document.createElement('tbody'); table.append(body);
       }
       const gr = document.createElement('tr'); body.append(gr);
-      const gc = add(gr, 'td', title, 'font-size:18px;font-weight:750;color:#fbbf24;background:#19263a;padding:8px 12px;border-left:3px solid #fbbf24');
+      const gc = add(gr, 'td', title, 'font-size:18px;font-weight:750;color:#fbbf24;background:#19263a;padding:8px 12px');
       gc.colSpan = 4;
       rows.forEach(row => {
         const tr = document.createElement('tr'); body.append(tr);
@@ -541,8 +541,27 @@
     onMove: fn => subscribe(moves, fn),
     onCaptureChange: fn => subscribe(states, fn)
   });
+  /* Steam sign-in in the real browser; the host polls the server for the result and loads it in this view (see SteamClaim). */
+  const steamFailed=new Set(),steamAlphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  async function openSteam(options){
+    const link=!!(options&&options.link);
+    const code=Array.from(crypto.getRandomValues(new Uint8Array(48)),b=>steamAlphabet[b&63]).join('');
+    let url;
+    if(link){
+      const res=await fetch('/auth/steam/link',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Qrazy-Auth':'1'},body:JSON.stringify({client:code})});
+      if(!res.ok)throw new Error('Steam link request failed ('+res.status+')');
+      const body=await res.json();
+      if(!body||typeof body.url!=='string')throw new Error('Steam link request failed');
+      url=new URL(body.url,location.origin).href;
+    }else url=location.origin+'/auth/steam/start?client='+code+'&remember=1';
+    await rpc('steam-start',{code,url});
+  }
   Object.defineProperty(window, 'qrazyDesktop', { configurable: false, writable: false, value: Object.freeze({
     version: 1, prototype: true,
+    steamLogin: true,
+    openSteam,
+    cancelSteam: () => rpc('steam-cancel').then(() => undefined),
+    onSteamFailed: fn => subscribe(steamFailed, fn),
     rawMouseCapability: Object.freeze({ supported: null, backend: 'sdl3-wayland', reason: 'Compositor capture and hardware behaviour require manual verification; capture() reports the SDL request result.' }),
     rawMouse,
     updates,
@@ -554,13 +573,19 @@
     config: Object.freeze({ version: 1, importFile: async () => (await rpc('config-import')).data, exportFile: async (name, text) => (await rpc('config-export', {name,text})).data }),
     quit: () => rpc('quit'),
     vsync, maxFps,
+    pacingDump: () => window.__qrazyPacingDump(), // local debug text for the game console; nothing is sent anywhere
     fullscreen: Object.freeze({ getState: async () => (await rpc('fullscreen-state')).fullscreen, toggle: async () => (await rpc('fullscreen-toggle')).fullscreen, onChange: fn => subscribe(fullscreen, fn) })
   }) });
+  // Local debug only (no telemetry): the last ~2 minutes of pacing samples, focus changes and kicks, for a game console command to print.
+  const diagRing = [];
+  function diagPush(message) { diagRing.push({ t: Math.round(performance.now()), ...message }); if (diagRing.length > 240) diagRing.shift(); }
+  window.__qrazyPacingDump = () => diagRing.map(m => JSON.stringify(m)).join('\n');
   window.addEventListener('pagehide', release);
   // Element blur bubbles through capture listeners; it is not window focus loss.
   window.addEventListener('blur', event => { if(event.target===window)release(); });
   return function dispatch(json) {
     const message = JSON.parse(json);
+    if (message.type === 'presentation-rate' || message.type === 'focus' || message.type === 'pacing-kick') diagPush(message);
     if (message.type === 'presentation-rate') {
       if (Number.isFinite(message.fps) && message.fps >= 0) { presentedFps = message.fps;
         updatePresentationLabel(); }
@@ -575,7 +600,8 @@
       if (message.reason === 'focus') window.dispatchEvent(new Event('blur'));
       ++sequence; generation = 0;
       if (captured) { captured = false; emit(states, { captured: false }); }
-    } else if (message.type === 'focus') {
+    } else if (message.type === 'steam-failed') emit(steamFailed, message.reason);
+    else if (message.type === 'focus') {
       window.dispatchEvent(new Event(message.focused ? 'focus' : 'blur'));
     } else if (message.type === 'fullscreen') emit(fullscreen, message.value);
     else if (message.type === 'render-settings') { emit(vsyncListeners, message.vsync); emit(maxFpsListeners, message.maxFps); }

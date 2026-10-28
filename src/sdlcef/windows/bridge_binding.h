@@ -10,6 +10,28 @@ bool Trusted(const CefString& url) {
 #endif
     CefString(&parts.username).empty() && CefString(&parts.password).empty();
 }
+// scheme://host[:port] of a trusted URL.
+std::string SteamOrigin(const CefString& url) {
+  CefURLParts parts;
+  if (!CefParseURL(url, parts)) return "";
+  std::string origin = CefString(&parts.scheme).ToString() + "://" + CefString(&parts.host).ToString();
+  if (!CefString(&parts.port).empty()) origin += ":" + CefString(&parts.port).ToString();
+  return origin;
+}
+// A trusted-origin URL whose path is `path` (or starts with it when `prefix`).
+bool SteamPath(const CefString& url, const char* path, bool prefix = false) {
+  CefURLParts parts;
+  if (!Trusted(url) || !CefParseURL(url, parts)) return false;
+  const std::string value = CefString(&parts.path).ToString();
+  return prefix ? value.rfind(path, 0) == 0 : value == path;
+}
+// URLs the client may open in the real browser for Steam sign-in: the game's /auth/steam/ pages or Steam's OpenID page.
+bool SteamExternalUrl(const CefString& url) {
+  if (SteamPath(url, "/auth/steam/", true)) return true;
+  CefURLParts parts;
+  return CefParseURL(url, parts) && CefString(&parts.scheme) == "https" && CefString(&parts.host) == "steamcommunity.com" &&
+    CefString(&parts.username).empty() && CefString(&parts.password).empty() && CefString(&parts.path).ToString().rfind("/openid/", 0) == 0;
+}
 CefRefPtr<CefDictionaryValue> Dict() { return CefDictionaryValue::Create(); }
 
 class Native final : public CefV8Handler {
@@ -21,7 +43,7 @@ class Native final : public CefV8Handler {
     if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 3 || !args[2]->IsString() || args[2]->GetStringValue().length()>1500000 ||
         !args[0]->IsString() || !args[1]->IsInt()) { exception = "Unauthorized native bridge call"; return true; }
     const auto op = args[0]->GetStringValue().ToString();
-    if (op != "pointer-lock-state" && op != "pointer-lock-activate" && op != "refresh-hz-get" && op != "native-window-get" && op != "native-window-set" && op != "vsync-get" && op != "vsync-set" && op != "max-fps-get" && op != "max-fps-set" && op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-notice" && op != "update-state" && op != "update-check" && op != "update-stage" && op != "update-install" && op != "update-rollback" && op != "changelog") {
+    if (op != "pointer-lock-state" && op != "pointer-lock-activate" && op != "refresh-hz-get" && op != "native-window-get" && op != "native-window-set" && op != "vsync-get" && op != "vsync-set" && op != "max-fps-get" && op != "max-fps-set" && op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-notice" && op != "update-state" && op != "update-check" && op != "update-stage" && op != "update-install" && op != "update-rollback" && op != "changelog" && op != "steam-start" && op != "steam-cancel") {
       exception = "Unknown native operation"; return true;
     }
     auto message = CefProcessMessage::Create("qrazy-command-v1");

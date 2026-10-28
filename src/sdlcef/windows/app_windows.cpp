@@ -18,6 +18,7 @@
 #include <map>
 #include <cstdio>
 #include <functional>
+#include <random>
 #include "include/cef_app.h"
 #include "include/cef_client.h"
 #include "include/cef_cookie.h"
@@ -199,6 +200,59 @@ class Texture {
     SDL_SetTextureScaleMode(texture_,exact||rect?SDL_SCALEMODE_NEAREST:SDL_SCALEMODE_LINEAR);
     return SDL_RenderTexture(renderer,texture_,nullptr,rect);
   }
+};
+/* Steam login for the desktop client: the page asks for it (qrazyDesktop.openSteam), the real browser opens the sign-in URL, and this polls
+   /auth/steam/claim?c=<code>. The server answers 302 once the browser finished (setting the session cookie in this client's cookie jar), and the
+   game page then loads the returned location. Only one claim runs at a time; a new code or a cancel stops the old one. UI thread only. */
+class SteamClaim final : public CefURLRequestClient {
+ public:
+  using Done=std::function<void(const std::string&)>;
+  using Fail=std::function<void(const char*)>;
+  static bool ValidCode(const std::string& code){
+    if(code.size()<32||code.size()>64)return false;
+    for(char c:code)if(!std::isalnum(static_cast<unsigned char>(c))&&c!='-'&&c!='_')return false;
+    return true;
+  }
+  static void Cancel(){current_.clear();}
+  static void Start(const std::string& origin,const std::string& code,Done done,Fail fail){
+    current_=code;
+    Poll(origin,code,std::move(done),std::move(fail),std::chrono::steady_clock::now()+std::chrono::minutes(10));
+  }
+ private:
+  SteamClaim(std::string origin,std::string code,Done done,Fail fail,std::chrono::steady_clock::time_point deadline):origin_(std::move(origin)),code_(std::move(code)),done_(std::move(done)),fail_(std::move(fail)),deadline_(deadline){}
+  static void Poll(const std::string& origin,const std::string& code,Done done,Fail fail,std::chrono::steady_clock::time_point deadline){
+    if(code!=current_)return;
+    auto request=CefRequest::Create();request->SetURL(origin+"/auth/steam/claim?c="+code);request->SetMethod("GET");
+    request->SetFlags(UR_FLAG_STOP_ON_REDIRECT|UR_FLAG_SKIP_CACHE|UR_FLAG_ALLOW_STORED_CREDENTIALS); /* without the last flag the session cookie of the 302 is not saved */
+    request->SetFirstPartyForCookies(origin+"/"); /* the cookie is SameSite=Strict */
+    CefURLRequest::Create(request,new SteamClaim(origin,code,std::move(done),std::move(fail),deadline),CefRequestContext::GetGlobalContext());
+  }
+  void Again(int delay_ms){
+    if(code_!=current_)return;
+    if(std::chrono::steady_clock::now()>=deadline_){current_.clear();if(fail_)fail_("timeout");return;}
+    auto self=CefRefPtr<SteamClaim>(this);
+    CefPostDelayedTask(TID_UI,new UiTask<std::function<void()>>([self]{Poll(self->origin_,self->code_,self->done_,self->fail_,self->deadline_);}),delay_ms);
+  }
+  void OnRequestComplete(CefRefPtr<CefURLRequest> request) override{
+    if(code_!=current_)return;
+    auto response=request->GetResponse();const int status=response?response->GetStatus():0;
+    if(status==301||status==302||status==303){
+      std::string location=response->GetHeaderByName("Location").ToString();
+      if(!location.empty()&&location[0]=='/')location=origin_+location;
+      if(Trusted(location)){current_.clear();if(done_)done_(location);return;}
+      current_.clear();if(fail_)fail_("failed");return;
+    }
+    /* The server only knows the code once the browser has opened the sign-in URL, so an early 404 just means "not yet". */
+    if(status==404&&std::chrono::steady_clock::now()>=deadline_-std::chrono::minutes(10)+std::chrono::seconds(45)){current_.clear();if(fail_)fail_("expired");return;}
+    Again(status==429?10000:2000); /* 204 pending; 429 backs off; network errors and 5xx keep trying until the deadline */
+  }
+  void OnUploadProgress(CefRefPtr<CefURLRequest>,int64_t,int64_t) override{}
+  void OnDownloadProgress(CefRefPtr<CefURLRequest>,int64_t,int64_t) override{}
+  void OnDownloadData(CefRefPtr<CefURLRequest>,const void*,size_t) override{}
+  bool GetAuthCredentials(bool,const CefString&,int,const CefString&,const CefString&,CefRefPtr<CefAuthCallback>) override{return false;}
+  std::string origin_,code_;Done done_;Fail fail_;std::chrono::steady_clock::time_point deadline_;
+  static inline std::string current_;
+  IMPLEMENT_REFCOUNTING(SteamClaim);
 };
 class Client final : public DesktopPolicy::RecoveryState,public CefClient,public CefRenderHandler,
   public CefLifeSpanHandler,public CefRequestHandler,public CefLoadHandler,public CefDisplayHandler,
@@ -499,7 +553,8 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     /* Native mode: history traversal (Alt+Left/Right, mouse side buttons, gestures) is never wanted; reloads and our own loads are not affected. */
     if(native_window&&frame->IsMain()&&(request->GetTransitionType()&TT_FORWARD_BACK_FLAG))return true;
     if(handoff_waiting)return !frame->IsMain()||request->GetURL()!="about:blank";
-    if(!frame->IsMain())return false;if(!Trusted(request->GetURL())){OpenWebLink(frame,request->GetURL(),gesture);return true;}
+    if(!frame->IsMain())return false;
+    if(!Trusted(request->GetURL())){OpenWebLink(frame,request->GetURL(),gesture);return true;}
     if(ToMain([self=CefRefPtr<Client>(this)]{self->Reset("navigation");self->BeginLoad();self->load_started=SDL_GetTicks();}))return false;
     Reset("navigation");BeginLoad();load_started=SDL_GetTicks();return false;
   }
@@ -645,6 +700,20 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       bool ok=browser&&!closing&&!fatal&&!handoff_waiting&&!loading&&Focused();
       result->SetBool("ok",ok);
       if(ok){server_retry.Stop();Reset("refresh");BeginLoad();load_started=SDL_GetTicks();server_retry.Start(load_started);server_retry.Attempt(load_started);OnBrowser([](CefRefPtr<CefBrowser> b){b->ReloadIgnoreCache();});}
+    }
+    else if(op=="steam-cancel")OnUi([]{SteamClaim::Cancel();});
+    else if(op=="steam-start") {
+      const std::string code=d&&d->GetType("code")==VTYPE_STRING?d->GetString("code").ToString():"",url=d&&d->GetType("url")==VTYPE_STRING?d->GetString("url").ToString():"";
+      const bool ok=!closing&&!fatal&&SteamClaim::ValidCode(code)&&SteamExternalUrl(url);
+      result->SetBool("ok",ok);
+      if(!ok)result->SetString("error","Steam login request refused");
+      else{
+        SDL_OpenURL(url.c_str());const CefString site=kOrigin;const std::string origin=SteamOrigin(site);
+        auto self=CefRefPtr<Client>(this);
+        OnUi([self,origin,code]{SteamClaim::Start(origin,code,
+          [self](const std::string& location){self->OnBrowser([location](CefRefPtr<CefBrowser> b){b->GetMainFrame()->LoadURL(location);});},
+          [self](const char* reason){auto event=Dict();event->SetString("type","steam-failed");event->SetString("reason",reason);self->Send(event);});});
+      }
     }
     else if(op=="retry")Retry();
     else if(op=="fullscreen-toggle"||op=="fullscreen-state") {

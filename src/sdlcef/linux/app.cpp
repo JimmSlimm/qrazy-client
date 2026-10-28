@@ -26,7 +26,11 @@
 #include <csignal>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <functional>
 #include "include/cef_cookie.h"
+#include "include/cef_request_context.h"
+#include "include/cef_urlrequest.h"
+#include "include/cef_task.h"
 #include "include/base/cef_compiler_specific.h"
 #include "include/cef_version.h"
 #include "include/cef_load_handler.h"
@@ -42,7 +46,8 @@
 #include "include/cef_render_handler.h"
 #include "include/cef_v8.h"
 #include "include/wrapper/cef_helpers.h"
-#include "experimental_pacing.h"
+#include "frame_pacing.h"
+#include "pacing_watchdog.h"
 
 namespace {
 constexpr char kOrigin[] = "https://qrazy-game.onrender.com/";
@@ -58,7 +63,7 @@ bool amd_mesa_renderer = false;
 QrazyWindows::ServerRetry server_retry;
 uint64_t connect_started=0;
 int render_rate = 0;
-ExperimentalPacing pacing; /* opt-in, see experimental_pacing.h */
+FramePacing pacing; /* VSync-off frame pacing, see frame_pacing.h */
 TimerBeginClock pacing_clock;
 DesktopWorker desktop_worker;
 #include "profile_lock.h"
@@ -110,6 +115,15 @@ bool Trusted(const CefString& url) {
     CefString(&parts.username).empty() && CefString(&parts.password).empty();
 }
 CefRefPtr<CefDictionaryValue> Dict() { return CefDictionaryValue::Create(); }
+// URLs the client may open in the real browser for Steam sign-in: the game's /auth/steam/ pages or Steam's OpenID page.
+bool SteamExternalUrl(const CefString& url) {
+  CefURLParts parts;
+  if (!CefParseURL(url, parts)) return false;
+  const std::string path = CefString(&parts.path).ToString();
+  if (Trusted(url)) return path.rfind("/auth/steam/", 0) == 0;
+  return CefString(&parts.scheme) == "https" && CefString(&parts.host) == "steamcommunity.com" &&
+    CefString(&parts.username).empty() && CefString(&parts.password).empty() && path.rfind("/openid/", 0) == 0;
+}
 
 class Native final : public CefV8Handler {
  public:
@@ -120,7 +134,7 @@ class Native final : public CefV8Handler {
     if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 3 || !args[2]->IsString() || args[2]->GetStringValue().length()>1500000 ||
         !args[0]->IsString() || !args[1]->IsInt()) { exception = "Unauthorized native bridge call"; return true; }
     const auto op = args[0]->GetStringValue().ToString();
-    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-notice" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog" && op != "vsync-get" && op != "vsync-set" && op != "max-fps-get" && op != "max-fps-set") {
+    if (op != "capture" && op != "release" && op != "clock" && op != "quit" && op != "fullscreen-state" && op != "fullscreen-toggle" && op != "assets" && op != "status" && op != "refresh-game" && op != "retry" && op != "diagnostics" && op != "clipboard-write" && op != "config-import" && op != "config-export" && op != "update-notice" && op != "update-state" && op != "update-check" && op != "update-install" && op != "changelog" && op != "vsync-get" && op != "vsync-set" && op != "max-fps-get" && op != "max-fps-set" && op != "steam-start" && op != "steam-cancel") {
       exception = "Unknown native operation"; return true;
     }
     auto message = CefProcessMessage::Create("qrazy-command-v1");
@@ -141,8 +155,8 @@ class App final : public CefApp, public CefRenderProcessHandler, public CefBrows
   CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override { return this; }
   CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
   void OnBeforeChildProcessLaunch(CefRefPtr<CefCommandLine> line) override {
-    /* Lets the renderer's bridge know, synchronously at load, whether the experimental mode is active. */
-    if (pacing.active) line->AppendSwitch("qrazy-experimental-pacing");
+    /* Lets the renderer's bridge know, synchronously at load, whether VSync-off pacing is active. */
+    if (pacing.active) line->AppendSwitch("qrazy-frame-pacing");
     if (line->GetSwitchValue("type") != "gpu-process") return;
     // Log only this fixed set of graphics controls, never the full command line.
     // Hardware captures confirm disable-angle-features already reaches the child.
@@ -189,7 +203,7 @@ class App final : public CefApp, public CefRenderProcessHandler, public CefBrows
     if (!frame->IsMain() || !Trusted(frame->GetURL())) return;
     auto native = CefV8Value::CreateFunction("qrazyNative", new Native);
     // Temporary bootstrap slot; removed before any website script runs. Dispatcher stays private.
-    native->SetValue("pacing", CefV8Value::CreateBool(CefCommandLine::GetGlobalCommandLine()->HasSwitch("qrazy-experimental-pacing")), V8_PROPERTY_ATTRIBUTE_READONLY);
+    native->SetValue("pacing", CefV8Value::CreateBool(CefCommandLine::GetGlobalCommandLine()->HasSwitch("qrazy-frame-pacing")), V8_PROPERTY_ATTRIBUTE_READONLY);
     context->GetGlobal()->SetValue("__qrazyBootstrap", native, V8_PROPERTY_ATTRIBUTE_NONE);
     CefRefPtr<CefV8Value> dispatch; CefRefPtr<CefV8Exception> exception;
     bool ok = context->Eval(bridge_source + "(__qrazyBootstrap)", "qrazy-native-bridge", 1, dispatch, exception);
@@ -316,6 +330,69 @@ class Texture {
 };
 
 
+/* Steam login for the desktop client: the page asks for it (qrazyDesktop.openSteam), the real browser opens the sign-in URL, and this polls
+   /auth/steam/claim?c=<code>. The server answers 302 once the browser finished (setting the session cookie in this client's cookie jar), and the
+   game page then loads the returned location. Only one claim runs at a time; a new code or a cancel stops the old one. UI thread only. */
+class SteamTask final : public CefTask {
+ public:
+  explicit SteamTask(std::function<void()> fn) : fn_(std::move(fn)) {}
+  void Execute() override { fn_(); }
+ private:
+  std::function<void()> fn_;
+  IMPLEMENT_REFCOUNTING(SteamTask);
+};
+class SteamClaim final : public CefURLRequestClient {
+ public:
+  using Done = std::function<void(const std::string&)>;
+  using Fail = std::function<void(const char*)>;
+  static bool ValidCode(const std::string& code) {
+    if (code.size() < 32 || code.size() > 64) return false;
+    for (char c : code) if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') return false;
+    return true;
+  }
+  static void Cancel() { current_.clear(); }
+  static void Start(const std::string& code, Done done, Fail fail) {
+    current_ = code;
+    Poll(code, std::move(done), std::move(fail), std::chrono::steady_clock::now() + std::chrono::minutes(10));
+  }
+ private:
+  static constexpr const char* kSite = "https://qrazy-game.onrender.com";
+  SteamClaim(std::string code, Done done, Fail fail, std::chrono::steady_clock::time_point deadline) : code_(std::move(code)), done_(std::move(done)), fail_(std::move(fail)), deadline_(deadline) {}
+  static void Poll(const std::string& code, Done done, Fail fail, std::chrono::steady_clock::time_point deadline) {
+    if (code != current_) return;
+    auto request = CefRequest::Create(); request->SetURL(std::string(kSite) + "/auth/steam/claim?c=" + code); request->SetMethod("GET");
+    request->SetFlags(UR_FLAG_STOP_ON_REDIRECT | UR_FLAG_SKIP_CACHE | UR_FLAG_ALLOW_STORED_CREDENTIALS); /* without the last flag the session cookie of the 302 is not saved */
+    request->SetFirstPartyForCookies(std::string(kSite) + "/"); /* the cookie is SameSite=Strict */
+    CefURLRequest::Create(request, new SteamClaim(code, std::move(done), std::move(fail), deadline), CefRequestContext::GetGlobalContext());
+  }
+  void Again(int delay_ms) {
+    if (code_ != current_) return;
+    if (std::chrono::steady_clock::now() >= deadline_) { current_.clear(); if (fail_) fail_("timeout"); return; }
+    auto self = CefRefPtr<SteamClaim>(this);
+    CefPostDelayedTask(TID_UI, new SteamTask([self] { Poll(self->code_, self->done_, self->fail_, self->deadline_); }), delay_ms);
+  }
+  void OnRequestComplete(CefRefPtr<CefURLRequest> request) override {
+    if (code_ != current_) return;
+    auto response = request->GetResponse(); const int status = response ? response->GetStatus() : 0;
+    if (status == 301 || status == 302 || status == 303) {
+      std::string location = response->GetHeaderByName("Location").ToString();
+      if (!location.empty() && location[0] == '/') location = std::string(kSite) + location;
+      current_.clear();
+      if (Trusted(location)) { if (done_) done_(location); } else if (fail_) fail_("failed");
+      return;
+    }
+    /* The server only knows the code once the browser has opened the sign-in URL, so an early 404 just means "not yet". */
+    if (status == 404 && std::chrono::steady_clock::now() >= deadline_ - std::chrono::minutes(10) + std::chrono::seconds(45)) { current_.clear(); if (fail_) fail_("expired"); return; }
+    Again(status == 429 ? 10000 : 2000); /* 204 pending; 429 backs off; network errors and 5xx keep trying until the deadline */
+  }
+  void OnUploadProgress(CefRefPtr<CefURLRequest>, int64_t, int64_t) override {}
+  void OnDownloadProgress(CefRefPtr<CefURLRequest>, int64_t, int64_t) override {}
+  void OnDownloadData(CefRefPtr<CefURLRequest>, const void*, size_t) override {}
+  bool GetAuthCredentials(bool, const CefString&, int, const CefString&, const CefString&, CefRefPtr<CefAuthCallback>) override { return false; }
+  std::string code_; Done done_; Fail fail_; std::chrono::steady_clock::time_point deadline_;
+  static inline std::string current_;
+  IMPLEMENT_REFCOUNTING(SteamClaim);
+};
 class Client final : public DesktopPolicy::RecoveryState, public CefClient, public CefRenderHandler, public CefLifeSpanHandler,
                      public CefRequestHandler, public CefDisplayHandler, public CefLoadHandler, public CefDownloadHandler, public CefDialogHandler,public CefContextMenuHandler {
  public:
@@ -371,7 +448,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     // A completed navigation ends connection recovery. Leaving its timer active
     // interrupts an already connected game when the five-minute window expires.
     server_retry.Stop();
-    SDL_SetWindowTitle(window,"Qrazy SDL3 + CEF — experimental");
+    SDL_SetWindowTitle(window,"Qrazy SDL3 + CEF");
     if(browser){
       // Retry can replace the renderer without an SDL focus event. Refresh CEF's
       // focus from the actual window so capture does not depend on Alt+Tab.
@@ -379,6 +456,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
       const bool focused=!hidden_check&&SDL_GetKeyboardFocus()==window;
       browser->GetHost()->SetFocus(focused);
       browser->GetHost()->SetAudioMuted(!focused);
+      PacingKick("load-end");
     }
   }
   void OnLoadError(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,ErrorCode code,const CefString&,const CefString& failed_url) override {
@@ -519,8 +597,30 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   unsigned begin_count=0;int paint_mark=0;Uint64 gap_last=0;float gap_p99_last=0,gap_max_last=0;std::vector<float> gap_ms;
   void NotePresent(){const Uint64 t=SDL_GetTicksNS();if(gap_last&&gap_ms.size()<4096)gap_ms.push_back(static_cast<float>((t-gap_last)/1e6));gap_last=t;}
   unsigned lp_passes=0;double lp_pump=0,lp_copy=0,lp_swap=0,lp_import=0,lp_wait=0;unsigned trace_n=0,trace_passes=0,trace_req=0,trace_present=0;int trace_frames=0;double trace_pump=0,trace_copy=0,trace_swap=0;Uint64 trace_at=SDL_GetTicksNS();
-  void PresentationTick() { /* experimental pacing only: measured successful swaps per second, sent about twice a second */
-    if(!pacing.active)return;
+  /* Re-applies what Alt+Tab re-applies on the host side, with no focus/blur sent to the page (that would release the mouse and clear keys): the CEF rate (toggled, so it is not skipped as unchanged), the view size, a repaint, and the adaptive-rate history. Players saw a persistent ~130 fps ceiling after a map load that only Alt+Tab cleared. */
+  PacingWatchdog watchdog;
+  void PacingKick(const char* why) {
+    if(!browser||closing)return;
+    auto host=browser->GetHost();
+    host->SetWindowlessFrameRate(30);host->SetWindowlessFrameRate(pacing.Target(render_rate));
+    host->WasResized();host->Invalidate(PET_VIEW);
+    adapt_at=0;adapt_ring_n=0;adapt_ring_i=0;watchdog.Reset();
+    {auto event=Dict();event->SetString("type","pacing-kick");event->SetString("why",why);event->SetInt("target",request_target);event->SetInt("cefRate",host->GetWindowlessFrameRate());Send(event);}
+    std::fprintf(stderr,"QRAZY pacing-kick why=%s target=%d cefRate=%d\n",why,request_target,host->GetWindowlessFrameRate());
+  }
+  /* With VSync on CEF paces itself at the display rate, so the shortfall is judged against that rate over 1 s windows. */
+  Uint64 wd_at=0;int wd_mark=0;
+  void WatchPaintRate() {
+    const Uint64 now=SDL_GetTicksNS();
+    if(!wd_at){wd_at=now;wd_mark=frames;return;}
+    if(now-wd_at<1000000000ull)return;
+    const double painted=(frames-wd_mark)*1e9/static_cast<double>(now-wd_at);
+    wd_at=now;wd_mark=frames;
+    const bool eligible=!hidden_check&&!loading&&!recovering&&!closing&&SDL_GetKeyboardFocus()==window;
+    if(watchdog.Update(static_cast<int64_t>(now),painted,render_rate,eligible))PacingKick("paint-shortfall");
+  }
+  void PresentationTick() { /* VSync-off pacing only: measured successful swaps per second, sent about twice a second */
+    if(!pacing.active){WatchPaintRate();return;}
     const Uint64 now=SDL_GetTicksNS(),elapsed=now-presentation_started;
     if(elapsed<500000000ull)return;
     auto data=Dict();data->SetString("type","presentation-rate");
@@ -528,6 +628,8 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     data->SetDouble("intervalMs",elapsed/1e6);data->SetInt("presents",static_cast<int>(presentation_count));
     data->SetDouble("requestedFps",begin_count*1e9/static_cast<double>(elapsed));
     data->SetDouble("paintedFps",(frames-paint_mark)*1e9/static_cast<double>(elapsed));
+    {const bool eligible=!hidden_check&&!loading&&!recovering&&!closing&&SDL_GetKeyboardFocus()==window;
+     if(watchdog.Update(static_cast<int64_t>(now),(frames-paint_mark)*1e9/static_cast<double>(elapsed),begin_count*1e9/static_cast<double>(elapsed),eligible))PacingKick("paint-shortfall");}
     data->SetInt("cap",pacing.max_fps);data->SetInt("target",request_target);data->SetInt("cefRate",browser?browser->GetHost()->GetWindowlessFrameRate():-1);
     if(!gap_ms.empty()){std::sort(gap_ms.begin(),gap_ms.end());gap_p99_last=gap_ms[gap_ms.size()/2]; /* median of the half-second window */gap_max_last=gap_ms.back();data->SetDouble("gapMed",gap_p99_last);data->SetDouble("gapMax",gap_max_last);gap_ms.clear();}
     data->SetDouble("passFps",(passes-lp_passes)*1e9/static_cast<double>(elapsed));
@@ -539,7 +641,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     lp_import=import_ms;lp_wait=wait_ms;
     lp_passes=passes;lp_pump=pump_ms;lp_copy=copy_ms;lp_swap=swap_ms;
     trace_req+=begin_count;trace_present+=presentation_count;
-    if(++trace_n%4==0){ /* experimental pacing only: one log line about every 2 seconds, per-second averages */
+    if(++trace_n%4==0){ /* VSync-off pacing only: one log line about every 2 seconds, per-second averages */
       const double sec=(now-trace_at)/1e9;
       std::fprintf(stderr,"QRAZY pacing-trace tgt=%d passes=%.0f req=%.0f paint=%.0f present=%.0f pump-ms/s=%.0f copy-ms/s=%.0f swap-ms/s=%.0f gap=%.1f/%.1f\n",request_target,
                    (passes-trace_passes)/sec,trace_req/sec,(frames-trace_frames)/sec,trace_present/sec,(pump_ms-trace_pump)/sec,(copy_ms-trace_copy)/sec,(swap_ms-trace_swap)/sec,gap_p99_last,gap_max_last);
@@ -563,7 +665,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     }
     return std::clamp(adapt_rate,floor_rate,cap);
   }
-  void RequestFrame() { /* experimental only; request after input and presentation */
+  void RequestFrame() { /* VSync-off pacing only; request after input and presentation */
     if(!pacing.active)return;
     request_target=pacing.Target(render_rate);
     request_target=AdaptiveTarget(request_target);
@@ -620,6 +722,20 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
       bool ok=browser&&!closing&&!loading&&!hidden_check&&SDL_GetKeyboardFocus()==window;result->SetBool("ok",ok);
       if(ok){Release("refresh");desktop_worker.Reset();BeginLoad();connect_started=SDL_GetTicks();server_retry.Start(connect_started);server_retry.Attempt(connect_started);popup_visible=false;selection.clear();composing=false;browser->GetHost()->ImeCancelComposition();browser->GetHost()->SetAudioMuted(true);browser->ReloadIgnoreCache();}
     } else if(op=="retry") { Retry(); }
+    else if(op=="steam-cancel") SteamClaim::Cancel();
+    else if(op=="steam-start") {
+      const std::string code=data_payload&&data_payload->GetType("code")==VTYPE_STRING?data_payload->GetString("code").ToString():"",url=data_payload&&data_payload->GetType("url")==VTYPE_STRING?data_payload->GetString("url").ToString():"";
+      const bool ok=!closing&&SteamClaim::ValidCode(code)&&SteamExternalUrl(url);
+      result->SetBool("ok",ok);
+      if(!ok)result->SetString("error","Steam login request refused");
+      else{
+        SDL_OpenURL(url.c_str());
+        auto self=CefRefPtr<Client>(this);
+        SteamClaim::Start(code,
+          [self](const std::string& location){if(self->browser&&!closing)self->browser->GetMainFrame()->LoadURL(location);},
+          [self](const char* reason){auto event=Dict();event->SetString("type","steam-failed");event->SetString("reason",reason);self->Send(event);});
+      }
+    }
     else if(op=="clipboard-write") {
       auto text=data_payload?data_payload->GetString("text").ToString():std::string();
       bool allowed=!hidden_check&&!captured&&!closing&&!recovering&&!loading&&SDL_GetKeyboardFocus()==window&&text.size()<=1048576&&text.find('\0')==std::string::npos;
@@ -670,7 +786,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
         result->SetBool("ok", false); result->SetString("error", "Expected a VSync boolean or com_maxfps integer from 30 to 10000");
       } else {
         /* Saved for the next start: VSync off runs the timer-driven pacing, which is set up at startup. Only the cap applies at once. */
-        const ExperimentalPacing previous = pacing;
+        const FramePacing previous = pacing;
         if (is_vsync) pacing.vsync = data_payload->GetBool("enabled"); else pacing.max_fps = data_payload->GetInt("value");
         if (!pacing.Save()) {
           pacing = previous;
@@ -694,7 +810,7 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
       auto data = Dict(); data->SetString("type", "move"); data->SetList("samples", list); Send(data);
       return;
     }
-    move_batch->SetDictionary(move_batch->GetSize(), sample); /* experimental pacing only: batched per loop pass */
+    move_batch->SetDictionary(move_batch->GetSize(), sample); /* VSync-off pacing only: batched per loop pass */
   }
   CefRefPtr<CefListValue> move_batch = CefListValue::Create(); /* captured-mouse samples from one loop pass go out as one message */
   void FlushMotion() {
@@ -897,7 +1013,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
   if(!profile_lock.Acquire(prototype_profile)){std::fprintf(stderr,"QRAZY profile already in use or unavailable; close its existing client before relaunching\n");return 4;}
   if(!desktop_worker.Start(executable,prototype_profile))std::fprintf(stderr,"QRAZY desktop worker unavailable; browser loading fallback retained\n");
   if(!hidden_check) {
-    /* Opt-in experimental frame pacing (off by default). The marker file is removed on a clean exit; if it is still there
+    /* Frame pacing for VSync off. The marker file is removed on a clean exit; if it is still there
        next start, the experiment is switched off again. */
     pacing.Load(prototype_profile);
     if(!pacing.vsync) {
@@ -921,7 +1037,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
   if (!render_rate) { std::fprintf(stderr, "QRAZY display refresh unavailable; refusing arbitrary FPS fallback\n"); return 5; }
   if (!hidden_check) {
     SDL_StartTextInput(window);
-    int interval = 0; const int wanted = pacing.SwapInterval(); /* VSync stays required unless experimental pacing is active */
+    int interval = 0; const int wanted = pacing.SwapInterval(); /* VSync stays on unless VSync-off pacing is active */
     if (!SDL_GL_SetSwapInterval(wanted) || !SDL_GL_GetSwapInterval(&interval) || interval != wanted) {
       std::fprintf(stderr, "QRAZY VSync swap interval %d unavailable: %s\n", wanted, SDL_GetError());
       if (wanted == 1 || !SDL_GL_SetSwapInterval(1) || !SDL_GL_GetSwapInterval(&interval) || interval != 1) return 5;
@@ -984,7 +1100,7 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
         }
         if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED) {
           if(!captured)SDL_StartTextInput(window);
-          if (client->browser) { client->browser->GetHost()->SetFocus(true); client->browser->GetHost()->SetAudioMuted(client->recovering||client->loading); }
+          if (client->browser) { client->browser->GetHost()->SetFocus(true); client->browser->GetHost()->SetAudioMuted(client->recovering||client->loading); client->PacingKick("focus-gained"); }
           auto data=Dict(); data->SetString("type","focus"); data->SetBool("focused",true); client->Send(data);
         }
         if (event.type == SDL_EVENT_WINDOW_RESIZED || event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {

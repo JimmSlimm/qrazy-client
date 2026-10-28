@@ -89,7 +89,7 @@
         body = document.createElement('tbody'); table.append(body);
       }
       const gr = document.createElement('tr'); body.append(gr);
-      const gc = add(gr, 'td', title, 'font-size:18px;font-weight:750;color:#fbbf24;background:#19263a;padding:8px 12px;border-left:3px solid #fbbf24');
+      const gc = add(gr, 'td', title, 'font-size:18px;font-weight:750;color:#fbbf24;background:#19263a;padding:8px 12px');
       gc.colSpan = 4;
       rows.forEach(row => {
         const tr = document.createElement('tr'); body.append(tr);
@@ -523,8 +523,18 @@
     const mc=new MessageChannel();let mcPump=null;mc.port1.onmessage=()=>{const f=mcPump;mcPump=null;f?.();};
     /* GPU backpressure, VSync off only: the hop-driven loop bypasses Chromium's frame pacing, so a GPU-bound spot would build a long queue (measured: 22 frames/s shown, 177 ms to display, at cap 480). Keep at most FENCE_DEPTH frames of GPU work in flight; the timeout lets the game run on if a fence never signals (context lost, hidden window). */
     const FENCE_DEPTH=2,FENCE_TIMEOUT_MS=250;let gl=null,fences=[],fenceSince=0;
-    const origGetContext=HTMLCanvasElement.prototype.getContext;HTMLCanvasElement.prototype.getContext=function(type,...rest){const c=origGetContext.call(this,type,...rest);if(!gl&&c&&type==='webgl2')gl=c;return c;};
-    const gpuBusy=()=>{if(!gl||vsyncOn)return false;try{if(gl.isContextLost())return false;const t=performance.now();while(fences.length&&gl.getSyncParameter(fences[0],gl.SYNC_STATUS)===gl.SIGNALED){gl.deleteSync(fences.shift());fenceSince=0;}if(fences.length<FENCE_DEPTH)return false;if(!fenceSince)fenceSince=t;if(t-fenceSince>FENCE_TIMEOUT_MS){for(const f of fences)gl.deleteSync(f);fences=[];fenceSince=0;return false;}return true;}catch(e){gl=null;fences=[];return false;}};
+    /*BEGIN pickRenderContext*/ /* The fences must sit on the context that draws. The game creates a throwaway probe canvas first (never attached to the page), so latching the first webgl2 context fenced the wrong stream: fence latency then follows GPU scheduling of an idle context, not the frames, and depth 2 turns that into a fps ceiling that nothing clears until the contexts change (alt-tab). Pick the newest live context whose canvas is on the page. */
+    const pickRenderContext=list=>{for(let i=list.length-1;i>=0;i--){const c=list[i];try{if(c&&c.canvas&&c.canvas.isConnected&&!c.isContextLost())return c;}catch(e){}}return null;};/*END pickRenderContext*/
+    const glList=[];let glChecked=0;
+    const origGetContext=HTMLCanvasElement.prototype.getContext;HTMLCanvasElement.prototype.getContext=function(type,...rest){const c=origGetContext.call(this,type,...rest);if(c&&type==='webgl2'&&!glList.includes(c)){glList.push(c);if(glList.length>8)glList.shift();}return c;};
+    const stats={pumps:0,busy:0,fenceDrops:0,relatch:0};
+    const refreshGl=t=>{if(gl&&t-glChecked<250)return;glChecked=t;const next=pickRenderContext(glList);if(next!==gl){if(gl)stats.relatch++;gl=next;fences=[];fenceSince=0;}};
+    /* local debug only (no telemetry): limiter state at map-load stages and focus changes, readable from DevTools as window.__qrazyLimiter() */
+    const limiterRing=[];setInterval(()=>{try{limiterRing.push({t:Math.round(performance.now()),...window.__qrazyLimiter()});if(limiterRing.length>120)limiterRing.shift();}catch(e){}},1000);window.__qrazyPacingDump=()=>limiterRing.map(m=>JSON.stringify(m)).join('\n');
+    window.__qrazyLimiter=()=>({cap,vsyncOn,effCap:effCap(),fences:fences.length,glLatched:!!gl,glCandidates:glList.length,dispReady,dispI,...stats});
+    const logLimiter=why=>{try{console.debug('[qrazy-limiter]',why,JSON.stringify(window.__qrazyLimiter()));}catch(e){}};
+    window.addEventListener('focus',()=>{refreshGl(Infinity);logLimiter('focus');});window.addEventListener('blur',()=>logLimiter('blur'));document.addEventListener('visibilitychange',()=>{refreshGl(Infinity);logLimiter('visibility-'+document.visibilityState);});
+    const gpuBusy=()=>{refreshGl(performance.now());stats.pumps++;if(!gl||vsyncOn)return false;try{if(gl.isContextLost())return false;const t=performance.now();while(fences.length&&gl.getSyncParameter(fences[0],gl.SYNC_STATUS)===gl.SIGNALED){gl.deleteSync(fences.shift());fenceSince=0;}if(fences.length<FENCE_DEPTH)return false;if(!fenceSince)fenceSince=t;if(t-fenceSince>FENCE_TIMEOUT_MS){for(const f of fences)gl.deleteSync(f);fences=[];fenceSince=0;stats.fenceDrops++;return false;}stats.busy++;return true;}catch(e){gl=null;fences=[];return false;}};
     const fenceFrame=()=>{if(!gl||vsyncOn)return;try{if(gl.isContextLost())return;fences.push(gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE,0));gl.flush();}catch(e){gl=null;fences=[];}};
     /* Display-time grid (VSync off): the game gets the predicted display time as its frame timestamp, so the frame that is shown carries the world at an evenly spaced time whatever moment it was drawn. Raw rAF tick times jitter by about a millisecond while the display cadence does not, so the ticks steer a slow phase-locked grid (5% correction per tick) that resyncs after a stall. */
     let dispGrid=0,dispT=0,dispReady=false,lastTs=0,dispI=0,tickPrev=0;
@@ -581,8 +591,27 @@
     onMove: fn => subscribe(moves, fn),
     onCaptureChange: fn => subscribe(states, fn)
   });
+  /* Steam sign-in in the real browser; the host polls the server for the result and loads it in this view (see SteamClaim). */
+  const steamFailed=new Set(),steamAlphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+  async function openSteam(options){
+    const link=!!(options&&options.link);
+    const code=Array.from(crypto.getRandomValues(new Uint8Array(48)),b=>steamAlphabet[b&63]).join('');
+    let url;
+    if(link){
+      const res=await fetch('/auth/steam/link',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Qrazy-Auth':'1'},body:JSON.stringify({client:code})});
+      if(!res.ok)throw new Error('Steam link request failed ('+res.status+')');
+      const body=await res.json();
+      if(!body||typeof body.url!=='string')throw new Error('Steam link request failed');
+      url=new URL(body.url,location.origin).href;
+    }else url=location.origin+'/auth/steam/start?client='+code+'&remember=1';
+    await rpc('steam-start',{code,url});
+  }
   Object.defineProperty(window, 'qrazyDesktop', { configurable: false, writable: false, value: Object.freeze({
     version: 1, prototype: true,
+    steamLogin: true,
+    openSteam,
+    cancelSteam: () => rpc('steam-cancel').then(() => undefined),
+    onSteamFailed: fn => subscribe(steamFailed, fn),
     windowMode: nativeWindow ? 'native' : 'offscreen',
     ...(nativeWindow ? {} : { rawMouseCapability: Object.freeze({ supported: null, backend: 'sdl3-wayland', reason: 'Compositor capture and hardware behaviour require manual verification; capture() reports the SDL request result.' }),
     rawMouse }),
@@ -593,6 +622,7 @@
     status: Object.freeze({ version: 1, report: reportStatus }),
     vsync: Object.freeze(vsync),
     maxFps: Object.freeze(maxFps),
+    pacingDump: () => (window.__qrazyPacingDump?window.__qrazyPacingDump():'not available'), // local debug text for the game console; nothing is sent anywhere
     presentation: Object.freeze({version:1,getState:async()=>({...presentationState}),onChange:fn=>subscribe(presentationListeners,fn)}),
     graphics: Object.freeze({ getState: async () => (await rpc('diagnostics')).data }),
     config: Object.freeze({ version: 1, importFile: async () => (await rpc('config-import')).data, exportFile: async (name, text) => (await rpc('config-export', {name,text})).data }),
@@ -656,6 +686,7 @@
       window.dispatchEvent(new Event(message.focused ? 'focus' : 'blur'));
     } else if (message.type === 'escape') { if (document.pointerLockElement) document.exitPointerLock(); }
     else if (message.type === 'fullscreen') emit(fullscreen, message.value);
+    else if (message.type === 'steam-failed') emit(steamFailed, message.reason);
     else if (message.type === 'button') {
       // CEF's native click API covers only three buttons. The existing game accepts
       // document mouse events for side buttons; these events are deliberately synthetic.
