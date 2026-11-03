@@ -42,6 +42,27 @@
 #include "server_retry.h"
 #include "client_destination.h"
 
+#ifdef QRAZY_TRUE_CLIENT
+/* Dev-only "true client" (CMake QRAZY_TRUE_CLIENT_DIR, only with CLIENT_MODE dev): a Vulkan renderer owns the window's swapchain and runs on its own thread; F2 hides the CEF child to show it. Defined in the renderer's source. */
+void tc_start(HWND hwnd,const char* cmdline);void tc_set_visible(bool visible);void tc_stop();void tc_push_state(const uint8_t* data,size_t size);
+static bool tc_synth_flag=false;static std::atomic<bool> tc_view_on{false}; /* F2 view active; the synthetic page script only takes pointer lock / moves its camera while this is true, so the game's menus stay usable */ /* dev test: the browser process runs a small page script that sends synthetic game state through qrazyFrame() */
+static const char* const kTcSynthJs=R"JS((()=>{if(window.__qtcSynth||typeof qrazyFrame!=='function')return;window.__qtcSynth=true;const b=new ArrayBuffer(1136),dv=new DataView(b),t0=performance.now(),enc=new TextEncoder();let f=0,last=t0;
+const chat=enc.encode('^2Synthetic sender^7: WASD moves, click then move the mouse to look (Esc releases), Shift = fast\n^3Page^7: the camera below is driven by input that reached THIS page');
+const keys=new Set();let yaw=100,pitch=0,px=1824,py=804,pz=6092;
+addEventListener('keydown',e=>{keys.add(e.code);},true);addEventListener('keyup',e=>{keys.delete(e.code);},true);window.addEventListener('blur',()=>keys.clear());
+addEventListener('mousedown',()=>{if(window.__qtcOn&&!document.pointerLockElement&&document.documentElement.requestPointerLock)document.documentElement.requestPointerLock();},true);
+addEventListener('mousemove',e=>{if(window.__qtcOn&&document.pointerLockElement){yaw-=e.movementX*0.1;pitch=Math.max(-89,Math.min(89,pitch-e.movementY*0.1));}},true);
+const pump=()=>{const now=performance.now(),dt=Math.min(0.1,(now-last)/1000),t=(now-t0)/1000;last=now;
+const sp=(keys.has('ShiftLeft')?900:300)*dt,r=Math.PI/180,fx=Math.cos(yaw*r),fz=-Math.sin(yaw*r),rx=Math.sin(yaw*r),rz=Math.cos(yaw*r);
+if(keys.has('KeyW')){px+=fx*sp;pz+=fz*sp;}if(keys.has('KeyS')){px-=fx*sp;pz-=fz*sp;}if(keys.has('KeyD')){px+=rx*sp;pz+=rz*sp;}if(keys.has('KeyA')){px-=rx*sp;pz-=rz*sp;}if(keys.has('Space'))py+=sp;if(keys.has('ControlLeft'))py-=sp;
+dv.setUint32(0,0x31435451,true);dv.setUint32(4,1,true);dv.setUint32(8,1136,true);dv.setBigUint64(16,BigInt(f++),true);dv.setFloat64(24,t,true);
+dv.setFloat64(32,px,true);dv.setFloat64(40,py,true);dv.setFloat64(48,pz,true);dv.setFloat64(56,yaw,true);dv.setFloat64(64,pitch,true);dv.setFloat64(72,100,true);
+dv.setInt32(80,Math.max(1,100-((t*3)|0)%90),true);dv.setInt32(84,50,true);dv.setInt32(88,25,true);dv.setInt32(92,((t*1000)|0)+83456,true);dv.setInt32(96,(640+300*Math.sin(t))|0,true);dv.setInt32(100,4,true);
+dv.setUint32(104,chat.length,true);new Uint8Array(b,112,chat.length).set(chat);qrazyFrame(b);requestAnimationFrame(pump);};pump();})();)JS";
+#define TC_OR ||tc_on
+#else
+#define TC_OR
+#endif
 namespace {
 constexpr auto& kOrigin=QrazyDestination::Origin;
 constexpr auto& kProfile=QrazyDestination::Profile;
@@ -564,6 +585,9 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     if(main&&loading&&!recovering)SDL_SetWindowTitle(window,"Qrazy - connecting");}
   void OnLoadEnd(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,int code) override {
     const bool main=frame->IsMain(),trusted=Trusted(frame->GetURL());
+#ifdef QRAZY_TRUE_CLIENT
+    if(main&&trusted&&tc_synth_flag)frame->ExecuteJavaScript(std::string(tc_view_on?"window.__qtcOn=true;":"window.__qtcOn=false;")+kTcSynthJs,"qrazy-tc-synth",0);
+#endif
     if(ToMain([self=CefRefPtr<Client>(this),main,trusted,code]{self->LoadEnded(main,trusted,code);}))return;
     LoadEnded(main,trusted,code);
   }
@@ -594,6 +618,12 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   void OnPopupSize(CefRefPtr<CefBrowser>,const CefRect& rect) override{if(rect.width!=popup_rect.width||rect.height!=popup_rect.height)popup_ready=false;popup_rect=rect;dirty=true;}
   void FullscreenState(){auto data=Dict();data->SetString("type","fullscreen");data->SetBool("value",!!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN));Send(data);}
   bool OnProcessMessageReceived(CefRefPtr<CefBrowser> b,CefRefPtr<CefFrame> frame,CefProcessId source,CefRefPtr<CefProcessMessage> msg) override {
+#ifdef QRAZY_TRUE_CLIENT
+    if(msg->GetName()=="qrazy-frame-v1"){   /* Stage 2: the page's game state (dev builds only); runs on CEF's thread, tc_push_state is thread safe */
+      if(source==PID_RENDERER&&frame->IsMain()&&Trusted(frame->GetURL())){auto a=msg->GetArgumentList();if(a->GetSize()==1&&a->GetType(0)==VTYPE_BINARY){auto bin=a->GetBinary(0);std::vector<uint8_t> buf(bin->GetSize());if(!buf.empty()&&bin->GetData(buf.data(),buf.size(),0)==buf.size())tc_push_state(buf.data(),buf.size());}}
+      return true;
+    }
+#endif
     if(msg->GetName()!="qrazy-command-v1")return false;
     CefRefPtr<CefBrowser> current=mt_loop?ui_browser:browser; /* this callback runs on CEF's UI thread: use that thread's handle */
     if(source!=PID_RENDERER||!current||b->GetIdentifier()!=current->GetIdentifier()||!frame->IsMain()||
@@ -805,11 +835,17 @@ int Run(HINSTANCE instance,void* sandbox) {
       GetSystemMetrics(size==ICON_SMALL?SM_CYSMICON:SM_CYICON),LR_SHARED);
     if(icon)SendMessageW(hwnd,WM_SETICON,size,reinterpret_cast<LPARAM>(icon));
   }
+#ifdef QRAZY_TRUE_CLIENT
+  /* no SDL renderer: its D3D11 swapchain would occupy the window that Vulkan presents to */
+  if((render_rate=RefreshRate())==0){SDL_DestroyWindow(window);SDL_Quit();return 3;}
+  ID3D11Device* device=nullptr;
+#else
   renderer=SDL_CreateRenderer(window,"direct3d11");
   int vsync=0;
   if(!renderer||!SDL_SetRenderVSync(renderer,render_preferences.vsync?1:0)||!SDL_GetRenderVSync(renderer,&vsync)||vsync!=(render_preferences.vsync?1:0)||(render_rate=RefreshRate())==0){SDL_DestroyRenderer(renderer);SDL_DestroyWindow(window);SDL_Quit();return 3;}
   auto device=static_cast<ID3D11Device*>(SDL_GetPointerProperty(SDL_GetRendererProperties(renderer),SDL_PROP_RENDERER_D3D11_DEVICE_POINTER,nullptr));
   if(!device)return 3;
+#endif
   CefSettings settings;settings.windowless_rendering_enabled=true;settings.no_sandbox=false;settings.command_line_args_disabled=true;settings.multi_threaded_message_loop=mt_loop;
   settings.persist_session_cookies=false;
   settings.log_severity=LOGSEVERITY_WARNING;
@@ -830,6 +866,10 @@ int Run(HINSTANCE instance,void* sandbox) {
   }
   if(QRAZY_DEV_MODE)client_title+=" [DEV localhost:5173]";
   SDL_SetWindowTitle(window,client_title.c_str());
+#ifdef QRAZY_TRUE_CLIENT
+  bool tc_started=false,tc_on=false,tc_applied=false;
+  {std::ifstream in(base/"true-client.cmdline");std::string line;if(in&&std::getline(in,line)&&!line.empty()){tc_start(hwnd,line.c_str());tc_started=true;tc_synth_flag=line.find("--synth")!=std::string::npos;}}
+#endif
   int result=0;
   {
     auto request_context=CefRequestContext::GetGlobalContext();
@@ -873,7 +913,7 @@ int Run(HINSTANCE instance,void* sandbox) {
       if(!frame_clock.UpdateDisplay(hwnd)){client->fatal=true;closing=true;return;}
       int rate=RefreshRate();if(rate&&rate!=render_rate){render_rate=rate;if(client->browser)client->browser->GetHost()->SetWindowlessFrameRate(render_preferences.CefTarget(rate));}
     };
-    auto render_frame=[&](){client->dirty=false;SDL_SetRenderDrawColor(renderer,6,12,22,255);SDL_RenderClear(renderer);
+    auto render_frame=[&](){if(!renderer)return;client->dirty=false;SDL_SetRenderDrawColor(renderer,6,12,22,255);SDL_RenderClear(renderer);
         if(client->loading||client->recovering){
           SDL_SetRenderScale(renderer,2,2);SDL_SetRenderDrawColor(renderer,251,191,36,255);
           SDL_RenderDebugText(renderer,20,35,client->server_retry.expired?"Still can't reach the server.":client->server_retry.active?"The Qrazy server is waking up.":client->recovering?"Connection failed - R to retry":"Connecting to game - please wait");
@@ -968,8 +1008,19 @@ int Run(HINSTANCE instance,void* sandbox) {
       if(native_window&&close_sent&&!closed&&SDL_GetTicksNS()-close_sent_ns>5000000000ull){std::fprintf(stderr,"PROTOTYPE native browser did not close in 5 s; exiting\n");closed=true;} /* last resort so a stuck windowed close cannot leave a window that ignores input */
       if(native_window&&client->browser) {
         /* Cards are drawn by SDL under the CEF child, so the child is hidden only while one is showing (recovery or server retry). Ordinary loading keeps the page visible and running. */
+#ifdef QRAZY_TRUE_CLIENT
+        {static bool f2=false;const bool down=Focused()&&(GetAsyncKeyState(VK_F2)&0x8000)!=0;if(down&&!f2&&tc_started){tc_on=!tc_on;tc_view_on=tc_on;tc_set_visible(tc_on);client->Host([on=tc_on](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(on?"window.__qtcOn=true":"window.__qtcOn=false","qrazy-tc-view",0);});}f2=down;} /* F2: native view <-> menus */
+#endif
         const bool card=client->recovering||client->server_retry.active;
         HWND child=mt_loop?client->child_hwnd.load():client->browser->GetHost()->GetWindowHandle(); /* mt_loop: the handle CEF's UI thread stored; the window itself belongs to that thread, so it is only touched there */
+#ifdef QRAZY_TRUE_CLIENT
+        /* F2 view: the CEF child stays shown, enabled and focused (every key and mouse event, pointer lock included, reaches the page natively) but is made a layered window with alpha 1/255, so the Vulkan view underneath shows through. */
+        if(child&&tc_started&&tc_on!=tc_applied){
+          tc_applied=tc_on;const bool on=tc_on;
+          OnUi([child,on]{const LONG ex=GetWindowLongW(child,GWL_EXSTYLE);if(on){SetWindowLongW(child,GWL_EXSTYLE,ex|WS_EX_LAYERED);SetLayeredWindowAttributes(child,0,1,LWA_ALPHA);}else{SetLayeredWindowAttributes(child,0,255,LWA_ALPHA);SetWindowLongW(child,GWL_EXSTYLE,ex&~WS_EX_LAYERED);}RedrawWindow(child,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_UPDATENOW);});
+          const bool focused=Focused();client->Host([focused](CefRefPtr<CefBrowserHost> host){host->SetFocus(focused);});
+        }
+#endif
         if(child&&card!=child_hidden) {
           child_hidden=card;OnUi([child,card]{ShowWindow(child,card?SW_HIDE:SW_SHOW);});
           if(card){SetFocus(hwnd);client->dirty=true;}else{client->ResizeChild(true);const bool focused=Focused();client->Host([focused](CefRefPtr<CefBrowserHost> host){host->SetFocus(focused);});}
@@ -996,7 +1047,10 @@ int Run(HINSTANCE instance,void* sandbox) {
     if(!result){CefRefPtr<CookieFlushed> flushed=new CookieFlushed;bool requested=CefCookieManager::GetGlobalManager(nullptr)->FlushStore(flushed);auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);while(requested&&!flushed->done&&std::chrono::steady_clock::now()<deadline){if(!mt_loop)CefDoMessageLoopWork();else SDL_PumpEvents();SDL_Delay(1);}std::fprintf(stderr,"PROTOTYPE cookie flush completed=%d\n",static_cast<int>(flushed->done.load()));if(!requested||!flushed->done)result=7;}
   }
   if(gesture_hook)UnhookWindowsHookEx(gesture_hook);
-  NetDiag::Stop();updater_worker.Stop();asset_worker.Stop();CefShutdown();app=nullptr;SDL_DestroyRenderer(renderer);SDL_DestroyWindow(window);SDL_Quit();return !result&&install_requested?Production::InstallExit:result;
+  #ifdef QRAZY_TRUE_CLIENT
+  if(tc_started)tc_stop();
+#endif
+  NetDiag::Stop();updater_worker.Stop();asset_worker.Stop();CefShutdown();app=nullptr;if(renderer)SDL_DestroyRenderer(renderer);SDL_DestroyWindow(window);SDL_Quit();return !result&&install_requested?Production::InstallExit:result;
 }
 } // namespace
 CEF_BOOTSTRAP_EXPORT int RunWinMain(HINSTANCE instance,LPWSTR,int,void* sandbox,cef_version_info_t*){return Run(instance,sandbox);}

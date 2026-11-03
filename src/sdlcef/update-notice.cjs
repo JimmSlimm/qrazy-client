@@ -23,7 +23,7 @@ async function check(root){
   if(fs.existsSync(runtime.work)){try{return runtime.ready(runtime.staged());}catch{/* Never remove staged files during discovery. */}}
   const context={policy:runtime.policy,key:runtime.key,transport:runtime.transport,state:()=>runtime.state()};
   return await (async function(){
-    const assetName='Qrazy-SDLCEF-'+this.policy.platform+'-stable.json';let candidate=null,notice=null,noticeSeen=false;
+    const assetName='Qrazy-SDLCEF-'+this.policy.platform+'-stable-v2.json';let candidate=null,notice=null,noticeSeen=false;
     for(let page=1;page<=5&&!candidate;++page) {
       const raw=await this.transport('https://api.github.com/repos/JimmSlimm/qrazy-client/releases?per_page=100&page='+page,3*1024**2,null,null,'api');
       const rows=JSON.parse(raw);if(!Array.isArray(rows))throw Error('Invalid release discovery response');

@@ -57,6 +57,23 @@ class Native final : public CefV8Handler {
   IMPLEMENT_REFCOUNTING(Native);
 };
 
+#ifdef QRAZY_TRUE_CLIENT
+/* Dev-only (true client, Stage 2): qrazyFrame(ArrayBuffer) hands the page's game state to the browser process, where the native renderer reads it. One argument, at most 8 KB, trusted main frame only. */
+class FrameSink final : public CefV8Handler {
+ public:
+  bool Execute(const CefString&, CefRefPtr<CefV8Value>, const CefV8ValueList& args, CefRefPtr<CefV8Value>& value, CefString& exception) override {
+    auto context = CefV8Context::GetCurrentContext(); auto frame = context ? context->GetFrame() : nullptr;
+    if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 1 || !args[0]->IsArrayBuffer()) { exception = "Unauthorized frame sink call"; return true; }
+    const size_t n = args[0]->GetArrayBufferByteLength(); void* data = args[0]->GetArrayBufferData();
+    if (!data || n == 0 || n > 8192) { exception = "Bad frame size"; return true; }
+    auto message = CefProcessMessage::Create("qrazy-frame-v1"); message->GetArgumentList()->SetBinary(0, CefBinaryValue::Create(data, n));
+    frame->SendProcessMessage(PID_BROWSER, message); value = CefV8Value::CreateUndefined(); return true;
+  }
+ private:
+  IMPLEMENT_REFCOUNTING(FrameSink);
+};
+#endif
+
 class App final : public CefApp, public CefRenderProcessHandler {
   struct Binding { CefRefPtr<CefV8Context> context; CefRefPtr<CefV8Value> dispatch; };
   std::map<int, Binding> bindings;
@@ -89,6 +106,9 @@ class App final : public CefApp, public CefRenderProcessHandler {
   void OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) override {
     if (!frame->IsMain() || !Trusted(frame->GetURL())) return;
     auto native = CefV8Value::CreateFunction("qrazyNative", new Native);
+#ifdef QRAZY_TRUE_CLIENT
+    context->GetGlobal()->SetValue("qrazyFrame", CefV8Value::CreateFunction("qrazyFrame", new FrameSink), V8_PROPERTY_ATTRIBUTE_READONLY);
+#endif
     // Temporary bootstrap slot; removed before any website script runs. Dispatcher stays private.
     context->GetGlobal()->SetValue("__qrazyBootstrap", native, V8_PROPERTY_ATTRIBUTE_NONE);
     // Temporary mode flag, read synchronously by the bridge and removed together with the bootstrap slot.

@@ -49,16 +49,16 @@
     };
     add(box, 'div', data.map || 'No current map', 'font-size:28px;font-weight:800;color:#fbbf24;overflow-wrap:anywhere');
     add(box, 'div', `${data.mode || '\u2014'} - Physics: ${data.physics || '\u2014'} - Mode: ${data.category || '\u2014'} - Session: ${data.sessionTime || '\u2014'}${data.mapTime ? ` - Map: ${data.mapTime}` : ''}`, 'color:#c3cfdf;margin:4px 0 18px');
-    const records = add(box, 'div', '', 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px');
-    const boards = data.profileRecords.length ? data.profileRecords : ['pql','vql'].flatMap(physics => ['w','s'].map(category => ({physics, category})));
+    const records = add(box, 'div', '', 'display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-bottom:18px');
+    const boards = data.profileRecords.length ? data.profileRecords : ['pql','vql'].flatMap(physics => ['w','s','h'].map(category => ({physics, category})));
     for (const board of boards) {
       const {physics, category} = board;
       const profile = data.profileRecords.length > 0;
       const record = profile ? board : data.records.find(r => r.physics === physics && r.category === category);
       const selection = profile ? data.activeProfileRecord : data.activeRecord;
       const active = profile ? selection?.profileId === board.profileId : selection?.physics === physics && selection?.category === category;
-      const title = profile ? board.label : `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : 'STRAFE'}`;
-      const card = add(records, 'div', '', `background:${active ? '#1d2535' : '#152238'};border:2px solid ${active ? '#8a7a45' : 'transparent'};border-radius:6px;padding:10px 12px;min-width:0;display:flex;flex-direction:column;align-items:flex-start`);
+      const title = profile ? board.label : `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : category === 'h' ? 'HOOK' : 'STRAFE'}`;
+      const card = add(records, 'div', '', `background:${active ? '#1d2535' : '#152238'};border:2px solid ${active ? '#8a7a45' : 'transparent'};border-radius:6px;padding:8px 9px;min-width:0;display:flex;flex-direction:column;align-items:flex-start`);
       if (active) {
         const label = selection.source === 'pov' ? 'WATCHING' : 'YOU';
         card.setAttribute('aria-label', `${title} world record \u2014 ${label}`);
@@ -132,6 +132,7 @@
     layoutVersion: 3,
     supportsProfileRecords: true,
     supportsPlayerNumbers: true,
+    supportsHookBoards: true,
     report(value) {
       const states = ['loading', 'ready', 'unavailable', 'disconnected'];
       if (!value || !states.includes(value.leaderboard?.state) || !states.includes(value.multiplayer?.state) ||
@@ -158,16 +159,16 @@
         if (count > 64) throw new TypeError('Roster exceeds 64 players');
         spectators = value.multiplayer.spectators.map(player);
       }
-      if (value.records !== undefined && (!Array.isArray(value.records) || value.records.length > 4)) throw new TypeError('Invalid records');
+      if (value.records !== undefined && (!Array.isArray(value.records) || value.records.length > 6)) throw new TypeError('Invalid records');
       const records = (value.records || []).map(r => {
-        if (!['pql','vql'].includes(r.physics) || !['w','s'].includes(r.category) || !states.includes(r.state)) throw new TypeError('Invalid record board');
+        if (!['pql','vql'].includes(r.physics) || !['w','s','h'].includes(r.category) || !states.includes(r.state)) throw new TypeError('Invalid record board');
         return {...clan(r), physics:r.physics, category:r.category, state:r.state, name:infoText(r.name, 96), coloredName:infoText(r.coloredName, 192), time:infoText(r.time, 48)};
       });
       if (value.profileRecords !== undefined && (!Array.isArray(value.profileRecords) || value.profileRecords.length > 1)) throw new TypeError('Invalid profile records');
       const profileRecords = (value.profileRecords || []).map(r => {
         if (!r || typeof r.profileId !== 'string' || !r.profileId.trim() || r.profileId.length > 96 ||
             typeof r.label !== 'string' || !r.label.trim() || r.label.length > 64 ||
-            !['pql','vql'].includes(r.physics) || !['w','s'].includes(r.category) ||
+            !['pql','vql'].includes(r.physics) || !['w','s','h'].includes(r.category) ||
             !['loading','ready','unavailable'].includes(r.state)) throw new TypeError('Invalid profile record board');
         return {...clan(r), profileId:r.profileId, label:r.label, physics:r.physics, category:r.category, state:r.state,
           name:infoText(r.name, 96), coloredName:infoText(r.coloredName, 192), time:infoText(r.time, 48)};
@@ -178,7 +179,7 @@
         ? {profileId:profileActive.profileId, source:profileActive.source} : null;
       // Only explicit game-owned POV context can select a board. Missing/invalid data clears it.
       const active = value.activeRecord;
-      const activeRecord = active && ['pql','vql'].includes(active.physics) && ['w','s'].includes(active.category) && ['self','pov'].includes(active.source)
+      const activeRecord = active && ['pql','vql'].includes(active.physics) && ['w','s','h'].includes(active.category) && ['self','pov'].includes(active.source)
         ? {physics: active.physics, category: active.category, source: active.source} : null;
       informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), mapTime: infoText(value.mapTime, 32),category: infoText(value.category, 32), activeRecord,
         groups, spectators, records, profileRecords, activeProfileRecord, legacy,
@@ -323,7 +324,11 @@
     const action=(label,fn)=>{const b=add('button',label);b.type='button';b.style.cssText='width:auto;margin:8px 12px 0 0;padding:10px 16px;font:16px system-ui;letter-spacing:normal';b.onclick=async event=>{event.preventDefault();event.stopPropagation();if(!event.isTrusted||b.disabled)return;b.disabled=true;try{await fn();}catch(error){add('p',error.message);}finally{b.disabled=false;}};return b;};
     // Plain text only; the message comes from the project's release description.
     if(message){
-      add('h3',message.title);add('pre',message.message).style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;font:inherit';
+      add('h3',message.title);const pre=add('pre','');pre.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;font:inherit';
+      // Any http(s) link in this release message is clickable and opens in the default browser.
+      for(const [i,part] of message.message.split(/(https?:\/\/[^\s<>"']+)/).entries()){
+        if(i%2){const a=document.createElement('a');a.textContent=part;a.href=part;a.target='_blank';a.rel='noopener noreferrer';a.style.color='#fbbf24';pre.append(a);}else pre.append(document.createTextNode(part));
+      }
     }
     if(showClient){
       add('h3','Client update · v'+state.version);
@@ -634,8 +639,7 @@
   if (nativeWindow) {
     const reportLock = () => { rpc('pointer-lock-state', { locked: !!document.pointerLockElement }).catch(() => {}); };
     /* Chromium refuses requestPointerLock without transient user activation (after alt-tab, long idle, programmatic re-lock). Have the host send a trusted unbound key first, for every request path. */
-    const nativeRequest = Element.prototype.requestPointerLock;
-    Element.prototype.requestPointerLock = function (...args) {
+    const nativeRequest = Element.prototype.requestPointerLock;    Element.prototype.requestPointerLock = function (...args) {
       /* Never lock while the window is in the background (e.g. spectating, the game enters free-spectate on a map change): Chromium would take focus to honor it. */
       if (!document.hasFocus()) { document.dispatchEvent(new Event('pointerlockerror')); return Promise.reject(new DOMException('Window is not focused', 'InvalidStateError')); }
       if (navigator.userActivation && navigator.userActivation.isActive) return nativeRequest.apply(this, args);

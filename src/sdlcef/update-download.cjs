@@ -89,7 +89,7 @@ async function update(root,options={}){
   const runtime=new Runtime(root,options),current=runtime.verified(runtime.current);
   if(fs.existsSync(runtime.journal))throw Error('Installation recovery required; close and reopen manually');
   if(fs.existsSync(runtime.work)){try{return runtime.ready(runtime.staged());}catch{runtime.remove(runtime.work);}}
-  let candidate=null;const assetName='Qrazy-SDLCEF-'+runtime.policy.platform+'-stable.json';
+  let candidate=null;const assetName='Qrazy-SDLCEF-'+runtime.policy.platform+'-stable-v2.json';
   for(let page=1;page<=5&&!candidate;page++){
     const rows=JSON.parse(await runtime.transport('https://api.github.com/repos/JimmSlimm/qrazy-client/releases?per_page=100&page='+page,3*1024**2,null,null,'api'));if(!Array.isArray(rows))throw Error('Invalid release discovery');
     for(const row of rows){

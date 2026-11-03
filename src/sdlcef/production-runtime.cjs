@@ -142,7 +142,7 @@ class Runtime {
     if(fs.existsSync(this.work)) {
       try{const staged=this.staged();return this.ready(staged);}catch{this.remove(this.work);}
     }
-    const assetName='Qrazy-SDLCEF-'+this.policy.platform+'-stable.json';let candidate=null;
+    const assetName='Qrazy-SDLCEF-'+this.policy.platform+'-stable-v2.json';let candidate=null;
     for(let page=1;page<=5&&!candidate;++page) {
       const raw=await this.transport('https://api.github.com/repos/JimmSlimm/qrazy-client/releases?per_page=100&page='+page,3*1024**2,null,null,'api');
       const rows=JSON.parse(raw);if(!Array.isArray(rows))throw Error('Invalid release discovery response');

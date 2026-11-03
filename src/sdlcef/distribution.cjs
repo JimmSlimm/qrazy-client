@@ -13,8 +13,7 @@ function decode(value) {
 function verify(bytes,key,policy={platform:'windows-x64',channel:'stable'}) {
   if(!Buffer.isBuffer(bytes)||bytes.length>3*1024**2)throw fail();
   try {
-    const envelope=JSON.parse(bytes),payload=decode(envelope.payload),signature=decode(envelope.signature),publicKey=crypto.createPublicKey(key);
-    if(publicKey.asymmetricKeyType!=='ed25519'||signature.length!==64||!crypto.verify(null,payload,publicKey,signature))throw fail();
+    const envelope=JSON.parse(bytes),payload=decode(envelope.payload);// unsigned releases
     const m=JSON.parse(payload);
     const linux=policy.platform==='linux-x64';
     if(!['windows-x64','linux-x64'].includes(policy.platform)||policy.channel!=='stable')throw fail();

@@ -47,16 +47,16 @@
     };
     add(box, 'div', data.map || 'No current map', 'font-size:28px;font-weight:800;color:#fbbf24;overflow-wrap:anywhere');
     add(box, 'div', `${data.mode || '\u2014'} - Physics: ${data.physics || '\u2014'} - Mode: ${data.category || '\u2014'} - Session: ${data.sessionTime || '\u2014'}${data.mapTime ? ` - Map: ${data.mapTime}` : ''}`, 'color:#c3cfdf;margin:4px 0 18px');
-    const records = add(box, 'div', '', 'display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px');
-    const boards = data.profileRecords.length ? data.profileRecords : ['pql','vql'].flatMap(physics => ['w','s'].map(category => ({physics, category})));
+    const records = add(box, 'div', '', 'display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-bottom:18px');
+    const boards = data.profileRecords.length ? data.profileRecords : ['pql','vql'].flatMap(physics => ['w','s','h'].map(category => ({physics, category})));
     for (const board of boards) {
       const {physics, category} = board;
       const profile = data.profileRecords.length > 0;
       const record = profile ? board : data.records.find(r => r.physics === physics && r.category === category);
       const selection = profile ? data.activeProfileRecord : data.activeRecord;
       const active = profile ? selection?.profileId === board.profileId : selection?.physics === physics && selection?.category === category;
-      const title = profile ? board.label : `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : 'STRAFE'}`;
-      const card = add(records, 'div', '', `background:${active ? '#1d2535' : '#152238'};border:2px solid ${active ? '#8a7a45' : 'transparent'};border-radius:6px;padding:10px 12px;min-width:0;display:flex;flex-direction:column;align-items:flex-start`);
+      const title = profile ? board.label : `${physics.toUpperCase()} ${category === 'w' ? 'WEAPONS' : category === 'h' ? 'HOOK' : 'STRAFE'}`;
+      const card = add(records, 'div', '', `background:${active ? '#1d2535' : '#152238'};border:2px solid ${active ? '#8a7a45' : 'transparent'};border-radius:6px;padding:8px 9px;min-width:0;display:flex;flex-direction:column;align-items:flex-start`);
       if (active) {
         const label = selection.source === 'pov' ? 'WATCHING' : 'YOU';
         card.setAttribute('aria-label', `${title} world record \u2014 ${label}`);
@@ -130,6 +130,7 @@
     layoutVersion: 3,
     supportsProfileRecords: true,
     supportsPlayerNumbers: true,
+    supportsHookBoards: true,
     report(value) {
       const states = ['loading', 'ready', 'unavailable', 'disconnected'];
       if (!value || !states.includes(value.leaderboard?.state) || !states.includes(value.multiplayer?.state) ||
@@ -156,16 +157,16 @@
         if (count > 64) throw new TypeError('Roster exceeds 64 players');
         spectators = value.multiplayer.spectators.map(player);
       }
-      if (value.records !== undefined && (!Array.isArray(value.records) || value.records.length > 4)) throw new TypeError('Invalid records');
+      if (value.records !== undefined && (!Array.isArray(value.records) || value.records.length > 6)) throw new TypeError('Invalid records');
       const records = (value.records || []).map(r => {
-        if (!['pql','vql'].includes(r.physics) || !['w','s'].includes(r.category) || !states.includes(r.state)) throw new TypeError('Invalid record board');
+        if (!['pql','vql'].includes(r.physics) || !['w','s','h'].includes(r.category) || !states.includes(r.state)) throw new TypeError('Invalid record board');
         return {...clan(r), physics:r.physics, category:r.category, state:r.state, name:infoText(r.name, 96), coloredName:infoText(r.coloredName, 192), time:infoText(r.time, 48)};
       });
       if (value.profileRecords !== undefined && (!Array.isArray(value.profileRecords) || value.profileRecords.length > 1)) throw new TypeError('Invalid profile records');
       const profileRecords = (value.profileRecords || []).map(r => {
         if (!r || typeof r.profileId !== 'string' || !r.profileId.trim() || r.profileId.length > 96 ||
             typeof r.label !== 'string' || !r.label.trim() || r.label.length > 64 ||
-            !['pql','vql'].includes(r.physics) || !['w','s'].includes(r.category) ||
+            !['pql','vql'].includes(r.physics) || !['w','s','h'].includes(r.category) ||
             !['loading','ready','unavailable'].includes(r.state)) throw new TypeError('Invalid profile record board');
         return {...clan(r), profileId:r.profileId, label:r.label, physics:r.physics, category:r.category, state:r.state,
           name:infoText(r.name, 96), coloredName:infoText(r.coloredName, 192), time:infoText(r.time, 48)};
@@ -176,7 +177,7 @@
         ? {profileId:profileActive.profileId, source:profileActive.source} : null;
       // Only explicit game-owned POV context can select a board. Missing/invalid data clears it.
       const active = value.activeRecord;
-      const activeRecord = active && ['pql','vql'].includes(active.physics) && ['w','s'].includes(active.category) && ['self','pov'].includes(active.source)
+      const activeRecord = active && ['pql','vql'].includes(active.physics) && ['w','s','h'].includes(active.category) && ['self','pov'].includes(active.source)
         ? {physics: active.physics, category: active.category, source: active.source} : null;
       informationSnapshot = {map: infoText(value.map), mode: infoText(value.mode, 32), physics: infoText(value.physics, 32), sessionTime: infoText(value.sessionTime, 32), mapTime: infoText(value.mapTime, 32),category: infoText(value.category, 32), activeRecord,
         groups, spectators, records, profileRecords, activeProfileRecord, legacy,
@@ -293,12 +294,18 @@
   });
 
 
-  let clientNoticeState=null, clientNoticeDismissed='', clientCheckBusy=false, clientCheckTime=0;
+  let clientNoticeState=null, clientNoticeDismissed='', clientCheckBusy=false, clientCheckTime=0, clientMessage=null;
+  const clientMessageKey='qrazy-client-message-seen', clientMessageDismissedNow=new Set();
+  function clientMessageSeen(id){
+    if(clientMessageDismissedNow.has(id))return true;
+    try{return localStorage.getItem(clientMessageKey)===id;}catch{return false;}
+  }
+  function clientMessageDismiss(id){clientMessageDismissedNow.add(id);try{localStorage.setItem(clientMessageKey,id);}catch{}}
   async function checkClientNotice() {
     const menu=document.getElementById('overlay');
     if(!menu||!menu.getClientRects().length||document.visibilityState==='hidden'||!document.hasFocus()||clientCheckBusy||Date.now()-clientCheckTime<5*60*1000)return;
     clientCheckBusy=true;
-    try { const reply=await rpc('update-notice');if(reply.ok&&reply.data){clientCheckTime=Date.now();clientNoticeState=reply.data;renderClientNotice();} }
+    try { const reply=await rpc('update-notice');if(reply.ok&&reply.data){clientCheckTime=Date.now();clientNoticeState=reply.data;clientMessage=reply.data.notice||null;renderClientNotice();} }
     catch { /* Offline checks stay quiet; the manual check remains available. */ }
     finally { clientCheckBusy=false; }
   }
@@ -306,12 +313,20 @@
     const menu=document.getElementById('overlay');
     document.getElementById('qrazy-client-update-notice')?.remove();
     const state=clientNoticeState,clientAvailable=state&&['available','ready'].includes(state.phase),showClient=clientAvailable&&clientNoticeDismissed!==state.version,showGame=siteOutdated&&!siteDismissed;
-    if(!menu||(!showClient&&!showGame))return;
+    const message=clientMessage&&!clientMessageSeen(clientMessage.id)?clientMessage:null;
+    if(!menu||(!showClient&&!showGame&&!message))return;
     const box=document.createElement('section');box.id='qrazy-client-update-notice';box.setAttribute('role','status');
     box.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(560px,calc(100% - 64px));max-height:75vh;overflow:auto;z-index:2147483646;background:#0b1424;color:#edf2fa;border:2px solid #fbbf24;border-radius:12px;padding:24px;font:16px/1.5 system-ui;box-shadow:0 12px 60px #000c';
     const add=(tag,text)=>{const el=document.createElement(tag);el.textContent=text;box.append(el);return el;};
-    add('h2','Updates available').style.cssText='color:#fbbf24;margin-top:0';
+    add('h2',showClient||showGame?'Updates available':'Message from Qrazy').style.cssText='color:#fbbf24;margin-top:0';
     const action=(label,fn)=>{const b=add('button',label);b.type='button';b.style.cssText='width:auto;margin:8px 12px 0 0;padding:10px 16px;font:16px system-ui;letter-spacing:normal';b.onclick=async event=>{event.preventDefault();event.stopPropagation();if(!event.isTrusted||b.disabled)return;b.disabled=true;try{await fn();}catch(error){add('p',error.message);}finally{b.disabled=false;}};return b;};
+    if(message){
+      add('h3',message.title);const pre=add('pre','');pre.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;font:inherit';
+      // Any http(s) link in this release message is clickable and opens in the default browser.
+      for(const [i,part] of message.message.split(/(https?:\/\/[^\s<>"']+)/).entries()){
+        if(i%2){const a=document.createElement('a');a.textContent=part;a.href=part;a.target='_blank';a.rel='noopener noreferrer';a.style.color='#fbbf24';pre.append(a);}else pre.append(document.createTextNode(part));
+      }
+    }
     if(showClient){
       add('h3','Client update · v'+state.version);
       add('p','Installed: v'+state.installedVersion+'. Installing closes Qrazy. Reopen it manually afterward; the game will then load the latest site.');
@@ -325,7 +340,7 @@
       add('h3','Game update');add('p','Refreshing ends the current run and reconnects multiplayer. Until refreshed, some features may not work and runs may be rejected.');
       action(showClient?'Refresh game only':'Refresh game',()=>updates.refreshGame());
     }
-    action('Later',()=>{if(showClient)clientNoticeDismissed=state.version;if(showGame)siteDismissed=true;renderSiteUpdate();});
+    action(message&&!showClient&&!showGame?'OK':'Later',()=>{if(showClient)clientNoticeDismissed=state.version;if(showGame)siteDismissed=true;if(message)clientMessageDismiss(message.id);renderSiteUpdate();});
     menu.append(box);
   }
 
