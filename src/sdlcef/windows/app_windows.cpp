@@ -1,6 +1,7 @@
 // Windows host implementation in progress. No game/input/physics implementation.
 #include <cctype>
 #include <windows.h>
+#include <shellapi.h>
 #include <intrin.h>
 #include <psapi.h>
 #include <dxgi1_4.h>
@@ -41,10 +42,109 @@
 #include "handoff_startup.h"
 #include "server_retry.h"
 #include "client_destination.h"
+#include "../date_binding.h"
+#include "date_format.h"
 
-#ifdef QRAZY_TRUE_CLIENT
+#ifdef QRAZY_NATIVE_CLIENT
+#include "qrazy_core_api.h"   /* QC_INTERFACE_VERSION: names the core manifest on the site */
+#include "../native_hub.h"
+#endif
+#if defined(QRAZY_TRUE_CLIENT)||defined(QRAZY_NATIVE_CLIENT)
 /* Dev-only "true client" (CMake QRAZY_TRUE_CLIENT_DIR, only with CLIENT_MODE dev): a Vulkan renderer owns the window's swapchain and runs on its own thread; F2 hides the CEF child to show it. Defined in the renderer's source. */
 void tc_start(HWND hwnd,const char* cmdline);void tc_set_visible(bool visible);void tc_stop();void tc_push_state(const uint8_t* data,size_t size);
+#ifdef QRAZY_NATIVE_CLIENT
+/* Native client (dev builds, CMake QRAZY_NATIVE_CLIENT_DIR): the page tells the host when a match starts or ends (qrazyNativeMatch, bridge_binding.h); the host starts or stops the native view. The token never touches the command line. */
+void tc_set_frame_cap(int fps);
+bool tc_take_error(char* buf,size_t n);void tc_set_menu_request(void (*f)());static std::atomic<bool> native_menu_requested{false};static void NativeMenuRequest(){native_menu_requested=true;}
+void tc_core_prepare(const char* cacheDir,bool fetch,bool staging);void tc_core_wait();void tc_set_tab(void (*f)(bool));bool tc_get_pose(double* out14);bool tc_take_started();bool tc_hud_feed();bool tc_audio_feed();void tc_hud_ready();std::string tc_error_code();bool tc_take_pose_request();static std::string NativeMenuScript(){char b[400];double p[14];if(tc_get_pose(p))std::snprintf(b,sizeof b,"window.__qtcOn=false;window.dispatchEvent(new CustomEvent('qrazy-native-menu',{detail:{x:%.3f,y:%.3f,z:%.3f,yaw:%.6f,pitch:%.6f}}))",p[0],p[1],p[2],p[3],p[4]);else std::snprintf(b,sizeof b,"window.__qtcOn=false;window.dispatchEvent(new Event('qrazy-native-menu'))");return b;}   /* the Esc event carries where the player is: the page's menu background can look from there */
+void tc_set_sim_out(void (*f)(const char*));static std::mutex native_sim_mutex;static std::vector<std::string> native_sim;static void NativeSimOut(const char* json){std::lock_guard<std::mutex> lock(native_sim_mutex);if(native_sim.size()<64)native_sim.push_back(json);}   /* sim events for the page's HUD texts, queued from the render thread */
+void tc_log(const char* message);
+static void SendNativeShortcut(CefRefPtr<CefBrowserHost> host,bool tab,bool down){
+  const UINT vk=tab?VK_TAB:VK_ESCAPE;
+  const char* code=tab?"Tab":"Escape";
+  const bool shift=(GetAsyncKeyState(VK_SHIFT)&0x8000)!=0,ctrl=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0,alt=(GetAsyncKeyState(VK_MENU)&0x8000)!=0;
+  char js[900];std::snprintf(js,sizeof js,"(function(){const e=new KeyboardEvent('%s',{code:'%s',key:'Unidentified',keyCode:%u,which:%u,shiftKey:%s,ctrlKey:%s,altKey:%s,bubbles:true,cancelable:true,composed:true});const c=document.querySelector('#qconsole.open .qcon-input'),w=document.getElementById('chat-input-wrap'),t=c||(w&&!w.hidden?document.getElementById('chat-input'):null)||document.activeElement||document;if(t!==document&&t.focus&&document.activeElement!==t)t.focus();t.dispatchEvent(e);})()",down?"keydown":"keyup",code,static_cast<unsigned>(vk),static_cast<unsigned>(vk),shift?"true":"false",ctrl?"true":"false",alt?"true":"false");host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js,"qrazy-native-key",0);
+}
+void tc_board(const char* json);void tc_settings(const char* json);void tc_hud(const char* json);static std::atomic<int> native_tab_edge{0};static void NativeTab(bool down){native_tab_edge=down?1:2;}   /* Tab in the native view: the main loop passes it to the page, which reports the information board */
+#include "nc_hub.h"
+bool tc_hub_ready();
+void tc_hub_service();
+void tc_hub_shutdown();
+
+static std::mutex native_mutex;static std::vector<std::string> native_requests;   /* a queue: ops sent back to back (mode, setspawn) all arrive */static std::string native_running_cmd;   /* the command line of the running native match: an identical start while it runs is ignored */
+/* The native view draws into its own child window of the host window (never a see-through page window): the host creates it on the main thread, the native thread only makes a Vulkan surface on it. While it is shown the page's child window is hidden. */
+int tc_click(int x,int y,int* element,int* index,char* url,int cap);void tc_log_mouse(int kind,int x,int y,bool shift);void tc_log_wheel(double notches);
+static std::mutex native_click_mutex;static std::vector<std::pair<int,int>> native_clicks;   /* clicks on the native view's buttons, for the page: (element, index) */
+/* The one place that says how a click on a native element reaches the page: window.qrazyNativeClick({element,index}) for every element (map info 16: index -1 = Close; links are opened by the client itself, never sent; race panel 22 / race invite 23: index = button position in text order). */
+/* Element 1000 = the x of the open chat box / console: the page gets the synthetic Escape key (the same path as the keyboard), see the consumer of native_clicks. */
+static std::string NativeClickScript(int element,int index){return "window.qrazyNativeClick&&window.qrazyNativeClick({element:"+std::to_string(element)+",index:"+std::to_string(index)+"})";}
+void tc_sim_op(const char* json);   /* an op of the page for the running sim: respawn, mode, cmd, giveitem, stat, removepowerups, pose (the raw JSON) */
+bool tc_typing();   /* a chat / console box is open */
+void tc_set_js_out(void (*f)(const char*));void tc_text_unit(unsigned unit);void tc_text_commit(const char* utf8);void tc_text_preedit(const char* utf8,unsigned a,unsigned b,unsigned c,unsigned d);bool tc_text_composing();bool tc_caret_rect(float* out4);
+static std::mutex native_js_mutex;static std::vector<std::string> native_js;static void NativeJsOut(const char* js){std::lock_guard<std::mutex> lock(native_js_mutex);if(native_js.size()<256)native_js.push_back(js);}   /* page messages of the core's text field (textState / textSubmit / textEscapeReleased), queued from the render thread, run in the hidden page by the main loop */
+#include <imm.h>
+#pragma comment(lib,"imm32.lib")
+static std::string WideToUtf8(const wchar_t* w,int n){if(n<=0)return std::string();const int len=WideCharToMultiByte(CP_UTF8,0,w,n,nullptr,0,nullptr,nullptr);std::string out(static_cast<size_t>(len),'\0');if(len>0)WideCharToMultiByte(CP_UTF8,0,w,n,&out[0],len,nullptr,nullptr);return out;}
+bool tc_cursor();   /* the mouse is free: chat / console open, or a clickable element on screen */
+static bool native_drag=false;   /* a log selection drag is running (the view also holds the mouse capture while the mouse is free, so GetCapture alone no longer says it) */
+static LRESULT CALLBACK NativeViewProc(HWND h,UINT m,WPARAM w,LPARAM l){
+  if(m==WM_ERASEBKGND)return 1;
+  const int x=(short)LOWORD(l),y=(short)HIWORD(l);const bool shift=(w&MK_SHIFT)!=0;
+  if(m==WM_LBUTTONDOWN){   /* a clickable element first (map info, race panel, race invite), else the open chat box / console log (selection) */
+    char url[1024]="";int element=0,index=0;const int r=tc_click(x,y,&element,&index,url,sizeof url);
+    if(r==1){std::lock_guard<std::mutex> lock(native_click_mutex);native_clicks.emplace_back(element,index);}
+    else if(r==2){if(!strncmp(url,"https://",8)||!strncmp(url,"http://",7))ShellExecuteA(nullptr,"open",url,nullptr,nullptr,SW_SHOWNORMAL);}
+    else if(tc_typing()){SetCapture(h);native_drag=true;tc_log_mouse(0,x,y,shift);}
+    return 0;}
+  if(m==WM_MOUSEMOVE){if(native_drag||tc_typing())tc_log_mouse(1,x,y,shift);return 0;}
+  if(m==WM_LBUTTONUP){if(native_drag){native_drag=false;tc_log_mouse(2,x,y,shift);}return 0;}
+  if(m==WM_MOUSEWHEEL){if(tc_typing())tc_log_wheel(GET_WHEEL_DELTA_WPARAM(w)/120.0);return 0;}
+  if(m==WM_SETCURSOR){SetCursor(tc_cursor()?LoadCursorW(nullptr,IDC_ARROW):nullptr);return TRUE;}
+  /* The core's text field: characters and IME text arrive here (the native view holds the keyboard focus while a box is open); the keys come from raw input on the render thread. */
+  if(m==WM_CHAR){if(tc_typing())tc_text_unit(static_cast<unsigned>(w));return 0;}
+  if(m==WM_IME_SETCONTEXT){return DefWindowProcW(h,m,w,l&~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW));}   /* the engine draws the composition; the system keeps its candidate list */
+  if(m==WM_IME_STARTCOMPOSITION)return 0;
+  if(m==WM_IME_ENDCOMPOSITION){tc_text_preedit("",0,0,0,0);return 0;}
+  if(m==WM_IME_COMPOSITION){
+    if(HIMC imc=ImmGetContext(h)){
+      if(l&GCS_RESULTSTR){const LONG n=ImmGetCompositionStringW(imc,GCS_RESULTSTR,nullptr,0);if(n>0){std::wstring ws(static_cast<size_t>(n)/2,L'\0');ImmGetCompositionStringW(imc,GCS_RESULTSTR,&ws[0],static_cast<DWORD>(n));tc_text_commit(WideToUtf8(ws.data(),static_cast<int>(ws.size())).c_str());}}
+      if(l&GCS_COMPSTR){const LONG n=ImmGetCompositionStringW(imc,GCS_COMPSTR,nullptr,0);std::wstring ws(n>0?static_cast<size_t>(n)/2:0,L'\0');if(n>0)ImmGetCompositionStringW(imc,GCS_COMPSTR,&ws[0],static_cast<DWORD>(n));
+        const auto bytes=[&](size_t units){return static_cast<unsigned>(WideToUtf8(ws.data(),static_cast<int>(std::min(units,ws.size()))).size());};
+        const LONG cur=ImmGetCompositionStringW(imc,GCS_CURSORPOS,nullptr,0);const unsigned caret=bytes(cur<0?0:static_cast<size_t>(cur));unsigned ulFrom=0,ulTo=0;
+        const LONG an=ImmGetCompositionStringW(imc,GCS_COMPATTR,nullptr,0);if(an>0&&static_cast<size_t>(an)==ws.size()){std::vector<BYTE> at(static_cast<size_t>(an));ImmGetCompositionStringW(imc,GCS_COMPATTR,at.data(),static_cast<DWORD>(an));size_t a=0,b=0;bool found=false;for(size_t i=0;i<at.size();++i)if(at[i]==ATTR_TARGET_CONVERTED||at[i]==ATTR_TARGET_NOTCONVERTED){if(!found){a=i;found=true;}b=i+1;}if(found){ulFrom=bytes(a);ulTo=bytes(b);}}   /* the clause being converted; none: the whole composition is underlined */
+        tc_text_preedit(WideToUtf8(ws.data(),static_cast<int>(ws.size())).c_str(),caret,caret,ulFrom,ulTo);}
+      else tc_text_preedit("",0,0,0,0);
+      ImmReleaseContext(h,imc);}
+    return 0;}
+  return DefWindowProcW(h,m,w,l);}
+static HWND native_child=nullptr;
+static HWND EnsureNativeView(HWND parent){
+  if(native_child)return native_child;
+  WNDCLASSW wc{};wc.lpfnWndProc=NativeViewProc;wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=L"QrazyNativeView";wc.hbrBackground=nullptr;RegisterClassW(&wc);
+  RECT area{};GetClientRect(parent,&area);
+  native_child=CreateWindowExW(0,L"QrazyNativeView",L"",WS_CHILD|WS_CLIPSIBLINGS,0,0,std::max<LONG>(1,area.right),std::max<LONG>(1,area.bottom),parent,nullptr,GetModuleHandleW(nullptr),nullptr);
+  return native_child;
+}
+using QrazyNativeMatch::NativeMatch;
+using QrazyNativeMatch::NativeText;
+/* The page's view of the match (window.qrazyNativeMatchState): 'started', 'refused' (code, reason) and 'ended' (reason), each at most once per match. 0 no match, 1 start accepted, 2 started. Main loop only. */
+static int native_match_state=0;
+static std::string NativeJsText(const std::string& s){std::string r="\"";for(unsigned char c:s.substr(0,200)){if(c=='"'||c=='\\'){r+='\\';r+=static_cast<char>(c);}else if(c<32)r+=' ';else r+=static_cast<char>(c);}return r+"\"";}
+static std::string NativeStateScript(const char* state,const std::string& code,const std::string& reason,bool hudFeed=false,bool audioFeed=false){std::string j=std::string("window.qrazyNativeMatchState&&window.qrazyNativeMatchState({state:'")+state+"'";if(!code.empty())j+=",code:'"+code+"'";if(!reason.empty())j+=",reason:"+NativeJsText(reason);if(hudFeed)j+=",hudFeed:1";if(audioFeed)j+=",audioFeed:1";return j+"})";}
+static bool NativeReportOp(const std::string& r){return r.find("\"runack\"")!=std::string::npos&&r.size()<128||r.compare(0,32,"{\"op\":\"capture\"",15)==0||r.rfind("{\"op\":\"watchsound\"",0)==0;}   /* ops the native client answers while the menu covers the match */
+
+static std::function<void(std::string)> native_hub_post;
+static void NativeHubEvent(const nc::HubEvent& event) {
+  if(native_hub_post)native_hub_post(QrazyNativeMatch::EncodeHubEvent(event));
+}
+
+#endif
+static void QuitLog(const char* s){std::fprintf(stderr,"PROTOTYPE %s\n",s);std::fflush(stderr);
+#ifdef QRAZY_NATIVE_CLIENT
+  tc_log(s);
+#endif
+}
+static void StartQuitWatchdog(int code){static std::atomic<bool> started{false};if(started.exchange(true))return;std::thread([code]{Sleep(8000);QuitLog("quit watchdog: process still alive 8 s after close was requested; terminating");Sleep(100);TerminateProcess(GetCurrentProcess(),static_cast<UINT>(code));}).detach();}   /* last resort: a stuck CEF close or native-view join must never leave the client running */
 static bool tc_synth_flag=false;static std::atomic<bool> tc_view_on{false}; /* F2 view active; the synthetic page script only takes pointer lock / moves its camera while this is true, so the game's menus stay usable */ /* dev test: the browser process runs a small page script that sends synthetic game state through qrazyFrame() */
 static const char* const kTcSynthJs=R"JS((()=>{if(window.__qtcSynth||typeof qrazyFrame!=='function')return;window.__qtcSynth=true;const b=new ArrayBuffer(1136),dv=new DataView(b),t0=performance.now(),enc=new TextEncoder();let f=0,last=t0;
 const chat=enc.encode('^2Synthetic sender^7: WASD moves, click then move the mouse to look (Esc releases), Shift = fast\n^3Page^7: the camera below is driven by input that reached THIS page');
@@ -64,8 +164,8 @@ dv.setUint32(104,chat.length,true);new Uint8Array(b,112,chat.length).set(chat);q
 #define TC_OR
 #endif
 namespace {
-constexpr auto& kOrigin=QrazyDestination::Origin;
-constexpr auto& kProfile=QrazyDestination::Profile;
+bool localhost_mode=QRAZY_DEV_MODE;
+const char* kOrigin=QrazyDestination::Origin(localhost_mode);
 SDL_Window* window=nullptr;
 std::string client_title="Qrazy";
 SDL_Renderer* renderer=nullptr;
@@ -355,6 +455,13 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   CefRefPtr<CefRequestHandler> GetRequestHandler() override{return this;}
   CefRefPtr<CefLoadHandler> GetLoadHandler() override{return this;}
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override{return this;}
+#ifdef QRAZY_NATIVE_CLIENT
+  /* the page's warnings and errors go to the native log (there is no DevTools in this client) */
+  bool OnConsoleMessage(CefRefPtr<CefBrowser>,cef_log_severity_t level,const CefString& message,const CefString& source,int line) override{
+    if(level>=LOGSEVERITY_WARNING){std::string text="page console: "+message.ToString().substr(0,300)+" ("+source.ToString().substr(0,80)+":"+std::to_string(line)+")";tc_log(text.c_str());}
+    return false;
+  }
+#endif
   CefRefPtr<CefDownloadHandler> GetDownloadHandler() override{return this;}
   CefRefPtr<CefDialogHandler> GetDialogHandler() override{return this;}
   void GetViewRect(CefRefPtr<CefBrowser>,CefRect& rect) override {
@@ -419,7 +526,8 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   // would, and F12 crashed inside libcef. The page still sees the key first (the game may bind it); only the accelerator is consumed.
   /* Escape key-up is consumed after the page has seen it: the game re-locks the pointer from that very key-up (menu resume), and Chromium's own
      handling of the same Escape would then release the fresh lock again within milliseconds (seen in the diagnostic log). */
-  bool OnKeyEvent(CefRefPtr<CefBrowser>,const CefKeyEvent& event,CefEventHandle) override {return native_window&&(DevToolsShortcut(event)||(event.windows_key_code==VK_ESCAPE&&event.type==KEYEVENT_KEYUP));}
+  bool OnKeyEvent(CefRefPtr<CefBrowser>,const CefKeyEvent& event,CefEventHandle) override {
+    return native_window&&(DevToolsShortcut(event)||(event.windows_key_code==VK_ESCAPE&&event.type==KEYEVENT_KEYUP));}
   bool OnPreKeyEvent(CefRefPtr<CefBrowser>,const CefKeyEvent& event,CefEventHandle,bool* is_keyboard_shortcut) override {
     if(!native_window||closing)return false;
     const bool down=event.type==KEYEVENT_RAWKEYDOWN||event.type==KEYEVENT_KEYDOWN,alt=!!(event.modifiers&EVENTFLAG_ALT_DOWN),first=down&&!(event.modifiers&EVENTFLAG_IS_REPEAT);
@@ -428,19 +536,28 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     if(pointer_locked&&event.windows_key_code==VK_ESCAPE&&down&&!(event.modifiers&(EVENTFLAG_ALT_DOWN|EVENTFLAG_CONTROL_DOWN))){if(first){auto data=Dict();data->SetString("type","escape");Send(data);}return true;}
     if(DevToolsShortcut(event)){*is_keyboard_shortcut=true;return false;}
     if(first&&(event.windows_key_code==VK_RETURN||event.windows_key_code==VK_SPACE))update_gesture=SDL_GetTicksNS();
-    if(alt&&!(event.modifiers&EVENTFLAG_CONTROL_DOWN)&&event.windows_key_code==VK_F4){if(first){Release("shortcut-close");closing=true;}return true;}
+    if(alt&&!(event.modifiers&EVENTFLAG_CONTROL_DOWN)&&event.windows_key_code==VK_F4){if(first){QuitLog("close: Alt+F4");Release("shortcut-close");closing=true;}return true;}
     if(alt&&event.windows_key_code==VK_RETURN){if(first)ToggleFullscreen();return true;}
     return false;
   }
   void ToggleFullscreen(){
     if(ToMain([self=CefRefPtr<Client>(this)]{self->ToggleFullscreen();}))return;
-    SDL_SetWindowFullscreen(window,!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN));
+    const bool entering=!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN);
+#ifdef QRAZY_NATIVE_CLIENT
+    const auto started=SDL_GetTicksNS();
+    tc_log(entering?"fullscreen: enter requested":"fullscreen: leave requested");
+#endif
+    SDL_SetWindowFullscreen(window,entering);
+#ifdef QRAZY_NATIVE_CLIENT
+    char timing[120];std::snprintf(timing,sizeof timing,"fullscreen: SDL request returned after %.1f ms",(SDL_GetTicksNS()-started)/1000000.0);tc_log(timing);
+#endif
   }
   void OnFullscreenModeChange(CefRefPtr<CefBrowser>,bool fullscreen) override{
     if(ToMain([self=CefRefPtr<Client>(this),fullscreen]{self->OnFullscreenModeChange(nullptr,fullscreen);}))return;
     if(native_window&&!closing&&fullscreen!=!!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN))SDL_SetWindowFullscreen(window,fullscreen);
   }
   void OnBeforeClose(CefRefPtr<CefBrowser>) override {
+    QuitLog("close: OnBeforeClose reached");
     if(mt_loop){ /* CEF's UI thread: drop its handle and hook now, the SDL thread's state follows in order */
       ui_browser=nullptr;child_hwnd=nullptr;if(ui_gesture_hook){UnhookWindowsHookEx(ui_gesture_hook);ui_gesture_hook=nullptr;}
       ToMain([self=CefRefPtr<Client>(this)]{self->Release("close");self->browser=nullptr;closed=true;});
@@ -503,6 +620,7 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       else if(f=="image/webp"){add("webp");}
       else if(f=="image/bmp"){add("bmp");}
       else if(f=="model/gltf-binary"){add("glb");}
+      else if(f=="application/json"){add("json");}
       else return false;
     }
     if(exts.empty())return false;
@@ -585,6 +703,9 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
     if(main&&loading&&!recovering)SDL_SetWindowTitle(window,"Qrazy - connecting");}
   void OnLoadEnd(CefRefPtr<CefBrowser>,CefRefPtr<CefFrame> frame,int code) override {
     const bool main=frame->IsMain(),trusted=Trusted(frame->GetURL());
+#ifdef QRAZY_NATIVE_CLIENT
+    if(main)frame->ExecuteJavaScript("console.warn('native probe: trusted="+std::string(trusted?"yes":"no")+" match='+typeof qrazyNativeMatch+' settings='+typeof qrazyNativeSettings+' quit='+typeof window.qrazyDesktop?.quit+' url='+location.href.slice(0,60))","qrazy-native-probe",0);
+#endif
 #ifdef QRAZY_TRUE_CLIENT
     if(main&&trusted&&tc_synth_flag)frame->ExecuteJavaScript(std::string(tc_view_on?"window.__qtcOn=true;":"window.__qtcOn=false;")+kTcSynthJs,"qrazy-tc-synth",0);
 #endif
@@ -618,6 +739,18 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
   void OnPopupSize(CefRefPtr<CefBrowser>,const CefRect& rect) override{if(rect.width!=popup_rect.width||rect.height!=popup_rect.height)popup_ready=false;popup_rect=rect;dirty=true;}
   void FullscreenState(){auto data=Dict();data->SetString("type","fullscreen");data->SetBool("value",!!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN));Send(data);}
   bool OnProcessMessageReceived(CefRefPtr<CefBrowser> b,CefRefPtr<CefFrame> frame,CefProcessId source,CefRefPtr<CefProcessMessage> msg) override {
+#ifdef QRAZY_NATIVE_CLIENT
+    if(msg->GetName()=="qrazy-native-v1"){   /* the page: a match started or ended; the main loop acts on it */
+      if(source==PID_RENDERER&&frame->IsMain()&&Trusted(frame->GetURL())){auto a=msg->GetArgumentList();if(a->GetSize()==1&&a->GetType(0)==VTYPE_STRING){std::lock_guard<std::mutex> lock(native_mutex);if(native_requests.size()<64)native_requests.push_back(a->GetString(0).ToString());}}
+      return true;
+    }
+#endif
+#ifdef QRAZY_NATIVE_CLIENT
+    if(msg->GetName()=="qrazy-native-info-v1"||msg->GetName()=="qrazy-native-settings-v1"||msg->GetName()=="qrazy-native-hud-v1"){   /* data from the page: the information board, the player's settings, the chat lines and typing line */
+      if(source==PID_RENDERER&&frame->IsMain()&&Trusted(frame->GetURL())){auto a=msg->GetArgumentList();if(a->GetSize()==1&&a->GetType(0)==VTYPE_STRING){const std::string text=a->GetString(0).ToString();const std::string n=msg->GetName();if(n=="qrazy-native-info-v1")tc_board(text.c_str());else if(n=="qrazy-native-settings-v1")tc_settings(text.c_str());else tc_hud(text.c_str());}}
+      return true;
+    }
+#endif
 #ifdef QRAZY_TRUE_CLIENT
     if(msg->GetName()=="qrazy-frame-v1"){   /* Stage 2: the page's game state (dev builds only); runs on CEF's thread, tc_push_state is thread safe */
       if(source==PID_RENDERER&&frame->IsMain()&&Trusted(frame->GetURL())){auto a=msg->GetArgumentList();if(a->GetSize()==1&&a->GetType(0)==VTYPE_BINARY){auto bin=a->GetBinary(0);std::vector<uint8_t> buf(bin->GetSize());if(!buf.empty()&&bin->GetData(buf.data(),buf.size(),0)==buf.size())tc_push_state(buf.data(),buf.size());}}
@@ -646,13 +779,19 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       if(closing||recovering||loading||!Focused()||!d||d->GetType("enabled")!=VTYPE_BOOL){Reply(id,QrazyWindows::Error("Return to the focused game before changing rendering settings"));return true;}
       const auto previous=render_preferences;render_preferences.vsync=d->GetBool("enabled");
       if(!render_preferences.Save()){render_preferences=previous;Reply(id,QrazyWindows::Error("Setting could not be saved"));return true;}
-      Reply(id,render_preferences.VSyncState()); /* applies at once: the bridge limiter reads it from the event below */
+#ifdef QRAZY_NATIVE_CLIENT
+      tc_set_frame_cap(render_preferences.vsync ? 0 : render_preferences.max_fps);
+#endif
+      Reply(id,render_preferences.VSyncState());
       auto event=Dict();event->SetString("type","render-settings");event->SetDictionary("vsync",render_preferences.VSyncState());event->SetDictionary("maxFps",render_preferences.MaxFpsState());Send(event);return true;
     }
-    if(native_window&&op=="max-fps-set"){ /* native mode: only saved; the bridge enforces it with a MessageChannel-paced requestAnimationFrame limiter */
+    if(native_window&&op=="max-fps-set"){
       if(closing||recovering||loading||!Focused()||!d||d->GetType("value")!=VTYPE_INT||d->GetInt("value")<30||d->GetInt("value")>10000){Reply(id,QrazyWindows::Error("Return to the focused game and give com_maxfps as an integer from 30 to 10000"));return true;}
       const auto previous=render_preferences;render_preferences.max_fps=d->GetInt("value");
       if(!render_preferences.Save()){render_preferences=previous;Reply(id,QrazyWindows::Error("Setting could not be saved"));return true;}
+#ifdef QRAZY_NATIVE_CLIENT
+      tc_set_frame_cap(render_preferences.vsync ? 0 : render_preferences.max_fps);
+#endif
       Reply(id,render_preferences.MaxFpsState());
       auto event=Dict();event->SetString("type","render-settings");event->SetDictionary("vsync",render_preferences.VSyncState());event->SetDictionary("maxFps",render_preferences.MaxFpsState());Send(event);return true;
     }
@@ -689,7 +828,11 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       }else{NudgeCursor();SDL_ShowOpenFileDialog(FileChosen,selected,window,&filter,1,nullptr,false);}
       return true;
     }else if(op=="update-notice"||op=="update-state"||op=="update-check"||op=="update-stage"||op=="update-install") {
-      if(QRAZY_DEV_MODE){Reply(id,QrazyWindows::Error("Updates are disabled in the development client"));return true;}
+      if(localhost_mode
+#ifdef QRAZY_STAGE0
+         || true
+#endif
+      ){Reply(id,QrazyWindows::Error("Updates are disabled in the development client"));return true;}
       if(!menu){Reply(id,QrazyWindows::Error("Return to the focused menu before updating"));return true;}
       std::string action=op=="update-notice"?"check":op=="update-state"?"state":op=="update-install"?"prepare":"update";
       if(action!="state"&&action!="check"){
@@ -725,7 +868,7 @@ class Client final : public DesktopPolicy::RecoveryState,public CefClient,public
       if(why)result->SetString("reason",why);
       captured=ok;if(ok){SDL_StopTextInput(window);if(!SDL_DisableScreenSaver())std::fprintf(stderr,"PROTOTYPE idle inhibition failed\n");}
       result->SetBool("ok",ok);result->SetInt("generation",++generation);
-    }else if(op=="quit"){Release("quit");closing=true;}
+    }else if(op=="quit"){QuitLog("close: qrazyDesktop.quit op");Release("quit");closing=true;}
     else if(op=="refresh-game") {
       bool ok=browser&&!closing&&!fatal&&!handoff_waiting&&!loading&&Focused();
       result->SetBool("ok",ok);
@@ -780,7 +923,7 @@ static bool SameFile(const std::filesystem::path& a,const std::filesystem::path&
 }
 // The launcher sits outside the runtime folder that updates replace, so a newer one
 // ships inside the runtime and is swapped in here. A running exe can be renamed.
-static void RefreshLauncher(const std::filesystem::path& base,const std::filesystem::path& runtime) {
+[[maybe_unused]] static void RefreshLauncher(const std::filesystem::path& base,const std::filesystem::path& runtime) {
   std::error_code error;
   const auto fresh=runtime/L"Qrazy-launcher.exe",live=base/L"Qrazy.exe",staged=base/L"Qrazy.exe.new",previous=base/L"Qrazy.exe.old";
   std::filesystem::remove(previous,error);std::filesystem::remove(staged,error);
@@ -798,6 +941,10 @@ int Run(HINSTANCE instance,void* sandbox) {
   wchar_t name[32768];DWORD n=GetModuleFileNameW(nullptr,name,32768);if(!n||n>=32768)return 2;
   auto root=std::filesystem::path(name).parent_path();
   std::ifstream bridge(root/"bridge.js");std::ostringstream content;content<<bridge.rdbuf();bridge_source=content.str();if(bridge_source.empty())return 2;
+  // Read the launcher's selection before CEF starts the browser or renderer.
+  wchar_t local_marker[2]={};
+  localhost_mode=QRAZY_DEV_MODE||(GetEnvironmentVariableW(QrazyDestination::LocalhostMarker,local_marker,2)==1&&local_marker[0]==L'1');
+  kOrigin=QrazyDestination::Origin(localhost_mode);
   CefMainArgs args(instance);CefRefPtr<App> app=new App;
   int sub=CefExecuteProcess(args,app,sandbox);if(sub>=0)return sub;
   auto command=CefCommandLine::CreateCommandLine();command->InitFromString(GetCommandLineW());
@@ -807,14 +954,31 @@ int Run(HINSTANCE instance,void* sandbox) {
   if(!marker_size||marker_size>=32768||std::filesystem::path(marker)!=base||root.filename()!=L"runtime")return 2;
   Production::CleanEnvironment();
   updater_worker.root=base;
-  auto profile=base/kProfile;std::error_code error;std::filesystem::create_directories(profile,error);
+  auto profile=base/QrazyDestination::Profile(localhost_mode);std::error_code error;std::filesystem::create_directories(profile,error);
   if(error||!QrazyWindows::NoReparse(profile))return 2;ProfileLock lock;if(!lock.Acquire(profile/"host.lock"))return 2;
+#ifdef QRAZY_NATIVE_CLIENT
+  struct CoreUpdateWait { ~CoreUpdateWait() { tc_core_wait(); } } core_update_wait;
+#if defined(QRAZY_STAGE0) && !defined(QRAZY_LOCAL_CORE_SMOKE)
+  tc_core_prepare((profile/"core-updates-v11").string().c_str(),false,false);
+#else
+  tc_core_prepare((profile/"core-updates-v11").string().c_str(),true,localhost_mode);
+#endif
+#endif
+#ifndef QRAZY_STAGE0
   RefreshLauncher(base,root);
+#endif
   NetDiag::Start(profile);
   render_preferences.Load(profile);native_window=render_preferences.native_window;startup_vsync=render_preferences.vsync;
   { /* CEF's own UI thread, so raw input never waits for this loop. Not for the offscreen backup, and not for the login handoff, whose gate must run on CEF's UI thread inside this loop. */
     std::error_code handoff_probe;mt_loop=native_window&&!std::filesystem::exists(base/L".qrazy-transition",handoff_probe);
   }
+#ifdef QRAZY_NATIVE_CLIENT
+#ifdef QRAZY_STAGE0
+  const auto nativeFixDir=profile/"native-match";
+#else
+  const auto nativeFixDir=std::filesystem::temp_directory_path(error)/"qrazy-native-match";
+#endif
+#endif
   asset_worker.Start(profile);
   SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER,"1");SDL_SetHint(SDL_HINT_MOUSE_AUTO_CAPTURE,"0");
   SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE,"0");SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SPEED_SCALE,"1");
@@ -864,10 +1028,12 @@ int Run(HINSTANCE instance,void* sandbox) {
       if(!version.empty()&&version.size()<64&&version.find_first_not_of("0123456789.")==std::string::npos)client_title="Qrazy v"+version;
     }
   }
-  if(QRAZY_DEV_MODE)client_title+=" [DEV localhost:5173]";
+  if(localhost_mode)client_title+=" [DEV localhost:5173]";
   SDL_SetWindowTitle(window,client_title.c_str());
-#ifdef QRAZY_TRUE_CLIENT
+#if defined(QRAZY_TRUE_CLIENT)||defined(QRAZY_NATIVE_CLIENT)
   bool tc_started=false,tc_on=false,tc_applied=false;
+#endif
+#ifdef QRAZY_TRUE_CLIENT
   {std::ifstream in(base/"true-client.cmdline");std::string line;if(in&&std::getline(in,line)&&!line.empty()){tc_start(hwnd,line.c_str());tc_started=true;tc_synth_flag=line.find("--synth")!=std::string::npos;}}
 #endif
   int result=0;
@@ -882,9 +1048,21 @@ int Run(HINSTANCE instance,void* sandbox) {
     if(!native_window&&!frame_clock.Start(hwnd))result=5;
     client->handoff_waiting=transitioning;
     if(!native_window&&(!client->view.Initialize(device)||!client->popup.Initialize(device)))result=5;
-    CefWindowInfo info;CefRefPtr<CefDictionaryValue> mode; /* extra_info reaches the render process; null in offscreen mode */
-    if(native_window){mode=CefDictionaryValue::Create();RECT area{};GetClientRect(hwnd,&area);info.SetAsChild(hwnd,CefRect(0,0,std::max<LONG>(1,area.right),std::max<LONG>(1,area.bottom)));mode->SetBool("nativeWindow",true);}
+    CefWindowInfo info;auto mode=CefDictionaryValue::Create();
+    mode->SetBool("localhostMode",localhost_mode);
+    if(native_window){RECT area{};GetClientRect(hwnd,&area);info.SetAsChild(hwnd,CefRect(0,0,std::max<LONG>(1,area.right),std::max<LONG>(1,area.bottom)));mode->SetBool("nativeWindow",true);}
     else{info.SetAsWindowless(hwnd);info.shared_texture_enabled=true;info.external_begin_frame_enabled=true;}
+#ifdef QRAZY_NATIVE_CLIENT
+    native_hub_post=[client](std::string event){
+      client->Host([event=std::move(event)](CefRefPtr<CefBrowserHost> host){
+        auto frame=host->GetBrowser()->GetMainFrame();
+        if(frame&&Trusted(frame->GetURL()))
+          frame->ExecuteJavaScript("window.qrazyNativeHubEvent&&window.qrazyNativeHubEvent("+event+")","qrazy-native-hub",0);
+      });
+    };
+    nc::appHub().setSink(NativeHubEvent);
+    mode->SetBool("nativeHub",tc_hub_ready());
+#endif
     CefBrowserSettings bs;bs.windowless_frame_rate=render_preferences.CefTarget(render_rate);bs.background_color=CefColorSetARGB(255,0,0,0);
     if(result||!CefBrowserHost::CreateBrowser(info,client,transitioning?"about:blank":kOrigin,bs,mode,request_context)){
       /* No silent fallback to offscreen: a native-window failure has to be reported so it can be fixed. */
@@ -972,7 +1150,7 @@ int Run(HINSTANCE instance,void* sandbox) {
       while(SDL_PollEvent(&e)) {
         if(e.type==SDL_EVENT_WINDOW_DISPLAY_CHANGED||e.type==SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED||e.type==SDL_EVENT_DISPLAY_ADDED||e.type==SDL_EVENT_DISPLAY_REMOVED)update_display();
         if(((e.type==SDL_EVENT_MOUSE_BUTTON_DOWN&&e.button.button==SDL_BUTTON_LEFT)||(e.type==SDL_EVENT_KEY_DOWN&&(e.key.key==SDLK_RETURN||e.key.key==SDLK_SPACE)))&&Focused())update_gesture=SDL_GetTicksNS();
-        if(e.type==SDL_EVENT_QUIT||e.type==SDL_EVENT_WINDOW_CLOSE_REQUESTED)closing=true;
+        if(e.type==SDL_EVENT_QUIT||e.type==SDL_EVENT_WINDOW_CLOSE_REQUESTED){QuitLog(e.type==SDL_EVENT_QUIT?"close: SDL_EVENT_QUIT":"close: SDL_EVENT_WINDOW_CLOSE_REQUESTED (X button / WM_CLOSE)");closing=true;}
         /* In native mode SDL reports focus loss whenever the CEF child takes keyboard focus; only a real loss of the foreground counts. */
         if((e.type==SDL_EVENT_WINDOW_FOCUS_LOST&&!(native_window&&Focused()))||e.type==SDL_EVENT_WINDOW_MINIMIZED) {
           client->Release("focus");client->selection.clear();client->composing=false;client->Host([](CefRefPtr<CefBrowserHost> host){host->ImeCancelComposition();host->SetAudioMuted(true);host->SetFocus(false);});
@@ -1004,26 +1182,93 @@ int Run(HINSTANCE instance,void* sandbox) {
       }
       if(move_batch->GetSize()&&client->browser){auto d=Dict();d->SetString("type","move");d->SetList("samples",move_batch);client->Send(d);}
       if(captured&&!ConfineCapturedCursor())client->Release("cursor-confinement-lost");
-      if(closing&&client->browser&&!close_sent){client->Release("close");client->Host([](CefRefPtr<CefBrowserHost> host){host->CloseBrowser(true);});close_sent=true;close_sent_ns=SDL_GetTicksNS();}
-      if(native_window&&close_sent&&!closed&&SDL_GetTicksNS()-close_sent_ns>5000000000ull){std::fprintf(stderr,"PROTOTYPE native browser did not close in 5 s; exiting\n");closed=true;} /* last resort so a stuck windowed close cannot leave a window that ignores input */
+      if(closing&&!close_sent_ns){close_sent_ns=SDL_GetTicksNS();StartQuitWatchdog(install_requested?Production::InstallExit:0);
+#if defined(QRAZY_TRUE_CLIENT)||defined(QRAZY_NATIVE_CLIENT)
+        if(native_match_state&&client->browser){native_match_state=0;client->Host([js=NativeStateScript("ended","","window")](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js,"qrazy-native-state",0);});}
+        if(tc_started){QuitLog("close: stopping native view");tc_set_visible(false);tc_stop();tc_started=false;tc_on=false;tc_view_on=false;QuitLog("close: native view stopped");}
+#endif
+      }
+      if(closing&&client->browser&&!close_sent){QuitLog("close: CloseBrowser(true) sent");client->Release("close");client->Host([](CefRefPtr<CefBrowserHost> host){host->CloseBrowser(true);});close_sent=true;close_sent_ns=SDL_GetTicksNS();}
+      if(close_sent&&!closed&&SDL_GetTicksNS()-close_sent_ns>5000000000ull){QuitLog("browser did not close in 5 s; exiting");closed=true;} /* last resort so a stuck windowed close cannot leave a window that ignores input */
       if(native_window&&client->browser) {
         /* Cards are drawn by SDL under the CEF child, so the child is hidden only while one is showing (recovery or server retry). Ordinary loading keeps the page visible and running. */
 #ifdef QRAZY_TRUE_CLIENT
         {static bool f2=false;const bool down=Focused()&&(GetAsyncKeyState(VK_F2)&0x8000)!=0;if(down&&!f2&&tc_started){tc_on=!tc_on;tc_view_on=tc_on;tc_set_visible(tc_on);client->Host([on=tc_on](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(on?"window.__qtcOn=true":"window.__qtcOn=false","qrazy-tc-view",0);});}f2=down;} /* F2: native view <-> menus */
 #endif
+#ifdef QRAZY_NATIVE_CLIENT
+        const auto native_state=[&](const char* state,const std::string& code,const std::string& why){const std::string js=NativeStateScript(state,code,why,std::strcmp(state,"started")==0&&tc_hud_feed(),std::strcmp(state,"started")==0&&tc_audio_feed());tc_log(js.c_str());client->Host([js](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js,"qrazy-native-state",0);});};
+        if(tc_started&&tc_take_started()&&native_match_state==1){native_match_state=2;native_state("started","","");tc_hud_ready();}
+        {char reason[512];if(tc_started&&tc_take_error(reason,sizeof reason)){   /* the native view stopped by itself: there is no other renderer, so the player is told and returned to the menus */
+           tc_set_visible(false);tc_stop();tc_started=false;tc_on=false;tc_view_on=false;
+           client->Host([](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(NativeMenuScript(),"qrazy-tc-view",0);});
+           const std::string text=std::string("Qrazy's graphics could not run this match.\n\n")+reason+"\n\nQrazy needs a graphics card with Vulkan support and an up-to-date graphics driver. If this keeps happening, please report it in the Qrazy Discord and include this text.";
+           tc_log((std::string("native view failed: ")+reason).c_str());
+           if(native_match_state==1)native_state("refused",tc_error_code(),reason);else if(native_match_state==2)native_state("ended","","crash");native_match_state=0;
+           {const std::string full=text+"\n\nReload the game now (RELOAD)? Choose No to stay in the menu.";const int wn=MultiByteToWideChar(CP_UTF8,0,full.c_str(),-1,nullptr,0);std::wstring wide(static_cast<size_t>(std::max(wn,1)),L'\0');MultiByteToWideChar(CP_UTF8,0,full.c_str(),-1,&wide[0],wn);
+            if(MessageBoxW(hwnd,wide.c_str(),L"Qrazy",MB_YESNO|MB_ICONERROR|MB_SETFOREGROUND)==IDYES){tc_log("native view failed: RELOAD chosen");client->Host([](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->ReloadIgnoreCache();});}}}}
+        {std::vector<std::pair<int,int>> clicks;{std::lock_guard<std::mutex> click_lock(native_click_mutex);clicks.swap(native_clicks);}if(!clicks.empty()&&tc_on)client->Host([clicks=std::move(clicks)](CefRefPtr<CefBrowserHost> host){for(const auto& c:clicks){if(c.first==1000){SendNativeShortcut(host,false,true);SendNativeShortcut(host,false,false);}else host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(NativeClickScript(c.first,c.second),"qrazy-native-click",0);}});}
+        {std::vector<std::string> scripts;{std::lock_guard<std::mutex> js_lock(native_js_mutex);scripts.swap(native_js);}if(!scripts.empty()&&tc_started)client->Host([scripts=std::move(scripts)](CefRefPtr<CefBrowserHost> host){for(const auto& js:scripts)host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(js,"qrazy-native-text",0);});}
+        if(native_child&&tc_on){static bool was_typing=false;const bool typing_now=tc_typing();   /* the native view holds the keyboard focus while a box is open (WM_CHAR and the IME go to it); it is given back when the box closes */
+          if(typing_now&&Focused()&&GetFocus()!=native_child)SetFocus(native_child);
+          if(!typing_now&&was_typing&&GetFocus()==native_child)SetFocus(hwnd);was_typing=typing_now;
+          if(typing_now&&tc_text_composing()){float r[4];if(tc_caret_rect(r)){if(HIMC imc=ImmGetContext(native_child)){COMPOSITIONFORM cf{};cf.dwStyle=CFS_POINT;cf.ptCurrentPos={static_cast<LONG>(r[0]),static_cast<LONG>(r[1])};ImmSetCompositionWindow(imc,&cf);CANDIDATEFORM cd{};cd.dwIndex=0;cd.dwStyle=CFS_CANDIDATEPOS;cd.ptCurrentPos={static_cast<LONG>(r[0]),static_cast<LONG>(r[1]+r[3])};ImmSetCandidateWindow(imc,&cd);ImmReleaseContext(native_child,imc);}}}}
+        {std::vector<std::string> sims;{std::lock_guard<std::mutex> sim_lock(native_sim_mutex);sims.swap(native_sim);}if(!sims.empty()&&tc_started)client->Host([sims=std::move(sims)](CefRefPtr<CefBrowserHost> host){for(const auto& j:sims)host->GetBrowser()->GetMainFrame()->ExecuteJavaScript("window.qrazyNativeSim&&window.qrazyNativeSim("+j+")","qrazy-native-sim",0);});}
+        {static Uint64 pose_sent=0;const Uint64 now=SDL_GetTicksNS();   /* the player's position and view angles for the page (its /viewpos), 10 Hz: window.qrazyNativePose({x,y,z (feet), vx,vy,vz, yaw,pitch (radians), ex,ey,ez (eye), ground, crouched}) */
+         if(tc_on&&(tc_take_pose_request()||now-pose_sent>=100000000ull)){pose_sent=now;double p[14];if(tc_get_pose(p)){char js[480];std::snprintf(js,sizeof js,"window.qrazyNativePose&&window.qrazyNativePose({x:%.3f,y:%.3f,z:%.3f,vx:%.3f,vy:%.3f,vz:%.3f,yaw:%.6f,pitch:%.6f,ex:%.3f,ey:%.3f,ez:%.3f,ground:%s,crouched:%s,weapon:%d})",p[5],p[6],p[7],p[8],p[9],p[10],p[3],p[4],p[0],p[1],p[2],p[11]!=0?"true":"false",p[12]!=0?"true":"false",static_cast<int>(p[13]));client->Host([s=std::string(js)](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(s,"qrazy-native-pose",0);});}}}
+        if(const int tab=native_tab_edge.exchange(0)){if(tc_on)client->Host([tab](CefRefPtr<CefBrowserHost> host){   /* the page is hidden and gets no keys: give it the Tab press so it reports the board */
+           if(tab==1)host->SetFocus(true);SendNativeShortcut(host,true,tab==1);tc_log(tab==1?"host: Tab down passed to the page":"host: Tab up passed to the page");});}
+        if(!tc_started)tc_hub_service();
+        if(native_menu_requested.exchange(false)&&tc_on){tc_on=false;tc_view_on=false;tc_set_visible(false);client->Host([](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(NativeMenuScript(),"qrazy-tc-view",0);});}   /* Esc in the native view: the page shows its menu */
+        {std::vector<std::string> requests;{std::lock_guard<std::mutex> native_lock(native_mutex);requests.swap(native_requests);}
+         static std::vector<std::string> held_sim_ops;   /* sim ops (mode, respawn, taint...) the page sent while the menu had the match suspended: applied on resume, in order */
+         for(const std::string& request:requests)if(!request.empty()){
+           if(QrazyNativeMatch::HandleHub(request))continue;
+           NativeMatch match;
+           if(!QrazyNativeMatch::ParseNativeMatch(request,[](const std::string& kind,const std::string& key){return asset_worker.PathOf(kind,key);},nativeFixDir,match)){std::fprintf(stderr,"native match request refused: %s\n",match.error.c_str());tc_log(("request refused: "+match.error).c_str());
+             if(match.start){if(tc_started){tc_set_visible(false);tc_stop();tc_started=false;}tc_on=false;tc_view_on=false;held_sim_ops.clear();native_match_state=0;native_state("refused",match.code,match.error);client->Host([](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript(NativeMenuScript(),"qrazy-tc-view",0);});}}   /* no half-started match */
+           else if(match.simop){if(tc_started&&(tc_on||match.soundfact||NativeReportOp(request))){tc_sim_op(request.c_str());}else if(tc_started&&(request.find("\"openText\"")!=std::string::npos||request.find("\"closeText\"")!=std::string::npos)){tc_log("text box op from the page while the menu is open: dropped");}else if(tc_started){if(held_sim_ops.size()<256)held_sim_ops.push_back(request);tc_log("sim op from the page while the menu is open: held until resume");}else tc_log("sim op from the page: no native match is running, ignored");}
+           else if(match.resume){if(tc_started&&!tc_on){for(const std::string& held:held_sim_ops)tc_sim_op(held.c_str());held_sim_ops.clear();tc_on=true;tc_view_on=true;tc_set_visible(true);client->Host([](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript("window.__qtcOn=true","qrazy-tc-view",0);});}}
+           else if(match.stop){held_sim_ops.clear();if(tc_started&&(tc_hud_feed()||(native_match_state==1&&native_running_cmd.find(" --hud-feed")!=std::string::npos))){tc_set_visible(false);tc_stop();tc_started=false;}if(native_match_state){native_match_state=0;native_state("ended","","stop");}if(tc_on){tc_on=false;tc_view_on=false;tc_set_visible(false);client->Host([](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript("window.__qtcOn=false","qrazy-tc-view",0);});}}
+           else if(tc_started&&tc_on&&match.cmdline==native_running_cmd){tc_log("start for the match that is already running: ignored");if(native_match_state==2)native_state("started","","");else if(native_match_state==0)native_match_state=1;}
+           else{held_sim_ops.clear();if(tc_started){tc_set_visible(false);tc_stop();tc_started=false;}native_running_cmd=match.cmdline;{const size_t at=match.cmdline.find("--bsp \"");tc_log(((at==std::string::npos?std::string("match start: runway"):"match start: bsp "+match.cmdline.substr(at+7,match.cmdline.find('"',at+7)-at-7))+(match.cmdline.find(" --hud-feed")!=std::string::npos?", page offers hudFeed":", legacy page")).c_str());}tc_set_menu_request(NativeMenuRequest);tc_set_tab(NativeTab);tc_set_sim_out(NativeSimOut);tc_set_js_out(NativeJsOut);{std::string pacing=render_preferences.vsync?std::string(" --pm fifo"):" --pm immediate --cap "+std::to_string(render_preferences.max_fps);native_match_state=1;tc_start(EnsureNativeView(hwnd),(match.cmdline+pacing).c_str());}   /* the player's own VSync / Max FPS settings pace the native view too */tc_started=true;tc_on=true;tc_view_on=true;tc_set_visible(true);client->Host([](CefRefPtr<CefBrowserHost> host){host->GetBrowser()->GetMainFrame()->ExecuteJavaScript("window.__qtcOn=true","qrazy-tc-view",0);});}
+         }}
+#endif
         const bool card=client->recovering||client->server_retry.active;
+#if defined(QRAZY_TRUE_CLIENT)||defined(QRAZY_NATIVE_CLIENT)
+        {static bool was_free=false;const bool now_free=tc_cursor();if(now_free!=was_free){was_free=now_free;tc_log(now_free?"cursor: free (arrow shown)":"cursor: taken (hidden)");if(native_child)PostMessageW(native_child,WM_SETCURSOR,(WPARAM)native_child,MAKELPARAM(HTCLIENT,WM_MOUSEMOVE));}}   /* the cursor shows / hides at once, not at the next mouse move */
+        /* The one free-mouse rule on this side. While the mouse is free (a text box open, or a clickable element on screen) the native view owns the pointer in every way Windows lets a window own it, so nothing the page's window or Chromium's pointer lock does can hide it: it is the topmost child (the page's window is shown under it while a text box is open for the real keyboard), it holds the mouse capture (WM_SETCURSOR and the clicks go to the capturing window whatever lies under the pointer), the cursor clip and this thread's display counter are reset, and the arrow is set every frame. Taken: the capture is let go. */
+        if(native_child&&tc_on){static bool above_logged=false;static std::string last_state;
+          if(GetTopWindow(hwnd)!=native_child){SetWindowPos(native_child,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);if(!above_logged){above_logged=true;tc_log("cursor: the native view was not the topmost child (the page's window was above it): raised");}}
+          const bool free=tc_cursor();
+          if(free){
+            /* only while the pointer is inside the client area: a held capture would take the click on the title bar X, the frame and other windows */
+            {POINT in{};RECT area{};const bool inside=native_drag||(GetCursorPos(&in)&&ScreenToClient(hwnd,&in)&&GetClientRect(hwnd,&area)&&PtInRect(&area,in));if(!inside){if(GetCapture()==native_child)ReleaseCapture();}else if(Focused()&&GetCapture()!=native_child)SetCapture(native_child);}
+            RECT clip{};const int sw=GetSystemMetrics(SM_CXVIRTUALSCREEN),sh=GetSystemMetrics(SM_CYVIRTUALSCREEN);if(GetClipCursor(&clip)&&(clip.right-clip.left<sw||clip.bottom-clip.top<sh))ClipCursor(nullptr);
+            int level=ShowCursor(TRUE);while(level<0)level=ShowCursor(TRUE);if(level>0)ShowCursor(FALSE);
+            SetCursor(LoadCursorW(nullptr,IDC_ARROW));
+          }else{if(GetCapture()==native_child&&!native_drag)ReleaseCapture();POINT pt;if(GetCursorPos(&pt)&&WindowFromPoint(pt)==native_child)SetCursor(nullptr);}
+          if(free){   /* the evidence for the next report: what Windows thinks the pointer is doing while it is free */
+            CURSORINFO ci{sizeof ci};GetCursorInfo(&ci);POINT pt{};GetCursorPos(&pt);HWND under=WindowFromPoint(pt),cap=GetCapture();char uc[64]="",cc[64]="";if(under)GetClassNameA(under,uc,sizeof uc);if(cap)GetClassNameA(cap,cc,sizeof cc);
+            char st[320];std::snprintf(st,sizeof st,"cursor state (free): showing %d, under pointer '%s'%s, capture '%s'%s, page pointer lock %d",(ci.flags&CURSOR_SHOWING)?1:0,uc,under==native_child?" (native view)":"",cc,cap==native_child?" (native view)":"",(int)pointer_locked.load());
+            if(last_state!=st){last_state=st;tc_log(st);}
+          }else last_state.clear();}
+#endif
+#if defined(QRAZY_TRUE_CLIENT)||defined(QRAZY_NATIVE_CLIENT)
+        const bool page_hidden=card||(tc_on&&native_child!=nullptr);   /* the core's text field takes the keyboard itself: the page window stays hidden while a chat / console box is open */   /* the page keeps running while hidden (see the renderer-backgrounding switches) */
+#else
+        const bool page_hidden=card;
+#endif
         HWND child=mt_loop?client->child_hwnd.load():client->browser->GetHost()->GetWindowHandle(); /* mt_loop: the handle CEF's UI thread stored; the window itself belongs to that thread, so it is only touched there */
-#ifdef QRAZY_TRUE_CLIENT
-        /* F2 view: the CEF child stays shown, enabled and focused (every key and mouse event, pointer lock included, reaches the page natively) but is made a layered window with alpha 1/255, so the Vulkan view underneath shows through. */
-        if(child&&tc_started&&tc_on!=tc_applied){
-          tc_applied=tc_on;const bool on=tc_on;
-          OnUi([child,on]{const LONG ex=GetWindowLongW(child,GWL_EXSTYLE);if(on){SetWindowLongW(child,GWL_EXSTYLE,ex|WS_EX_LAYERED);SetLayeredWindowAttributes(child,0,1,LWA_ALPHA);}else{SetLayeredWindowAttributes(child,0,255,LWA_ALPHA);SetWindowLongW(child,GWL_EXSTYLE,ex&~WS_EX_LAYERED);}RedrawWindow(child,nullptr,nullptr,RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_UPDATENOW);});
-          const bool focused=Focused();client->Host([focused](CefRefPtr<CefBrowserHost> host){host->SetFocus(focused);});
+#if defined(QRAZY_TRUE_CLIENT)||defined(QRAZY_NATIVE_CLIENT)
+        /* Native view: its own child window is shown and the page's child window is hidden (below); the window follows the host window's size. */
+        if(native_child){
+          RECT area{};if(GetClientRect(hwnd,&area)&&area.right>0&&area.bottom>0){RECT mine{};GetClientRect(native_child,&mine);if(mine.right!=area.right||mine.bottom!=area.bottom)SetWindowPos(native_child,HWND_TOP,0,0,area.right,area.bottom,SWP_NOACTIVATE);}
+          if(tc_on!=tc_applied){tc_applied=tc_on;ShowWindow(native_child,tc_on?SW_SHOW:SW_HIDE);if(tc_on)SetWindowPos(native_child,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);}
         }
 #endif
-        if(child&&card!=child_hidden) {
-          child_hidden=card;OnUi([child,card]{ShowWindow(child,card?SW_HIDE:SW_SHOW);});
-          if(card){SetFocus(hwnd);client->dirty=true;}else{client->ResizeChild(true);const bool focused=Focused();client->Host([focused](CefRefPtr<CefBrowserHost> host){host->SetFocus(focused);});}
+        if(child&&page_hidden!=child_hidden) {
+          child_hidden=page_hidden;OnUi([child,page_hidden]{ShowWindow(child,page_hidden?SW_HIDE:SW_SHOW);});
+          if(page_hidden){SetFocus(hwnd);client->dirty=true;}else{client->ResizeChild(true);const bool focused=Focused();client->Host([focused](CefRefPtr<CefBrowserHost> host){host->SetFocus(focused);});}
         }
         /* Same input gate as offscreen mode (no input while loading or recovering): a disabled child window receives no mouse or keys. */
         const bool allow=DesktopPolicy::AllowInput(false,client->recovering,client->loading); /* closing does not disable the child: a close that stalls must not also leave a dead window */
@@ -1047,8 +1292,15 @@ int Run(HINSTANCE instance,void* sandbox) {
     if(!result){CefRefPtr<CookieFlushed> flushed=new CookieFlushed;bool requested=CefCookieManager::GetGlobalManager(nullptr)->FlushStore(flushed);auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(3);while(requested&&!flushed->done&&std::chrono::steady_clock::now()<deadline){if(!mt_loop)CefDoMessageLoopWork();else SDL_PumpEvents();SDL_Delay(1);}std::fprintf(stderr,"PROTOTYPE cookie flush completed=%d\n",static_cast<int>(flushed->done.load()));if(!requested||!flushed->done)result=7;}
   }
   if(gesture_hook)UnhookWindowsHookEx(gesture_hook);
-  #ifdef QRAZY_TRUE_CLIENT
+  #if defined(QRAZY_TRUE_CLIENT)||defined(QRAZY_NATIVE_CLIENT)
   if(tc_started)tc_stop();
+#ifdef QRAZY_NATIVE_CLIENT
+  tc_hub_shutdown();
+  native_hub_post={};
+#endif
+#ifdef QRAZY_NATIVE_CLIENT
+  if(native_child){DestroyWindow(native_child);native_child=nullptr;}
+#endif
 #endif
   NetDiag::Stop();updater_worker.Stop();asset_worker.Stop();CefShutdown();app=nullptr;if(renderer)SDL_DestroyRenderer(renderer);SDL_DestroyWindow(window);SDL_Quit();return !result&&install_requested?Production::InstallExit:result;
 }

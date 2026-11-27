@@ -209,7 +209,7 @@
     return btoa(text);
   }
   const assets = {
-    version: 1, supportedKinds: Object.freeze(['map','sound','shader','texture']),
+    version: 1, supportedKinds: Object.freeze(['map','sound','shader','texture','model']),
     has: (kind,key) => assetCall('has',[kind,key]),
     openRead: (kind,key) => assetCall('openRead',[kind,key]),
     async readChunk(token) {

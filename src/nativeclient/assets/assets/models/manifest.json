@@ -1,0 +1,49 @@
+{
+  "models": {
+    "ammo": {
+      "file": "ammo.v1.glb",
+      "size": 336300,
+      "sha256": "9a027ffdc9ce14caa4bdbe8b5e10d78678464854944c94bb3418a2c1dbee8b25"
+    },
+    "harcosRL": {
+      "file": "harcosRL.v1.glb",
+      "size": 537620,
+      "sha256": "fbe8e1556cc73b520085df9eddfc77fc94fc66433137bd3e346021fcbfecd61a"
+    },
+    "haste": {
+      "file": "haste.v1.glb",
+      "size": 272304,
+      "sha256": "6ae4514f71f23c846bcc68f656fbdc6f0b99171297795c57bbd20302eca6f6ab"
+    },
+    "largeHealth": {
+      "file": "largeHealth.v1.glb",
+      "size": 669732,
+      "sha256": "c814cfd07297f2cac521f34d783b44609618b888a09331a41362fef5c72be33d"
+    },
+    "mediumHealth": {
+      "file": "mediumHealth.v1.glb",
+      "size": 683120,
+      "sha256": "40b2398447f2dd87afeca3001e38cac0ab51496ead47e8834b1b68fec206d2b7"
+    },
+    "megaHealth": {
+      "file": "megaHealth.v1.glb",
+      "size": 54900,
+      "sha256": "2a73af033e6e53a74291134aa7b55b1faa4541c61e986513799709853601f2ae"
+    },
+    "plasmaGun": {
+      "file": "plasmaGun.v2.glb",
+      "size": 1794460,
+      "sha256": "cb79b269bb20c5bdcae776651e307e2b627c2b0c73292fe19de83a9a375e8907"
+    },
+    "quadInner": {
+      "file": "quadInner.v1.glb",
+      "size": 340724,
+      "sha256": "343e6b4501e920fbeaf68dc3cce7aff0742dcb050550345fdc3a0c1da4f4722f"
+    },
+    "smallHealth": {
+      "file": "smallHealth.v1.glb",
+      "size": 661992,
+      "sha256": "e22012c7a411ae17176bf000d436f527ae9db18642a9e15f24f7da54d7a4b792"
+    }
+  }
+}

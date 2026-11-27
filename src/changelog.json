@@ -1,6 +1,17 @@
 {
   "releases": [
     {
+      "version": "0.6.0",
+      "date": "2026-11-27",
+      "added": [
+        "Windows: Added native Vulkan match support. The client checks for compatible game core updates in the background and uses them the next time it starts."
+      ],
+      "changed": [],
+      "fixed": [
+        "Windows: \"Import HUD file\" in the HUD editor now opens the file picker. It was being cancelled before it appeared."
+      ]
+    },
+    {
       "version": "0.5.7",
       "date": "2026-11-03",
       "added": [

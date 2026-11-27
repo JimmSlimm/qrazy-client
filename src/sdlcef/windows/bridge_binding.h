@@ -1,14 +1,12 @@
 bool Trusted(const CefString& url) {
   CefURLParts parts;
-  return CefParseURL(url, parts) &&
-#if QRAZY_DEV_MODE
-    CefString(&parts.scheme) == "http" && CefString(&parts.host) == "localhost" &&
-    CefString(&parts.port) == "5173" &&
-#else
-    CefString(&parts.scheme) == "https" && CefString(&parts.host) == "qrazy-game.onrender.com" &&
-    (CefString(&parts.port).empty() || CefString(&parts.port) == "443") &&
-#endif
-    CefString(&parts.username).empty() && CefString(&parts.password).empty();
+  if (!CefParseURL(url, parts) || !CefString(&parts.username).empty() || !CefString(&parts.password).empty()) return false;
+  if (localhost_mode) {
+    return CefString(&parts.scheme) == "http" && CefString(&parts.host) == "localhost" &&
+      CefString(&parts.port) == "5173";
+  }
+  return CefString(&parts.scheme) == "https" && CefString(&parts.host) == "qrazy-game.onrender.com" &&
+    (CefString(&parts.port).empty() || CefString(&parts.port) == "443");
 }
 // scheme://host[:port] of a trusted URL.
 std::string SteamOrigin(const CefString& url) {
@@ -74,13 +72,55 @@ class FrameSink final : public CefV8Handler {
 };
 #endif
 
+#ifdef QRAZY_NATIVE_CLIENT
+/* Dev-only (native client): qrazyNativeMatch(jsonString) tells the host that a match started on a map (with the asset keys, hub, name and account token) or ended. One string, at most 12 MB (a custom model), trusted main frame only. */
+class MatchSink final : public CefV8Handler {
+ public:
+  bool Execute(const CefString&, CefRefPtr<CefV8Value>, const CefV8ValueList& args, CefRefPtr<CefV8Value>& value, CefString& exception) override {
+    auto context = CefV8Context::GetCurrentContext(); auto frame = context ? context->GetFrame() : nullptr;
+    if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 1 || !args[0]->IsString() || args[0]->GetStringValue().length() > 12582912) { exception = "Unauthorized native match call"; return true; }
+    auto message = CefProcessMessage::Create("qrazy-native-v1"); message->GetArgumentList()->SetString(0, args[0]->GetStringValue());
+    frame->SendProcessMessage(PID_BROWSER, message); value = CefV8Value::CreateUndefined(); return true;
+  }
+ private:
+  IMPLEMENT_REFCOUNTING(MatchSink);
+};
+
+/* The hold-Tab information board: qrazyNativeInfo(jsonString) hands the host the board data the page reported ({"held":bool,"snap":{...}}), so the native view can draw it. Trusted main frame only, 256 KB at most. */
+/* The same shape for every "the page hands the native view some data" call: qrazyNativeInfo (board), qrazyNativeSettings (the player's settings and binds), qrazyNativeHud (chat lines and the typing line). */
+class PageSink final : public CefV8Handler {
+ public:
+  PageSink(const char* messageName, size_t maxLength) : name_(messageName), max_(maxLength) {}
+  bool Execute(const CefString&, CefRefPtr<CefV8Value>, const CefV8ValueList& args, CefRefPtr<CefV8Value>& value, CefString& exception) override {
+    auto context = CefV8Context::GetCurrentContext(); auto frame = context ? context->GetFrame() : nullptr;
+    if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 1 || !args[0]->IsString() || args[0]->GetStringValue().length() > max_) { exception = "Unauthorized native call"; return true; }
+    auto message = CefProcessMessage::Create(name_); message->GetArgumentList()->SetString(0, args[0]->GetStringValue());
+    frame->SendProcessMessage(PID_BROWSER, message); value = CefV8Value::CreateUndefined(); return true;
+  }
+ private:
+  std::string name_; size_t max_;
+  IMPLEMENT_REFCOUNTING(PageSink);
+};
+
+#endif
+
 class App final : public CefApp, public CefRenderProcessHandler {
   struct Binding { CefRefPtr<CefV8Context> context; CefRefPtr<CefV8Value> dispatch; };
   std::map<int, Binding> bindings;
   std::map<int, bool> native_browsers; /* browser id -> created as a windowed (native) browser; set from the host's extra_info */
  public:
-  void OnBrowserCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefDictionaryValue> extra_info) override { native_browsers[browser->GetIdentifier()] = extra_info && extra_info->GetType("nativeWindow") == VTYPE_BOOL && extra_info->GetBool("nativeWindow"); }
-  void OnBrowserDestroyed(CefRefPtr<CefBrowser> browser) override { native_browsers.erase(browser->GetIdentifier()); }
+  std::map<int, bool> hub_browsers;
+  void OnBrowserCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefDictionaryValue> extra_info) override {
+    const int id = browser->GetIdentifier();
+    // The browser host selects the origin. Sandboxed renderers need not inherit its environment.
+    localhost_mode = extra_info && extra_info->GetBool("localhostMode");
+    native_browsers[id] = extra_info && extra_info->GetBool("nativeWindow");
+    hub_browsers[id] = extra_info && extra_info->GetBool("nativeHub");
+  }
+  void OnBrowserDestroyed(CefRefPtr<CefBrowser> browser) override {
+    native_browsers.erase(browser->GetIdentifier());
+    hub_browsers.erase(browser->GetIdentifier());
+  }
   CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override { return this; }
   void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> line) override {
     /* Opt-in via profile/net-log.on (see net_diag.h); browser process only, fixed values, nothing user-controlled. */
@@ -92,6 +132,10 @@ class App final : public CefApp, public CefRenderProcessHandler {
 
     /* Native mode only: a 64 MB V8 young generation (min and max; V8 caps min at max) makes scavenge (minor GC) pauses rarer: with the game allocating ~25 MB/s, heap drops went from ~21 MB every second to ~45 MB every ~4.4 s (2026-10-15 log). It costs memory (not measured). */
     if (native_window) line->AppendSwitchWithValue("js-flags", "--min-semi-space-size=64 --max-semi-space-size=64");
+#ifdef QRAZY_NATIVE_CLIENT
+    /* The page handles lobby messages and answers the native view while its window is hidden: Chromium must not slow a hidden page down. */
+    line->AppendSwitch("disable-renderer-backgrounding"); line->AppendSwitch("disable-background-timer-throttling"); line->AppendSwitch("disable-backgrounding-occluded-windows");
+#endif
     line->AppendSwitchWithValue("use-angle", "d3d11");
     line->AppendSwitchWithValue("class", "qrazy-sdl-cef-prototype");
     // Do not add enable-logging: Chromium creates a Windows console for this
@@ -105,7 +149,18 @@ class App final : public CefApp, public CefRenderProcessHandler {
   }
   void OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) override {
     if (!frame->IsMain() || !Trusted(frame->GetURL())) return;
+    QrazyDate::Install(context, Trusted, [](double ms, bool date, bool time, bool seconds, int) {
+      return CefString(QrazyDate::FormatWindows(ms, date, time, seconds));
+    });
     auto native = CefV8Value::CreateFunction("qrazyNative", new Native);
+#ifdef QRAZY_NATIVE_CLIENT
+    context->GetGlobal()->SetValue("qrazyNativeMatch", CefV8Value::CreateFunction("qrazyNativeMatch", new MatchSink), V8_PROPERTY_ATTRIBUTE_READONLY);
+    context->GetGlobal()->SetValue("qrazyNativeInfo", CefV8Value::CreateFunction("qrazyNativeInfo", new PageSink("qrazy-native-info-v1", 262144)), V8_PROPERTY_ATTRIBUTE_READONLY);
+    context->GetGlobal()->SetValue("qrazyNativeSettings", CefV8Value::CreateFunction("qrazyNativeSettings", new PageSink("qrazy-native-settings-v1", 65536)), V8_PROPERTY_ATTRIBUTE_READONLY);
+    context->GetGlobal()->SetValue("qrazyNativeHud", CefV8Value::CreateFunction("qrazyNativeHud", new PageSink("qrazy-native-hud-v1", 262144)), V8_PROPERTY_ATTRIBUTE_READONLY);
+    if (hub_browsers[browser->GetIdentifier()])
+      context->GetGlobal()->SetValue("qrazyNativeHubVersion", CefV8Value::CreateInt(1), V8_PROPERTY_ATTRIBUTE_READONLY);
+#endif
 #ifdef QRAZY_TRUE_CLIENT
     context->GetGlobal()->SetValue("qrazyFrame", CefV8Value::CreateFunction("qrazyFrame", new FrameSink), V8_PROPERTY_ATTRIBUTE_READONLY);
 #endif

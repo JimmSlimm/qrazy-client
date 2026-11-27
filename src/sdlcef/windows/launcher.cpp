@@ -102,15 +102,17 @@ static void PreferHighPerformanceGpu(const std::wstring& executable) {
 }
 
 int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR command,int) {
-  if(command&&*command)return 2;wchar_t name[32768];DWORD n=GetModuleFileNameW(nullptr,name,32768);if(!n||n>=32768)return 2;
+  bool local=false;if(!QrazyDestination::ParseLaunch(command?command:L"",local))return 2;
+  wchar_t name[32768];DWORD n=GetModuleFileNameW(nullptr,name,32768);if(!n||n>=32768)return 2;
   auto root=std::filesystem::path(name).parent_path();Production::CleanEnvironment();
   Lock installation;if(!installation.Open(root/L"install.lock"))return Failure(L"Qrazy is already running, or an update is in progress. Close it normally before trying again.");
   if(std::filesystem::exists(root/L".qrazy-transition")) {
+    if(local)return Failure(L"Finish the pending client transition with a regular launch before using --localhost.");
     int recovered=RecoverTransition(root);
     if(recovered<0)return Failure(L"The transition could not be safely recovered. Keep this folder and both profiles intact. Replace the application files from an official full download if recovery remains unavailable.");
     if(recovered>0){MessageBoxW(nullptr,L"Close this notice, then reopen Qrazy in a few seconds. The previous client will be restored and your profiles kept.",L"Qrazy recovery",MB_OK|MB_ICONINFORMATION);return 0;}
   }
-  auto profile=root/QrazyDestination::Profile;std::error_code error;std::filesystem::create_directories(profile,error);if(error||!Production::NoLinks(profile))return Failure(L"The Qrazy profile folder is unavailable.");
+  auto profile=root/QrazyDestination::Profile(local);std::error_code error;std::filesystem::create_directories(profile,error);if(error||!Production::NoLinks(profile))return Failure(L"The Qrazy profile folder is unavailable.");
   std::string output;
   {Lock host,worker;if(!host.Open(profile/L"host.lock")||!worker.Open(profile/L"desktop-worker.lock"))return Failure(L"Close the running Qrazy client before starting this copy.");
   }
@@ -118,10 +120,14 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR command,int) {
   if(!SandboxRead(runtime))return Failure(L"Qrazy could not prepare sandbox read access for its public runtime files.");
   PreferHighPerformanceGpu(std::filesystem::path(name).wstring());PreferHighPerformanceGpu(exe.wstring());
   SetEnvironmentVariableW(L"SHIM_MCCOMPAT",L"0x800000001");
-  if(!SetEnvironmentVariableW(L"QRAZY_SDLCEF_ROOT",root.c_str()))return 2;
+  if(!SetEnvironmentVariableW(L"QRAZY_SDLCEF_ROOT",root.c_str())||
+     !SetEnvironmentVariableW(QrazyDestination::LocalhostMarker,local?L"1":L"0"))return 2;
   auto cmd=Production::Quote(exe.wstring());STARTUPINFOW startup{};startup.cb=sizeof(startup);PROCESS_INFORMATION process{};
   if(!CreateProcessW(exe.c_str(),cmd.data(),nullptr,nullptr,FALSE,0,nullptr,runtime.c_str(),&startup,&process))return Failure(L"Unable to start the verified Qrazy runtime.");
   CloseHandle(process.hThread);WaitForSingleObject(process.hProcess,INFINITE);DWORD code=1;GetExitCodeProcess(process.hProcess,&code);CloseHandle(process.hProcess);
+#ifdef QRAZY_STAGE0
+  if(code==Production::InstallExit)return 2;
+#endif
   if(code==Production::InstallExit){Lock host,worker;if(!host.Open(profile/L"host.lock")||!worker.Open(profile/L"desktop-worker.lock"))return Failure(L"Update refused because a Qrazy process still owns the profile. Close it normally and try again.");
     output.clear();if(!Production::Helper(root,L"install",output)) {
       std::wstring text=L"Update installation failed. Keep the folder intact for recovery on your next manual launch.";

@@ -5,10 +5,16 @@
   // Read-only presentation: the game owns data, formatting and Tab eligibility.
   let informationSnapshot = null, informationHeld = false, informationBox, informationClock = 0;
   const infoText = (value, max = 120) => typeof value === 'string' ? value.slice(0, max) : '';
-  function hideInformation() { informationHeld = false; clearInterval(informationClock); informationBox?.remove(); informationBox = null; }
+  // Native view: the same board data goes to the host, which draws it in the match (qrazyNativeInfo exists only in the native-client host build).
+  function postInformation(withSnapshot) {
+    if (typeof window.qrazyNativeInfo !== 'function' || window.__qtcOn !== true) return;
+    try { window.qrazyNativeInfo(JSON.stringify(withSnapshot && informationSnapshot ? {held: informationHeld, snap: informationSnapshot} : {held: informationHeld})); } catch {}
+  }
+  function hideInformation() { const was = informationHeld; informationHeld = false; clearInterval(informationClock); informationBox?.remove(); informationBox = null; if (was) postInformation(false); }
   function renderInformation() {
     informationBox?.remove(); informationBox = null; clearInterval(informationClock);
     if (!informationHeld || !informationSnapshot || !document.body) return;
+    postInformation(true);
     const data = informationSnapshot;
     const box = document.createElement('section');
     box.setAttribute('aria-label', 'Current map information');
@@ -190,15 +196,15 @@
     setHeld(value) {
       if (value !== true) { hideInformation(); return; }
       const target = document.activeElement;
-      if (!document.hasFocus() || target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(target?.tagName || '')) return;
+      if (window.__qtcOn !== true && (!document.hasFocus() || target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(target?.tagName || ''))) return;   // the hidden native-view page keeps the Play button focused and no real focus: the host's Tab press is the player's
       informationHeld = true; renderInformation();
     },
     clear() { hideInformation(); informationSnapshot = null; }
   };
   window.addEventListener('keyup', event => { if (event.code === 'Tab') hideInformation(); }, true);
-  window.addEventListener('blur', hideInformation);
+  window.addEventListener('blur', () => { if (window.__qtcOn !== true) hideInformation(); });
   window.addEventListener('pagehide', information.clear);
-  document.addEventListener('focusin', hideInformation);
+  document.addEventListener('focusin', () => { if (window.__qtcOn !== true) hideInformation(); });
 
   const pending = new Map(), moves = new Set(), states = new Set(), fullscreen = new Set();
   let gameStatusNotice;
@@ -211,7 +217,7 @@
     return btoa(text);
   }
   const assets = {
-    version: 1, supportedKinds: Object.freeze(['map','sound','shader','texture']),
+    version: 1, supportedKinds: Object.freeze(['map','sound','shader','texture','model']),
     has: (kind,key) => assetCall('has',[kind,key]),
     openRead: (kind,key) => assetCall('openRead',[kind,key]),
     async readChunk(token) {
@@ -414,7 +420,7 @@
       'Window: '+(g.pixelWidth||'?')+' × '+(g.pixelHeight||'?')+' pixels · Scale: '+number(g.displayScale*100)+'% · '+(g.fullscreen?'Fullscreen':'Windowed'),
       'Display: '+(g.displayName||missing)+' · '+(g.refreshHz??missing)+' Hz',
       'Game drawing buffer: '+(game.drawingBuffer?.join(' × ')||missing)+' pixels',
-      g.nativeWindow?'Native browser window: Chromium presents the page itself (VSync applies after restart; com_maxfps is enforced by the bridge)':'VSync: '+vsync+' · FPS limit: '+(g.maxFps??missing)+' · Requested rendering rate: '+(g.cefTarget??g.cefTargetFps??missing),
+      g.nativeWindow?'Native browser window: Chromium presents the web UI':'VSync: '+vsync+' · FPS limit: '+(g.maxFps??missing)+' · Requested rendering rate: '+(g.cefTarget??g.cefTargetFps??missing),
       'Frame clock: '+(g.frameClock||missing),
       'Runtime: CEF '+(g.cefVersion||missing)+' · Chromium '+(g.chromiumVersion||missing)+' · SDL '+(g.sdlVersion||missing),
       'Installation drive free space: '+number(g.installationFreeGiB,1)+' GiB',

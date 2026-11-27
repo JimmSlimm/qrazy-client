@@ -4,10 +4,27 @@ parser=argparse.ArgumentParser(description='Prepare an unsigned Linux candidate 
 parser.add_argument('--workspace',required=True);parser.add_argument('--dependencies',required=True)
 parser.add_argument('--version',required=True);parser.add_argument('--sequence',required=True,type=int)
 parser.add_argument('--notes-file',help='Finalized release notes; replaces the packaged CHANGES.txt')
+parser.add_argument('--native-core',type=pathlib.Path,help='Linux interface-11 core to bundle as the startup fallback')
+parser.add_argument('--native-core-manifest',type=pathlib.Path,help='Publisher manifest for the bundled Linux core')
 args=parser.parse_args()
 assert re.fullmatch(r'(0|[1-9][0-9]{0,5})[.](0|[1-9][0-9]{0,5})[.](0|[1-9][0-9]{0,5})',args.version) and args.sequence>0
 root=pathlib.Path(args.workspace).resolve();old=pathlib.Path(args.dependencies).resolve()
 linux=pathlib.Path(__file__).resolve().parent;source=linux.parent;out=root/'out';out.mkdir(exist_ok=True)
+def sha(p):
+ with p.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
+cache=root/'build/CMakeCache.txt'
+build_options=cache.read_text().splitlines() if cache.is_file() else []
+native='QRAZY_NATIVE_VULKAN:BOOL=ON' in build_options
+if native or args.native_core or args.native_core_manifest:
+ if not args.native_core or not args.native_core_manifest:
+  parser.error('Native packages require --native-core and --native-core-manifest')
+ manifest=json.loads(args.native_core_manifest.read_text())
+ platform=manifest['files']['linux-x64']
+ core_build=manifest['build']
+ if (manifest['interfaceVersion']!=11 or type(core_build) is not int or not 1<=core_build<10**15
+     or args.native_core.suffix!='.so' or args.native_core.stat().st_size!=platform['size']
+     or sha(args.native_core)!=platform['sha256']):
+  parser.error('The bundled Linux core must match its interface-11 manifest entry')
 target=out/('Qrazy-SDLCEF-linux-x64-'+args.version);target.mkdir() # Refuse rebuilding a used/prepared candidate.
 runtime=target/'runtime';runtime.mkdir();control=target/'updater';control.mkdir()
 cef=pathlib.Path((old/'cef-path.txt').read_text().strip())
@@ -23,6 +40,10 @@ for name in ('bridge.js','desktop_backend.py','SYSTEM-REQUIREMENTS.txt','CHANGES
 notes=pathlib.Path(args.notes_file).read_text() if args.notes_file else (linux/'CHANGES.txt').read_text()
 (runtime/'CHANGES.txt').write_text(notes)
 shutil.copyfile(root/'build/qrazy-sdl-cef',runtime/'qrazy-sdl-cef')
+if args.native_core:
+ native_source=source.parent/'nativeclient'
+ shutil.copytree(native_source/'assets',runtime/'native-assets')
+ shutil.copytree(native_source/'licences',runtime/'native-licences')
 licenses=runtime/'licenses';licenses.mkdir()
 for src,name in [(cef/'LICENSE.txt','CEF-LICENSE.txt'),(cef/'CREDITS.html','CEF-CREDITS.html'),(old/'deps/baseline/sdl/share/licenses/SDL3/LICENSE.txt','SDL3-LICENSE.txt'),(old/'PROJECT-LICENSE.txt','PROJECT-LICENSE.txt')]:shutil.copyfile(src,licenses/name)
 for p in runtime.rglob('*'):
@@ -30,8 +51,6 @@ for p in runtime.rglob('*'):
 lock=json.loads((linux/'node-lock.json').read_text());archive=root/lock['name']
 if not archive.exists():
  with urllib.request.urlopen(lock['url'],timeout=45) as response,archive.open('xb') as dest:shutil.copyfileobj(response,dest)
-def sha(p):
- with p.open('rb') as f:return hashlib.file_digest(f,'sha256').hexdigest()
 assert sha(archive)==lock['sha256']
 with tarfile.open(archive,'r:xz') as tar:
  for suffix,dest in [('bin/node',control/'node'),('LICENSE',control/'NODE-LICENSE.txt')]:
@@ -41,6 +60,9 @@ with tarfile.open(archive,'r:xz') as tar:
 (control/'node').chmod(0o755);(control/'NODE-LICENSE.txt').chmod(0o644)
 for name in ('production-runtime.cjs','production-release.cjs','release-public.pem'):shutil.copyfile(source/name,control/name);(control/name).chmod(0o644)
 subprocess.run([str(control/'node'),'--version'],check=True)
+if args.native_core:
+ subprocess.run([str(control/'node'),str(source.parent/'bundle-core.cjs'),str(args.native_core.resolve()),
+                 str(runtime),'--build',str(core_build)],check=True)
 inventory=[]
 for p in sorted(runtime.rglob('*')):
  if p.is_file():inventory.append(dict(path=p.relative_to(runtime).as_posix(),size=p.stat().st_size,sha256=sha(p),mode=493 if p.stat().st_mode&0o111 else 420))
@@ -53,6 +75,8 @@ manifest=dict(schema='qrazy-sdlcef-release-v1',product='qrazy-sdlcef',platform='
 (out/'runtime-manifest.json').write_text(json.dumps(manifest,separators=(',',':')))
 pins={p.relative_to(target).as_posix():sha(p) for p in control.iterdir()}
 launch=(linux/'launch.py').read_text().replace('CONTROL_PINS = {}', 'CONTROL_PINS = '+repr(pins))
+if 'QRAZY_LOCALHOST_SMOKE:BOOL=ON' in build_options:
+ launch=launch.replace("profile=ROOT/'profile-sdlcef-linux'", "profile=ROOT/'profile-sdlcef-linux-dev'")
 (target/'launch.py').write_text(launch);(target/'launch.py').chmod(0o644)
 shutil.copyfile(linux/'launch.sh',target/'launch.sh');(target/'launch.sh').chmod(0o755)
 shutil.copyfile(linux/'SYSTEM-REQUIREMENTS.txt',target/'SYSTEM-REQUIREMENTS.txt');(target/'SYSTEM-REQUIREMENTS.txt').chmod(0o644)

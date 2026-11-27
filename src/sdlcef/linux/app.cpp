@@ -45,12 +45,23 @@
 #include "include/cef_parser.h"
 #include "include/cef_render_handler.h"
 #include "include/cef_v8.h"
+#include "../date_binding.h"
+#include "date_format.h"
 #include "include/wrapper/cef_helpers.h"
 #include "frame_pacing.h"
 #include "pacing_watchdog.h"
+#ifdef QRAZY_NATIVE_VULKAN
+#include "native_view.h"
+#endif
 
 namespace {
+#ifdef QRAZY_LOCALHOST_SMOKE
+constexpr char kOrigin[] = "http://localhost:5173/";
+constexpr char kProfileName[] = "profile-sdlcef-linux-dev";
+#else
 constexpr char kOrigin[] = "https://qrazy-game.onrender.com/";
+constexpr char kProfileName[] = "profile-sdlcef-linux";
+#endif
 SDL_Window* window = nullptr;
 SDL_GLContext glcontext = nullptr;
 bool closing = false, closed = false, captured = false, hidden_check = false;
@@ -109,10 +120,16 @@ int DisplayRenderRate() {
 
 bool Trusted(const CefString& url) {
   CefURLParts parts;
-  return CefParseURL(url, parts) && CefString(&parts.scheme) == "https" &&
+  if (!CefParseURL(url, parts) || !CefString(&parts.username).empty() ||
+      !CefString(&parts.password).empty()) return false;
+#ifdef QRAZY_LOCALHOST_SMOKE
+  return CefString(&parts.scheme) == "http" && CefString(&parts.host) == "localhost" &&
+    CefString(&parts.port) == "5173";
+#else
+  return CefString(&parts.scheme) == "https" &&
     CefString(&parts.host) == "qrazy-game.onrender.com" &&
-    (CefString(&parts.port).empty() || CefString(&parts.port) == "443") &&
-    CefString(&parts.username).empty() && CefString(&parts.password).empty();
+    (CefString(&parts.port).empty() || CefString(&parts.port) == "443");
+#endif
 }
 CefRefPtr<CefDictionaryValue> Dict() { return CefDictionaryValue::Create(); }
 // URLs the client may open in the real browser for Steam sign-in: the game's /auth/steam/ pages or Steam's OpenID page.
@@ -147,6 +164,34 @@ class Native final : public CefV8Handler {
  private:
   IMPLEMENT_REFCOUNTING(Native);
 };
+
+#ifdef QRAZY_NATIVE_VULKAN
+QrazyLinuxNative::View native_view;
+
+class NativeMatchSink final : public CefV8Handler {
+  int operation_;
+ public:
+  explicit NativeMatchSink(int operation) : operation_(operation) {}
+  bool Execute(const CefString&, CefRefPtr<CefV8Value>, const CefV8ValueList& args,
+               CefRefPtr<CefV8Value>& value, CefString& exception) override {
+    auto context = CefV8Context::GetCurrentContext();
+    auto frame = context ? context->GetFrame() : nullptr;
+    if (!frame || !frame->IsMain() || !Trusted(frame->GetURL()) || args.size() != 1 ||
+        !args[0]->IsString() || args[0]->GetStringValue().length() > QrazyLinuxNative::bindings[operation_].limit) {
+      exception = "Unauthorized native match call";
+      return true;
+    }
+    auto message = CefProcessMessage::Create("qrazy-linux-match-v1");
+    message->GetArgumentList()->SetInt(0, operation_);
+    message->GetArgumentList()->SetString(1, args[0]->GetStringValue());
+    frame->SendProcessMessage(PID_BROWSER, message);
+    value = CefV8Value::CreateUndefined();
+    return true;
+  }
+ private:
+  IMPLEMENT_REFCOUNTING(NativeMatchSink);
+};
+#endif
 
 class App final : public CefApp, public CefRenderProcessHandler, public CefBrowserProcessHandler {
   struct Binding { CefRefPtr<CefV8Context> context; CefRefPtr<CefV8Value> dispatch; };
@@ -201,6 +246,16 @@ class App final : public CefApp, public CefRenderProcessHandler, public CefBrows
   }
   void OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) override {
     if (!frame->IsMain() || !Trusted(frame->GetURL())) return;
+    QrazyDate::Install(context, Trusted, [](double ms, bool date, bool time, bool seconds, int clock) {
+      return CefString(QrazyDate::FormatLinux(ms, date, time, seconds, clock));
+    }, desktop_clock_);
+#ifdef QRAZY_NATIVE_VULKAN
+    for (int i = 0; i < static_cast<int>(std::size(QrazyLinuxNative::bindings)); ++i) {
+      const auto* name = QrazyLinuxNative::bindings[i].name;
+      context->GetGlobal()->SetValue(name, CefV8Value::CreateFunction(name, new NativeMatchSink(i)), V8_PROPERTY_ATTRIBUTE_READONLY);
+    }
+    context->GetGlobal()->SetValue("qrazyNativeHubVersion", CefV8Value::CreateInt(1), V8_PROPERTY_ATTRIBUTE_READONLY);
+#endif
     auto native = CefV8Value::CreateFunction("qrazyNative", new Native);
     // Temporary bootstrap slot; removed before any website script runs. Dispatcher stays private.
     native->SetValue("pacing", CefV8Value::CreateBool(CefCommandLine::GetGlobalCommandLine()->HasSwitch("qrazy-frame-pacing")), V8_PROPERTY_ATTRIBUTE_READONLY);
@@ -213,6 +268,9 @@ class App final : public CefApp, public CefRenderProcessHandler, public CefBrows
       std::fprintf(stderr, "QRAZY trusted main-frame bridge installed\n");
     }
     else std::fprintf(stderr, "QRAZY bridge bootstrap failed\n");
+  }
+  void OnBrowserCreated(CefRefPtr<CefBrowser>, CefRefPtr<CefDictionaryValue> extra_info) override {
+    desktop_clock_ = extra_info ? extra_info->GetInt("desktopClock") : 0;
   }
   void OnContextReleased(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) override {
     auto it = bindings.find(browser->GetIdentifier());
@@ -228,6 +286,7 @@ class App final : public CefApp, public CefRenderProcessHandler, public CefBrows
     binding.context->Exit(); return true;
   }
  private:
+  int desktop_clock_ = 0;
   IMPLEMENT_REFCOUNTING(App);
 };
 
@@ -554,6 +613,9 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
   bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool gesture, bool) override {
     if (frame->IsMain()) {
       if(!Trusted(request->GetURL())){OpenWebLink(frame,request->GetURL(),gesture);return true;}
+#ifdef QRAZY_NATIVE_VULKAN
+      native_view.Stop(window);
+#endif
       Release("navigation");desktop_worker.Reset();selection.clear();popup_visible=false;BeginLoad();
       if(browser){browser->GetHost()->ImeCancelComposition();browser->GetHost()->SetAudioMuted(true);}composing=false;
       return false;
@@ -674,17 +736,44 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     ++begin_count;
     browser->GetHost()->SendExternalBeginFrame();
   }
+  CefRefPtr<CefDictionaryValue> VSyncState() {
+    auto state = pacing.VSyncState();
+#ifdef QRAZY_NATIVE_VULKAN
+    // The match renderer can change the Vulkan present mode without restarting CEF.
+    state->SetBool("activeEnabled", pacing.vsync);
+    state->SetBool("restartRequired", false);
+#endif
+    return state;
+  }
   void RenderSettingsChanged() {
-    auto event=Dict();event->SetString("type","render-settings");event->SetDictionary("vsync",pacing.VSyncState());event->SetDictionary("maxFps",pacing.MaxFpsState());Send(event);
+    auto event=Dict();event->SetString("type","render-settings");event->SetDictionary("vsync",VSyncState());event->SetDictionary("maxFps",pacing.MaxFpsState());Send(event);
   }
   void FullscreenState() {
     auto data=Dict(); data->SetString("type","fullscreen"); data->SetBool("value",!!(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN)); Send(data);
   }
   bool OnProcessMessageReceived(CefRefPtr<CefBrowser> b, CefRefPtr<CefFrame> frame, CefProcessId source, CefRefPtr<CefProcessMessage> msg) override {
-    if (msg->GetName() != "qrazy-command-v1") return false;
+    const auto name = msg->GetName();
+#ifdef QRAZY_NATIVE_VULKAN
+    const bool native_match = name == "qrazy-linux-match-v1";
+    if (name != "qrazy-command-v1" && !native_match) return false;
+#else
+    if (name != "qrazy-command-v1") return false;
+#endif
     if (source != PID_RENDERER || !browser || b->GetIdentifier() != browser->GetIdentifier() || !frame->IsMain() ||
         frame->GetIdentifier() != browser->GetMainFrame()->GetIdentifier() || !Trusted(frame->GetURL()) || !Trusted(browser->GetMainFrame()->GetURL())) return true;
     auto args = msg->GetArgumentList();
+#ifdef QRAZY_NATIVE_VULKAN
+    if (native_match) {
+      if (hidden_check || closing || args->GetSize() != 2 || args->GetType(0) != VTYPE_INT ||
+          args->GetType(1) != VTYPE_STRING) return true;
+      const int operation = args->GetInt(0);
+      if (operation < 0 || operation >= static_cast<int>(std::size(QrazyLinuxNative::bindings)) ||
+          args->GetString(1).length() > QrazyLinuxNative::bindings[operation].limit) return true;
+      native_view.Message(window, frame, prototype_profile, operation, args->GetString(1).ToString(), pacing.vsync, pacing.max_fps);
+      if (native_view.Shown() && captured) Release("native-match");
+      return true;
+    }
+#endif
     if (args->GetSize() != 3 || args->GetType(2)!=VTYPE_STRING || args->GetString(2).length()>1500000 || args->GetType(0) != VTYPE_STRING || args->GetType(1) != VTYPE_INT) return true;
     const auto op = args->GetString(0).ToString(); int id = args->GetInt(1); if (id < 0) return true;
     auto result = Dict(); result->SetBool("ok", true);
@@ -780,20 +869,28 @@ class Client final : public DesktopPolicy::RecoveryState, public CefClient, publ
     } else if (op == "fullscreen-state") result->SetBool("fullscreen", !!(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
     else if (op == "vsync-get" || op == "max-fps-get" || op == "vsync-set" || op == "max-fps-set") {
       const bool is_vsync = op == "vsync-get" || op == "vsync-set", is_set = op == "vsync-set" || op == "max-fps-set";
-      if (!is_set) result->SetDictionary("data", is_vsync ? pacing.VSyncState() : pacing.MaxFpsState());
-      else if (closing || recovering || loading || hidden_check || SDL_GetKeyboardFocus() != window) { result->SetBool("ok", false); result->SetString("error", "Return to the focused game before changing rendering settings"); }
+      bool focused = SDL_GetKeyboardFocus() == window;
+#ifdef QRAZY_NATIVE_VULKAN
+      if (native_view.Shown()) focused = native_view.HasKeyboardFocus();
+#endif
+      if (!is_set) result->SetDictionary("data", is_vsync ? VSyncState() : pacing.MaxFpsState());
+      else if (closing || recovering || loading || hidden_check || !focused) { result->SetBool("ok", false); result->SetString("error", "Return to the focused game before changing rendering settings"); }
       else if (!data_payload || (is_vsync ? data_payload->GetType("enabled") != VTYPE_BOOL : data_payload->GetType("value") != VTYPE_INT) || (!is_vsync && (data_payload->GetInt("value") < 30 || data_payload->GetInt("value") > 10000))) {
         result->SetBool("ok", false); result->SetString("error", "Expected a VSync boolean or com_maxfps integer from 30 to 10000");
       } else {
-        /* Saved for the next start: VSync off runs the timer-driven pacing, which is set up at startup. Only the cap applies at once. */
+        /* The CEF pacing mode is selected at startup. The native match applies
+           the saved value through its live Vulkan frame-cap setting. */
         const FramePacing previous = pacing;
         if (is_vsync) pacing.vsync = data_payload->GetBool("enabled"); else pacing.max_fps = data_payload->GetInt("value");
         if (!pacing.Save()) {
           pacing = previous;
           result->SetBool("ok", false); result->SetString("error", "Rendering setting could not be saved");
         } else {
+#ifdef QRAZY_NATIVE_VULKAN
+          native_view.SetFrameCap(pacing.vsync ? 0 : pacing.max_fps);
+#endif
           if (pacing.active && browser) browser->GetHost()->SetWindowlessFrameRate(pacing.Target(render_rate));
-          result->SetDictionary("data", is_vsync ? pacing.VSyncState() : pacing.MaxFpsState());
+          result->SetDictionary("data", is_vsync ? VSyncState() : pacing.MaxFpsState());
           RenderSettingsChanged();
         }
       }
@@ -953,7 +1050,16 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
   setenv("MESA_DISK_CACHE_DATABASE", "false", 1);
   setenv("MESA_DISK_CACHE_SINGLE_FILE", "false", 1);
   auto cache_root=getenv("QRAZY_ROOT")?std::filesystem::path(getenv("QRAZY_ROOT")):executable.parent_path();
-  setenv("XDG_CACHE_HOME", (cache_root / "profile-sdlcef-linux" / "cache-graphics").c_str(), 1);
+  setenv("XDG_CACHE_HOME", (cache_root / kProfileName / "cache-graphics").c_str(), 1);
+#ifdef QRAZY_NATIVE_VULKAN
+  if (argc == 2 && std::string_view(argv[1]) == "--native-core-check") {
+    if (tc_prepare_core()) return 0;
+    char reason[512] = "Verified native core unavailable";
+    tc_take_error(reason, sizeof(reason));
+    std::fprintf(stderr, "QRAZY %s\n", reason);
+    return 4;
+  }
+#endif
   if(argc==2&&std::string(argv[1])=="--desktop-worker-check") {
     auto fixture=executable/("worker-fixture-"+std::to_string(getpid()));
     if(std::filesystem::exists(fixture)||!std::filesystem::create_directory(fixture))return 25;
@@ -986,8 +1092,13 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     }
     if (RateForRefresh(0) || RateForRefresh(-1) || RateForRefresh(std::numeric_limits<double>::infinity()) ||
         RateForRefresh(std::numeric_limits<double>::quiet_NaN())) return 24;
+    #ifdef QRAZY_LOCALHOST_SMOKE
+    const char* good[]={kOrigin,"http://localhost:5173/path?query=1"};
+    const char* bad[]={"https://qrazy-game.onrender.com/","http://localhost/","http://localhost:5174/","http://localhost.evil.example:5173/","http://user@localhost:5173/","http://127.0.0.1:5173/"};
+    #else
     const char* good[]={kOrigin,"https://qrazy-game.onrender.com/path?query=1","https://qrazy-game.onrender.com:443/"};
     const char* bad[]={"http://qrazy-game.onrender.com/","https://qrazy-game.onrender.com.evil.example/","https://evil.example/?q=https://qrazy-game.onrender.com/","https://user@qrazy-game.onrender.com/","https://qrazy-game.onrender.com:444/","blob:https://qrazy-game.onrender.com/test","http://localhost:5173/","file:///tmp/test.html","https://qrazy-game.onrender.com./"};
+    #endif
     for(auto url:good) if(!Trusted(url)) return 20;
     for(auto url:bad) if(Trusted(url)) return 21;
     std::fprintf(stderr,"POLICY trusted-origin cases passed (no SDL or browser initialization)\n"); return 0;
@@ -1005,12 +1116,28 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     if(!ec&&std::filesystem::is_directory(candidate))profile_root=candidate;
     else { std::fprintf(stderr,"QRAZY invalid isolated root\n");return 4; }
   }
-  prototype_profile=profile_root/"profile-sdlcef-linux";
+  prototype_profile=profile_root/kProfileName;
   std::error_code profile_error;std::filesystem::create_directories(prototype_profile,profile_error);
   if(profile_error||std::filesystem::is_symlink(prototype_profile)){std::fprintf(stderr,"QRAZY unsafe/unavailable profile directory\n");return 4;}
   chmod(prototype_profile.c_str(),0700);signal(SIGPIPE,SIG_IGN);
   ProfileLock profile_lock;
   if(!profile_lock.Acquire(prototype_profile)){std::fprintf(stderr,"QRAZY profile already in use or unavailable; close its existing client before relaunching\n");return 4;}
+#ifdef QRAZY_NATIVE_VULKAN
+  struct CoreUpdateWait { ~CoreUpdateWait() { tc_core_wait(); } } core_update_wait;
+#if defined(QRAZY_LOCALHOST_SMOKE)
+  constexpr bool core_staging = true;
+#else
+  constexpr bool core_staging = false;
+#endif
+  tc_core_prepare((prototype_profile/"core-updates-v11").string().c_str(), !hidden_check, core_staging);
+  if (!tc_prepare_core()) {
+    char reason[512] = "Verified native core unavailable";
+    tc_take_error(reason, sizeof(reason));
+    std::fprintf(stderr, "QRAZY %s\n", reason);
+    return 4;
+  }
+  native_view.InstallHub();
+#endif
   if(!desktop_worker.Start(executable,prototype_profile))std::fprintf(stderr,"QRAZY desktop worker unavailable; browser loading fallback retained\n");
   if(!hidden_check) {
     /* Frame pacing for VSync off. The marker file is removed on a clean exit; if it is still there
@@ -1061,7 +1188,9 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
     CefRefPtr<Client> client = new Client;
     CefWindowInfo info; info.SetAsWindowless(0); info.shared_texture_enabled = true; info.external_begin_frame_enabled = pacing.active;
     CefBrowserSettings bs; bs.windowless_frame_rate = pacing.active ? pacing.Target(render_rate) : render_rate; bs.background_color = CefColorSetARGB(255,0,0,0);
-    if (!CefBrowserHost::CreateBrowser(info, client, kOrigin, bs, nullptr, nullptr)) return 7;
+    auto preferences = CefDictionaryValue::Create();
+    preferences->SetInt("desktopClock", QrazyDate::DesktopClock());
+    if (!CefBrowserHost::CreateBrowser(info, client, kOrigin, bs, preferences, nullptr)) return 7;
     auto end = std::chrono::steady_clock::now() + std::chrono::seconds(25);
     auto inspect_at = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     bool inspected=false;
@@ -1072,6 +1201,9 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
       ++passes;
       const auto pump_begin=std::chrono::steady_clock::now();
       CefDoMessageLoopWork();client->PumpDesktop();client->PumpRetry();
+#ifdef QRAZY_NATIVE_VULKAN
+      if (client->browser) native_view.Pump(window, client->browser->GetMainFrame());
+#endif
       pump_ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-pump_begin).count();
       // Also catch refresh changes that do not move or resize the window.
       if (std::chrono::steady_clock::now() >= refresh_at) {
@@ -1092,6 +1224,9 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
       while (SDL_PollEvent(&event)) {
         if (hidden_check) continue; // Never act on input, focus or cursor during background checks.
         if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) closing = true;
+#ifdef QRAZY_NATIVE_VULKAN
+        if (native_view.Event(event, closing)) continue;
+#endif
         if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST || event.type == SDL_EVENT_WINDOW_MINIMIZED) {
           client->ConfirmInstall(false);
           if (client->browser) { client->browser->GetHost()->SetFocus(false); client->browser->GetHost()->SetAudioMuted(true); }
@@ -1187,7 +1322,12 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
       const int present_rate=pacing.Target(render_rate);
       const auto present_period=std::chrono::nanoseconds(1000000000ll/std::clamp(present_rate,30,10000));
       const bool present_due=!pacing.active||present_now-last_present>=present_period*9/10;
-      if (native_card || (present_due && client->Draw())) {
+#ifdef QRAZY_NATIVE_VULKAN
+      const bool show_page = !native_view.Shown();
+#else
+      const bool show_page = true;
+#endif
+      if (show_page && (native_card || (present_due && client->Draw()))) {
         last_present=present_now;
         ++presentations;
         if (!hidden_check) {
@@ -1205,6 +1345,10 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
       if(pacing.active)pacing_clock.Wait(std::chrono::microseconds(250));
       else SDL_Delay(1);
     }
+#ifdef QRAZY_NATIVE_VULKAN
+    native_view.Stop(window);
+    native_view.ShutdownHub();
+#endif
     desktop_worker.Reset();if(!hidden_check){saved_window.Observe();saved_window.Save();}
     CefRefPtr<CookieFlushed> flushed=new CookieFlushed;
     bool requested=CefCookieManager::GetGlobalManager(nullptr)->FlushStore(flushed);
@@ -1230,6 +1374,8 @@ NOINLINE int RunBrowser(int argc, char** argv, const CefMainArgs& args, CefRefPt
 // requires this annotation on every frame leading to CefExecuteProcess. Do not
 // disable guard changes, global stack protection, or the Chromium sandbox.
 NO_STACK_PROTECTOR int main(int argc, char** argv) {
+  QrazyDate::DateLocale();
+  tzset();
   const auto executable = std::filesystem::canonical("/proc/self/exe").parent_path();
   std::ifstream bridge(executable / "bridge.js");
   std::ostringstream contents; contents << bridge.rdbuf(); bridge_source = contents.str();

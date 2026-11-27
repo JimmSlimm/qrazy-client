@@ -27,7 +27,7 @@ set(QRAZY_CONTROL_DIR "" CACHE PATH "Prepared public updater controls and genera
 target_include_directories(Qrazy PRIVATE "${QRAZY_CONTROL_DIR}")
 target_include_directories(QrazyLauncherObject PRIVATE "${QRAZY_CONTROL_DIR}")
 
-# Reuse the existing source-selected destination; no command-line runtime override.
+# Source-selected default destination. The Windows launcher also accepts --localhost.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../client-mode.cjs" QRAZY_CLIENT_MODE_SOURCE)
 if(QRAZY_CLIENT_MODE_SOURCE MATCHES "const CLIENT_MODE = 'dev';")
   set(QRAZY_DEV_MODE 1)
@@ -54,6 +54,48 @@ if(QRAZY_TRUE_CLIENT_DIR)
   target_compile_definitions(Qrazy PRIVATE QRAZY_TRUE_CLIENT=1)
   target_include_directories(Qrazy PRIVATE "${QRAZY_CORE_DIR}" "${QRAZY_CORE_DIR}/text" "${QRAZY_VK_INCLUDE}")
   target_link_libraries(Qrazy "${QRAZY_CORE_LIB}" "${QRAZY_CORE_DIR}/text/out/native/text_engine.lib" winmm.lib ole32.lib windowscodecs.lib uuid.lib gdi32.lib user32.lib)
+endif()
+
+# Native client (src/nativeclient): the game's own Vulkan renderer, sim, HUD, audio and network, drawn into the window and toggled with F2 like the true-client viewer above (they exclude each other).
+# QRAZY_NATIVE_DEPS_DIR holds the /MT builds of its libraries (local/build-deps-mt.cmd): third_party/glslang-build-mt, third_party/miniz, third_party/miniz-inc, third_party/stb, core-build-mt, text-build-mt.
+set(QRAZY_NATIVE_CLIENT_DIR "" CACHE PATH "Native client sources (src/nativeclient; empty = off)")
+set(QRAZY_NATIVE_DEPS_DIR "" CACHE PATH "Native client dependencies (folder holding third_party/, see src/nativeclient/deps.lock.json)")
+set(QRAZY_NATIVE_CORE_LIB "" CACHE FILEPATH "Import library of the game core (qrazy_core.lib, built by qlrace2)")
+if(QRAZY_NATIVE_CLIENT_DIR)
+  if(QRAZY_TRUE_CLIENT_DIR)
+    message(FATAL_ERROR "QRAZY_NATIVE_CLIENT_DIR and QRAZY_TRUE_CLIENT_DIR exclude each other")
+  endif()
+  set(NC_TP "${QRAZY_NATIVE_DEPS_DIR}/third_party")
+  file(GLOB NC_SOURCES "${QRAZY_NATIVE_CLIENT_DIR}/nc_*.cpp")
+  list(FILTER NC_SOURCES EXCLUDE REGEX "nc_main[.]cpp$")
+  set(NC_C_SOURCES "${NC_TP}/miniz/miniz.c" "${NC_TP}/miniz/miniz_tdef.c" "${NC_TP}/miniz/miniz_tinfl.c" "${NC_TP}/miniz/miniz_zip.c" "${NC_TP}/stb/stb_vorbis.c")
+  target_sources(Qrazy PRIVATE ${NC_SOURCES} ${NC_C_SOURCES})
+  set_source_files_properties(${NC_SOURCES} ${NC_C_SOURCES} PROPERTIES COMPILE_OPTIONS "/W3;/WX-;/wd4996;/wd4244;/wd4267;/EHsc")   # /EHsc: fatal errors throw (nc::g_throwOnFatal), the host build has no exception handling by default
+  target_link_options(Qrazy PRIVATE /DELAYLOAD:qrazy_core.dll)
+  # the client's own fonts, HUD sheets and the licences of what it is built from ship next to the program (the game core library is bundled by src/bundle-core.cjs, see local/build-native-embedded.cmd)
+  add_custom_command(TARGET Qrazy POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory "${QRAZY_NATIVE_CLIENT_DIR}/assets" "$<TARGET_FILE_DIR:Qrazy>/native-assets" COMMAND ${CMAKE_COMMAND} -E copy_directory "${QRAZY_NATIVE_CLIENT_DIR}/licences" "$<TARGET_FILE_DIR:Qrazy>/native-licences")
+  target_compile_definitions(Qrazy PRIVATE QRAZY_NATIVE_CLIENT=1 NC_CORE_LOADER=1)   # the page starts and stops the native view (qrazyNativeMatch); no F2, no true-client.cmdline
+  target_include_directories(Qrazy PRIVATE "${QRAZY_NATIVE_CLIENT_DIR}" "${QRAZY_NATIVE_CLIENT_DIR}/interface" "${QRAZY_VK_INCLUDE}" "${NC_TP}/glslang-build-mt/install/include" "${NC_TP}/miniz" "${NC_TP}/miniz-inc")
+  # the game core is a separate library (qrazy_core.dll, qrazy_core_api.h): linked by import library and delay-loaded, so tc_start picks the file (downloaded, cached or bundled) before the first call
+  target_link_libraries(Qrazy "${QRAZY_NATIVE_CORE_LIB}" delayimp.lib
+    "${NC_TP}/glslang-build-mt/install/lib/glslang.lib" "${NC_TP}/glslang-build-mt/install/lib/glslang-default-resource-limits.lib" winmm.lib ole32.lib windowscodecs.lib uuid.lib gdi32.lib user32.lib avrt.lib winhttp.lib mfplat.lib mfreadwrite.lib mfuuid.lib shlwapi.lib)
+endif()
+
+option(QRAZY_LOCAL_NATIVE_TEST "Use the local game and staged cores without client updates" OFF)
+if(QRAZY_LOCAL_NATIVE_TEST)
+  if(NOT QRAZY_NATIVE_CLIENT_DIR)
+    message(FATAL_ERROR "QRAZY_LOCAL_NATIVE_TEST requires QRAZY_NATIVE_CLIENT_DIR")
+  endif()
+  set(QRAZY_DEV_MODE 1)
+endif()
+
+option(QRAZY_STAGE0 "Disable updates for the Stage 0 comparison" OFF)
+if(QRAZY_LOCAL_NATIVE_TEST AND NOT QRAZY_STAGE0)
+  target_compile_definitions(Qrazy PRIVATE QRAZY_LOCAL_CORE_SMOKE=1)
+endif()
+if(QRAZY_STAGE0 OR QRAZY_LOCAL_NATIVE_TEST)
+  target_compile_definitions(Qrazy PRIVATE QRAZY_STAGE0=1)
+  target_compile_definitions(QrazyLauncherObject PRIVATE QRAZY_STAGE0=1)
 endif()
 
 target_compile_definitions(Qrazy PRIVATE QRAZY_DEV_MODE=${QRAZY_DEV_MODE})

@@ -84,7 +84,7 @@ class Assets {
   uint64_t total_,reserve_;
   std::filesystem::path directory_;
   std::map<std::string,std::unique_ptr<Transfer>> transfers_;
-  static int Limit(const std::string& kind){return kind=="sound"?64*static_cast<int>(AssetChunk):kind=="map"||kind=="shader"||kind=="texture"?512*static_cast<int>(AssetChunk):0;}
+  static int Limit(const std::string& kind){return kind=="sound"?64*static_cast<int>(AssetChunk):kind=="map"||kind=="shader"||kind=="texture"?512*static_cast<int>(AssetChunk):kind=="model"?16*static_cast<int>(AssetChunk):0;}
   std::filesystem::path Filename(const std::string& kind,const std::string& key){Hash hash;hash.Add(kind.data(),kind.size());char zero=0;hash.Add(&zero,1);hash.Add(key.data(),key.size());auto name=hash.Finish();return name.empty()?std::filesystem::path():directory_/(name+".asset");}
   bool Key(const std::string& kind,const std::string& key){if(!Limit(kind)||key.empty()||key.size()>2048)return false;for(unsigned char ch:key)if(ch<32||ch==127)return false;return true;}
   std::string Token(){unsigned char bytes[16];if(BCryptGenRandom(nullptr,bytes,sizeof(bytes),BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)return {};Hash hash;hash.Add(bytes,sizeof(bytes));return hash.Finish();}
@@ -107,6 +107,8 @@ class Assets {
   }
  public:
   explicit Assets(uint64_t total=AssetTotal,uint64_t reserve=AssetReserve):total_(total),reserve_(reserve){}
+  /* The file a completed asset is stored in (QAS1: AssetHeader bytes, then the payload), for read-only use by the native client; empty for a bad kind or key. */
+  std::filesystem::path PathOf(const std::string& kind,const std::string& key){return Key(kind,key)?Filename(kind,key):std::filesystem::path();}
   bool Initialize(const std::filesystem::path& profile){directory_=profile/"desktop-assets";std::error_code error;if(!NoReparse(directory_))return false;std::filesystem::create_directories(directory_,error);return !error&&NoReparse(directory_);}
   void Reset(){transfers_.clear();}
   CefRefPtr<CefDictionaryValue> Call(const std::string& op,CefRefPtr<CefListValue> args) {
@@ -175,6 +177,7 @@ class AssetWorker {
  public:
   std::atomic<unsigned> epoch{0};
   ~AssetWorker(){Stop();}
+  std::filesystem::path PathOf(const std::string& kind,const std::string& key){return assets_.PathOf(kind,key);}
   bool Start(const std::filesystem::path& profile){if(!assets_.Initialize(profile))return false;thread_=std::thread([this]{for(;;){AssetJob job;{std::unique_lock<std::mutex> lock(mutex_);wake_.wait(lock,[&]{return stopping_||!queue_.empty();});if(stopping_)break;job=std::move(queue_.front());queue_.pop_front();}if(job.op=="reset"||job.epoch==epoch.load())job.response=Serialize(job.op=="config-read"||job.op=="config-write"?Config(job.op,job.args):assets_.Call(job.op,job.args));{std::lock_guard<std::mutex> lock(mutex_);--pending_;if(job.id&&!job.response.empty())replies_.push_back(std::move(job));}}assets_.Reset();});return true;}
   bool Submit(int id,const std::string& op,CefRefPtr<CefListValue> args){std::lock_guard<std::mutex> lock(mutex_);if(!thread_.joinable()||stopping_||pending_>=16)return false;++pending_;queue_.push_back({id,epoch.load(),op,{},args->Copy()});wake_.notify_one();return true;}
   void Reset(){++epoch;std::lock_guard<std::mutex> lock(mutex_);pending_-=queue_.size();queue_.clear();replies_.clear();if(thread_.joinable()&&!stopping_){++pending_;queue_.push_back({0,epoch.load(),"reset",{},nullptr});wake_.notify_one();}}

@@ -55,6 +55,13 @@ try {
     if ($registration.InstallLocation -eq $root -and $plan.version) { Set-ItemProperty -LiteralPath $uninstallKey -Name DisplayVersion -Value $plan.version }
   } catch { # Metadata failure must not undo a verified application update.
   }
+  # Keep only the newest recovery folder: remove older ones left by earlier updates.
+  try {
+    Get-ChildItem -LiteralPath $parent -Directory -Force -Filter '.qrazy-previous-*' -ErrorAction Stop | Where-Object {
+      $_.Name -match '^\.qrazy-previous-[a-f0-9]+$' -and $_.FullName -ne $backup -and !($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+    } | ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop } catch { } }
+  } catch { # Cleanup failure must not affect the verified update.
+  }
   Report 'installed' 'Client updated. The previous application folder is retained for recovery.'
   if (!$plan.noRestart) { Start-Process -FilePath (Join-Path $root 'Qrazy.exe') -WorkingDirectory $root -WindowStyle Normal }
 } catch {

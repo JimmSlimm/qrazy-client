@@ -7,7 +7,7 @@ import base64, hashlib, json, os, pathlib, re, stat, struct, sys, uuid
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
 
 HEADER, CHUNK = 4096, 1048576
-LIMITS = {'map': 512*CHUNK, 'sound': 64*CHUNK, 'shader': 512*CHUNK, 'texture': 512*CHUNK}
+LIMITS = {'map': 512*CHUNK, 'sound': 64*CHUNK, 'shader': 512*CHUNK, 'texture': 512*CHUNK, 'model': 16*CHUNK}
 TOTAL, RESERVE = 16*1024**3, 1024**3
 
 def integer(n): return type(n) is int
