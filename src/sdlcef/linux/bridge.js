@@ -3,10 +3,15 @@
   // Read-only presentation: the game owns data, formatting and Tab eligibility.
   let informationSnapshot = null, informationHeld = false, informationBox, informationClock = 0;
   const infoText = (value, max = 120) => typeof value === 'string' ? value.slice(0, max) : '';
-  function hideInformation() { informationHeld = false; clearInterval(informationClock); informationBox?.remove(); informationBox = null; }
+  function postInformation(withSnapshot) {
+    if (typeof window.qrazyNativeInfo !== 'function' || window.__qtcOn !== true) return;
+    try { window.qrazyNativeInfo(JSON.stringify(withSnapshot && informationSnapshot ? {held: informationHeld, snap: informationSnapshot} : {held: informationHeld})); } catch {}
+  }
+  function hideInformation() { const was = informationHeld; informationHeld = false; clearInterval(informationClock); informationBox?.remove(); informationBox = null; if (was) postInformation(false); }
   function renderInformation() {
     informationBox?.remove(); informationBox = null; clearInterval(informationClock);
     if (!informationHeld || !informationSnapshot || !document.body) return;
+    postInformation(true);
     const data = informationSnapshot;
     const box = document.createElement('section');
     box.setAttribute('aria-label', 'Current map information');
@@ -188,15 +193,15 @@
     setHeld(value) {
       if (value !== true) { hideInformation(); return; }
       const target = document.activeElement;
-      if (!document.hasFocus() || target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(target?.tagName || '')) return;
+      if (window.__qtcOn !== true && (!document.hasFocus() || target?.isContentEditable || /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(target?.tagName || ''))) return;
       informationHeld = true; renderInformation();
     },
     clear() { hideInformation(); informationSnapshot = null; }
   };
   window.addEventListener('keyup', event => { if (event.code === 'Tab') hideInformation(); }, true);
-  window.addEventListener('blur', hideInformation);
+  window.addEventListener('blur', () => { if (window.__qtcOn !== true) hideInformation(); });
   window.addEventListener('pagehide', information.clear);
-  document.addEventListener('focusin', hideInformation);
+  document.addEventListener('focusin', () => { if (window.__qtcOn !== true) hideInformation(); });
 
   const pending = new Map(), moves = new Set(), states = new Set(), fullscreen = new Set();
   let gameStatusNotice;

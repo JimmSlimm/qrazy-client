@@ -409,8 +409,8 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
 
   // ---- the map (optional: without --root the loop just clears)
   nc::PostPass post; uint32_t pathRevision = 0;
-  nc::World world; bool haveWorld = false; double eye[3] = {0, 100, 0}, yaw0 = 0, pitch = 0, fov = g_set->fov;
   nc::FileSource fs; fs.root = optRoot;
+  nc::World world; bool haveWorld = false; double eye[3] = {0, 100, 0}, yaw0 = 0, pitch = 0, fov = g_set->fov;
   for (const auto& [pk, tier] : optPk3) { std::string p = pk; uint64_t off = 0; const size_t at = pk.rfind('@'); if (at != std::string::npos && at + 1 < pk.size() && pk.find_first_not_of("0123456789", at + 1) == std::string::npos) { p = pk.substr(0, at); off = strtoull(pk.c_str() + at + 1, nullptr, 10); }   // "file@offset": an archive inside a larger file
     std::string err; if (!fs.mountZip(p, &err, off, tier)) nc::fatal("%s", err.c_str()); nc::logf("mounted %s", p.c_str()); }
   for (const std::string& spec : optFiles2) {   // "assets/models/x.glb=C:/path/file@4096+12345"
@@ -473,6 +473,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
   }
   // ---- the simulation
   struct Pickup { int handle; double pos[3]; }; std::vector<Pickup> pickups;
+  std::map<std::string, std::vector<int>> pickupHandles;
   static_assert(sizeof(QcCameraInput) == 264 && offsetof(QcCameraInput, mode) == 184);
   static_assert(sizeof(QcCamera) == 168 && offsetof(QcCamera, gun) == 104 &&
                 offsetof(QcCamera, zoomed) == 160 && offsetof(QcCamera, inputFlags) == 164);
@@ -501,6 +502,41 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
     return optRunway ? sim.loadRunway(simFixes, !optPql, sharedMatch)
                      : sim.loadMap(simBsp, simFixes, simName, !optPql, sharedMatch);
   };
+  nc::J modelManifest;
+  const auto modelFile = [&](const char* key) -> std::string {
+    const nc::J* models = modelManifest.get("models");
+    if (!*key) return {};
+    const std::string mounted = std::string("assets/models/by-name/") + key + ".glb";
+    if (fs.exists(mounted)) return mounted;
+    const nc::J* entry = models ? models->get(key) : nullptr;
+    const std::string file = entry ? entry->str("file") : "";
+    if (file.size() <= 4 || file.substr(file.size() - 4) != ".glb" ||
+        file.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != std::string::npos) return {};
+    return "assets/models/" + file;
+  };
+  const auto syncPickups = [&] {
+    if (!haveWorld) return;
+    for (const Pickup& pickup : pickups) world.setObject(pickup.handle, pickup.pos, 0, false);
+    pickups.clear();
+    std::map<std::string, size_t> used;
+    for (const auto& spot : sim.items()) {
+      const auto visual = pickupVisuals.find(spot.classname);
+      if (visual == pickupVisuals.end()) continue;
+      const auto& row = visual->second;
+      auto& handles = pickupHandles[spot.classname];
+      size_t& next = used[spot.classname];
+      if (next == handles.size()) {
+        const int handle = world.addPickup(row.weapon, modelFile(row.model), row.icons, row.size,
+                                           row.marker, row.radius, row.stretch);
+        if (handle < 0) continue;
+        handles.push_back(handle);
+      }
+      const int handle = handles[next++];
+      pickups.push_back({handle, {spot.pos[0], spot.pos[1], spot.pos[2]}});
+      world.setObject(handle, spot.pos, 0, true);
+    }
+    nc::logf("pickups: %zu placed", pickups.size());
+  };
   const bool sessionAudio = optSim && nc::soundEvent(QC_SOUND_RESET) == 0;
   if (optSim) {
     if (sharedMatch) nc::matchOp(QC_MATCH_MODE, !optPql, optWeaponS, optHook);
@@ -519,18 +555,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
       std::string manifestText;
       if (fs.read(manifestPath, bytes)) manifestText.assign(bytes.begin(), bytes.end());
       else if (!g_assetsDir.empty()) manifestText = readText(g_assetsDir + "/" + manifestPath);
-      nc::J manifest;
-      const nc::J* models = nc::parseJson(manifestText, manifest) ? manifest.get("models") : nullptr;
-      const auto modelFile = [&fs, models](const char* key) -> std::string {
-        if (!*key) return {};
-        const std::string mounted = std::string("assets/models/by-name/") + key + ".glb";
-        if (fs.exists(mounted)) return mounted;
-        const nc::J* entry = models ? models->get(key) : nullptr;
-        const std::string file = entry ? entry->str("file") : "";
-        if (file.size() <= 4 || file.substr(file.size() - 4) != ".glb" ||
-            file.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != std::string::npos) return {};
-        return "assets/models/" + file;
-      };
+      if (!nc::parseJson(manifestText, modelManifest)) modelManifest = {};
       for (int i = 0; ; ++i) {
         RcViewWeaponVisual row{};
         if (!rc_view_weapon_visual(i, &row)) break;
@@ -547,15 +572,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
         if (!rc_pickup_visual(i, &row)) break;
         pickupVisuals.emplace(row.classname, row);
       }
-      for (const auto& spot : sim.items()) {
-        const auto visual = pickupVisuals.find(spot.classname);
-        if (visual == pickupVisuals.end()) continue;
-        const auto& row = visual->second;
-        const int handle = world.addPickup(row.weapon, modelFile(row.model), row.icons, row.size,
-                                           row.marker, row.radius, row.stretch);
-        if (handle >= 0) pickups.push_back({handle, {spot.pos[0], spot.pos[1], spot.pos[2]}});
-      }
-      nc::logf("pickups: %zu placed", pickups.size());
+      syncPickups();
     }
     syncCapture();
     if (optFacePickup && !pickups.empty()) {   // --facepickup: turn toward the nearest pickup (for captures)
@@ -568,7 +585,14 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
   // the pickups' motion records (qc_ses_items): the map's pickups first, then the custom ones; room for every one made now
   constexpr size_t CUSTOM_ITEMS = 24; std::vector<QcItemSpin> spins; double itemsAt = -1;
   const auto addSpin = [&](const double p[3]) { QcItemSpin it{}; it.baseY = it.y = p[1]; it.phase = fmod(p[0] * 0.013 + p[2] * 0.017, 6.283); it.visible = 1; spins.push_back(it); };
-  spins.reserve(pickups.size() + CUSTOM_ITEMS); customItems.reserve(CUSTOM_ITEMS); for (const Pickup& pk : pickups) addSpin(pk.pos);
+  const auto resetPickupSpins = [&] {
+    spins.clear();
+    spins.reserve(pickups.size() + CUSTOM_ITEMS);
+    for (const Pickup& pk : pickups) addSpin(pk.pos);
+    for (const CustomItem& item : customItems) addSpin(item.pos);
+  };
+  customItems.reserve(CUSTOM_ITEMS);
+  resetPickupSpins();
   // the !showtriggers overlay for the held map and physics: built hidden at every load and again after a mode op (the physics decides which entities exist); its label images are uploaded here
   const auto buildTriggers = [&] { if (!haveWorld) return; world.buildTriggerOverlay(optSim ? simFixes : readText(optFixes), loadName, !optPql, optRunway); world.showTriggerOverlay(optShowTriggers || g_showTriggers); };
   buildTriggers();
@@ -737,7 +761,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
   std::string joined, simPush, pageActions;
   pageActions.reserve(256 * 96);
   uint64_t shownRevision = UINT64_MAX;
-  size_t lastShownMax = 0;
+  size_t lastShownFirst = 0;
   uint32_t shownChatFirst = UINT32_MAX, shownChatEnd = UINT32_MAX;
   g_input.recordMotion = latency.active();
   g_input.motionReceipt = {};
@@ -749,7 +773,11 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
     if (g_boardDirty.exchange(false)) { std::string j; { std::lock_guard<std::mutex> g(g_boardMu); j = g_boardJson; } nc::parseScoreboard(j, board); nc::logf("board message: held %d, %zu cards, %zu groups", (int)board.held, board.cards.size(), board.groups.size()); }
     if (g_settingsDirty.exchange(false)) {   // the player's settings from the page (qrazyNativeSettings): look, view, audio, binds
       std::string j; { std::lock_guard<std::mutex> g(g_pageMu); j = g_settingsJson; } nc::J r;
-      if (coreSettings(j) && nc::parseJson(j, r) && r.t == nc::J::Obj) {
+      const int previousPicmip = (int)g_set->picmip;
+      const bool accepted = coreSettings(j);
+      if (accepted && haveWorld && (int)g_set->picmip != previousPicmip)
+        world.setPicmip((int)g_set->picmip);
+      if (accepted && nc::parseJson(j, r) && r.t == nc::J::Obj) {
         auto flag = [](const nc::J* o, const char* k) { const nc::J* v = o ? o->get(k) : nullptr; return v && v->t == nc::J::Bool && v->b; };
         const nc::J* ho = r.get("host");   // what only the page can work out
         const auto part = [&](const char* k) { const nc::J* v = ho ? ho->get(k) : nullptr; return v && v->t == nc::J::Obj ? v : nullptr; };
@@ -917,6 +945,8 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
     }
     if (g_quit) break;
     NC_CK(vkWaitForFences(c.dev, 1, &fence, VK_TRUE, UINT64_MAX));
+    if (hostStop && hostStop->load()) break;
+    if (haveWorld && !g_settingsDirty.load()) world.refreshPicmip();
     if (shotPending) { shotPending = false; writePngBgra(optShot, shotBuf.ptr, shotW, shotH); }
     if (optBench && qValid && frames >= 30) {
       uint64_t ts[4] = {};
@@ -1033,6 +1063,8 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
           if (sharedMatch && nc::matchOp(QC_MATCH_RELOAD, nc::inputSeconds(nc::qpcNow())) < 0)
             nc::fatal("sim: match reload refused");
           advertiseMode();
+          syncPickups();
+          resetPickupSpins();
           qc_peer_clear_samples(); buildTriggers();
           afterRespawn("mode reload", r0);
         }
@@ -1184,6 +1216,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
       if (optSim && poseDirty) { nPoses = sim.poses(poseBytes); poseDirty = false; }
     }
     const bool following = followN > 0 && haveFollow;
+    if (haveHud) hud.setPlayerHudView(followN < 0, following);
     nc::HudNumbers gunState{};
     if (optSim && !gunHandle.empty()) liveNumbers(gunState);
     if (sharedMatch && haveHud) {
@@ -1288,13 +1321,17 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
       if (optSim) {
         if (haveHud && !sharedMatch) {
           const bool showHistory = chatHistory || (camera.inputFlags & 1u);
-          if (!chatOpen && !showHistory) { const int64_t cutoff = nowQ - 8 * freq; while (!chatLog.empty() && chatLog.front().at < cutoff) { chatLog.erase(chatLog.begin()); ++chatRevision; } }   // closed: the last 6 lines of the last 8 seconds; open (page): the last 40
           const size_t shownMax = showHistory && !chatOpen ? 14 : 6;
-          if (shownRevision != chatRevision || shownMax != lastShownMax) {
+          size_t first = chatLog.size() > shownMax ? chatLog.size() - shownMax : 0;
+          if (!showHistory) {
+            const int64_t cutoff = nowQ - 8 * freq;
+            while (first < chatLog.size() && chatLog[first].at < cutoff) ++first;
+          }
+          if (shownRevision != chatRevision || first != lastShownFirst) {
             shownRevision = chatRevision;
-            lastShownMax = shownMax;
+            lastShownFirst = first;
             joined.clear();
-            for (size_t k = chatLog.size() > shownMax ? chatLog.size() - shownMax : 0; k < chatLog.size(); ++k) {
+            for (size_t k = first; k < chatLog.size(); ++k) {
               if (!joined.empty()) joined += '\n';
               joined += chatLog[k].text;
             }

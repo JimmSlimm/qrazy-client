@@ -38,15 +38,16 @@ bool parseScoreboard(const std::string& json, Scoreboard& b) {
     return c; };
   if (profile) for (const J& r : prof->a) b.cards.push_back(cardOf(r));
   else if (recs && recs->t == J::Arr) for (const J& r : recs->a) b.cards.push_back(cardOf(r));
-  const J* mp = s->get("multiplayer"); int total = 0; size_t rowsN = 0, specN = 0;
+  const J* groups = s->get("groups"); const J* specs = s->get("spectators");
+  size_t rowsN = 0;
+  if (groups && groups->t == J::Arr) for (const J& g : groups->a) { ScoreGroup o; o.label = g.str("label"); const J* rows = g.get("rows"); if (rows && rows->t == J::Arr) for (const J& r : rows->a) o.rows.push_back(rowOf(r)); rowsN += o.rows.size(); if (!o.rows.empty()) b.groups.push_back(o); }
+  if (specs && specs->t == J::Arr) for (const J& r : specs->a) b.spectators.push_back(joinName(r));
+  const J* mp = s->get("multiplayer"); int total = 0;
   if (mp && mp->t == J::Obj) {
-    const J* groups = mp->get("groups"); const J* specs = mp->get("spectators");
-    if (groups && groups->t == J::Arr) for (const J& g : groups->a) { ScoreGroup o; o.label = g.str("label"); const J* rows = g.get("rows"); if (rows && rows->t == J::Arr) for (const J& r : rows->a) o.rows.push_back(rowOf(r)); rowsN += o.rows.size(); if (!o.rows.empty()) b.groups.push_back(o); }
-    if (specs && specs->t == J::Arr) for (const J& r : specs->a) b.spectators.push_back(joinName(r)); specN = b.spectators.size();
     total = (int)mp->num("total", 0);
     if (mp->str("state") == "disconnected" && mode != "Solo") b.notice = "Not connected to multiplayer."; else if (b.groups.empty()) b.notice = "No active players.";
   }
-  const int count = mode == "Solo" ? (int)(rowsN + specN) : total;
+  const int count = mode == "Solo" ? (int)(rowsN + b.spectators.size()) : total;
   char f[96]; snprintf(f, sizeof f, "%d %s - Release Tab to return", count, count == 1 ? "player" : "players"); b.footer = f;
   return true;
 }

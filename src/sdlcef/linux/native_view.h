@@ -186,8 +186,9 @@ class View {
     instance_ = this;
     tc_set_menu_request([] { instance_->menu_ = true; });
     tc_set_tab([](bool down) {
-      instance_->Queue(std::string("window.dispatchEvent(new KeyboardEvent('") +
-          (down ? "keydown" : "keyup") + "',{code:'Tab',key:'Tab',bubbles:true}))");
+      // The game's Tab handlers listen on document.
+      instance_->Queue(std::string("document.dispatchEvent(new KeyboardEvent('") +
+          (down ? "keydown" : "keyup") + "',{code:'Tab',key:'Tab',bubbles:true,cancelable:true}))");
     });
     tc_set_sim_out([](const char* json) {
       instance_->Queue(std::string("window.qrazyNativeSim&&window.qrazyNativeSim(") + json + ")");

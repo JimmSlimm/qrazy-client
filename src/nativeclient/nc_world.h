@@ -54,6 +54,8 @@ class World {
   int addViewWeaponGlb(const std::vector<uint8_t>& glb, double scale);   // /custommodel: fitted by rc_fit_standard(scale)
   int addObjectGlb(const std::vector<uint8_t>& glb, double size);   // /custompickup
   void setLoadOptions(int picmip, bool mapFx);   // r_picmip, r_mapFx: read by load()
+  void setPicmip(int level);
+  void refreshPicmip();   // render thread, after the previous frame's fence and before recording
   void setRender(bool sortTranslucent, bool volumeFog, bool fastSky);   // r_sortTranslucent, r_volumeFog, r_fastSky: any time after load
   // cg_ghostPath: the ghost's route as two lines (ghost-path.js). Build once per track (rows = stride 14: t x y z ... teleport counter in 13); draw every frame (no allocation). k = the sample the ghost is at; resW / resH in layout pixels.
   void buildGhostPath(const double* rows, int n);

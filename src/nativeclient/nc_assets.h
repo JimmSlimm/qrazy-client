@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <memory>
 
 namespace nc {
 
@@ -15,6 +16,7 @@ struct FileSource {
   ~FileSource();
   FileSource(const FileSource&) = delete; FileSource& operator=(const FileSource&) = delete;
   FileSource(FileSource&&) noexcept; FileSource& operator=(FileSource&&) noexcept;
+  FileSource snapshot() const;   // capture the current mounts before handing reads to another thread
   bool mountZip(const std::string& path, std::string* error = nullptr, uint64_t offset = 0, int shaderTier = 2);   // offset: where the archive starts inside the file (the asset store's QAS1 header is 4096 bytes)   // false = unreadable / not a zip
   bool read(const std::string& rel, std::vector<uint8_t>& out, int* archive = nullptr, std::string* actualName = nullptr) const;
   bool exists(const std::string& rel) const;
@@ -27,7 +29,7 @@ struct FileSource {
   int archiveCount() const;
  private:
   bool readEntry(int archive, unsigned index, std::vector<uint8_t>& out) const;
-  struct Zip; std::vector<Zip*> zips_;
+  struct Zip; std::vector<std::shared_ptr<Zip>> zips_;
   struct VFile { std::string name, path; uint64_t offset, size; }; std::vector<VFile> vfiles_;
 };
 

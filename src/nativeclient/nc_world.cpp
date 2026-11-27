@@ -9,11 +9,14 @@
 #include "object_state.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <climits>
+#include <future>
 #include <map>
+#include <stdexcept>
 #include <vector>
 
 using namespace rc::fp;
@@ -89,13 +92,34 @@ struct Prog {
   VkShaderModule vs = VK_NULL_HANDLE, fs = VK_NULL_HANDLE; VkDescriptorSetLayout set2 = VK_NULL_HANDLE; VkPipelineLayout layout = VK_NULL_HANDLE;
   std::vector<Attr> attrs; std::vector<UniformSlot> slots; uint32_t stageVec4 = 0; bool ok = false; uint32_t stride = 56; const char* names = nullptr; std::vector<std::pair<std::string, int>> inputs;
 };
-struct MatGpu { VkDescriptorSet set = VK_NULL_HANDLE; size_t matOff = 0, stageOff = 0; bool ready = false, hasDiffuse = false; uint32_t stamp = 0; int surface = -1; };
+struct MatGpu { VkDescriptorSet set = VK_NULL_HANDLE; size_t matOff = 0, stageOff = 0; bool ready = false; std::string diffuse; uint32_t stamp = 0; int surface = -1; };
 struct SurfaceTarget { Image color, depth; VkFramebuffer fb = VK_NULL_HANDLE; int size = 0; };
 struct Grabbed { std::vector<FrameEntry> ent; std::vector<uint8_t> blocks; std::vector<ObjectState> states; std::vector<DrawItem> draws; };
 
 static const int MAX_PASS_SLOTS = 9, MINIMAP_SLOT = MAX_PASS_SLOTS - 1, GUN_SLOT = MINIMAP_SLOT - 1, PASS_SLOT = 16384, LIGHT_SLOT = 512, DRAW_STRIDE = 256, DRAW_CAP = 16384;
 
 struct GunPass { Grabbed list; uint32_t drawBase = 0; bool on = false; };
+struct TexturePixels {
+  std::string name;
+  std::vector<uint8_t> rgba;
+  int32_t size[2] = {};
+  Image replacement;
+
+  bool load(const FileSource& fs, bool mip, int level) {
+    int w = 0, h = 0;
+    if (!loadImage(fs, name, rgba, w, h)) return false;
+    size[0] = w;
+    size[1] = h;
+    if (mip && (rgba.size() > INT_MAX || rc_picmip_rgba(rgba.data(), static_cast<int>(rgba.size()), size, level) != 0))
+      throw std::runtime_error("core picmip failed for " + name);
+    return true;
+  }
+
+  Image upload(const Context& c) const {
+    return makeTexture(c, rgba.data(), size[0], size[1], true, !getenv("QRAZY_NC_LINEARTEX"));
+  }
+};
+
 struct World::Impl {
   std::vector<PlanPass> passes;
   Grabbed lists[MAX_PASS_SLOTS], objectList;
@@ -113,25 +137,27 @@ struct World::Impl {
   Buf vbuf, ibuf, passBuf, lightBuf, drawBuf, matBuf; size_t matBump = 0;
   VkDescriptorSetLayout set0Layout = VK_NULL_HANDLE, set1Layout = VK_NULL_HANDLE; VkDescriptorPool pool = VK_NULL_HANDLE; VkSampler samp = VK_NULL_HANDLE, sampClamp = VK_NULL_HANDLE, sampFlat = VK_NULL_HANDLE;   // sampFlat: repeat, linear, level 0 only (a record material with wrapS 10497: the trigger overlay labels)
   VkDescriptorSet set0[MAX_PASS_SLOTS], set1 = VK_NULL_HANDLE;
-  Image white, grey; std::vector<Image> lmPages; std::map<std::string, Image> texCache; std::vector<SurfaceTarget> targets;
+  Image white, grey; std::vector<Image> lmPages; std::map<std::pair<std::string, bool>, Image> texCache; std::vector<SurfaceTarget> targets;
   std::map<std::pair<uint32_t, uint32_t>, VkPipeline> pipes;
   uint32_t frameStamp = 0; int nSurfaces = 0; bool loggedObjects = false;
   struct Obj; std::unique_ptr<Obj> obj;
+  int wantedPicmip = 0;
+  size_t refreshCacheSize = 0;
+  std::atomic<bool> cancelPicmip{false};
+  std::future<std::vector<TexturePixels>> picmipJob;
+  std::vector<TexturePixels> picmipUploads;
+  size_t uploadedPicmip = 0;
 
   const Image& texByName(const std::string& nameIn, bool mip = true) {   // mip: r_picmip applies (not to baked lightmaps)
-    const std::string name = lower(nameIn); auto it = texCache.find(name); if (it != texCache.end()) return it->second;
-    std::vector<uint8_t> rgba; int w = 0, h = 0;
-    if (loadImage(*fs, name, rgba, w, h)) { ++st.texturesLoaded;
-      if (mip) {
-        int32_t size[2] = {w, h};
-        if (rgba.size() > INT_MAX || rc_picmip_rgba(rgba.data(), static_cast<int>(rgba.size()), size, picmip) != 0)
-          fatal("core picmip failed for %s (%d x %d)", name.c_str(), w, h);
-        w = size[0];
-        h = size[1];
-      }
-      return texCache[name] = makeTexture(c, rgba.data(), w, h, true, !getenv("QRAZY_NC_LINEARTEX")); }   // the packet's images are sRGB-encoded: sampled to linear (QRAZY_NC_LINEARTEX: raw, a diagnostic)
-    ++st.texturesMissing; if (st.texturesMissing <= 12) logf("missing texture: %s", name.c_str());
-    return texCache[name] = grey;
+    const auto key = std::make_pair(lower(nameIn), mip);
+    auto it = texCache.find(key); if (it != texCache.end()) return it->second;
+    TexturePixels pixels{key.first};
+    if (pixels.load(*fs, mip, picmip)) {
+      ++st.texturesLoaded;
+      return texCache[key] = pixels.upload(c);
+    }
+    ++st.texturesMissing; if (st.texturesMissing <= 12) logf("missing texture: %s", key.first.c_str());
+    return texCache[key] = grey;
   }
   std::string blobStr(uint32_t off, uint32_t len) const { return std::string(blob.data() + off, len); }
   bool texFileExists(const std::string& stem) const { for (const char* e : {".tga", ".jpg", ".jpeg", ".png"}) if (fs->exists(stem + e)) return true; return false; }
@@ -142,6 +168,7 @@ struct World::Impl {
 
   void buildProgram(Prog& P, const Program& p, const UniformSlot* slots, const uint8_t* b, int idx, bool isWorld = true);
   void prepareMaterial(uint32_t id);
+  void writeMaterialDescriptors(uint32_t id);
   void fillMaterial(uint32_t id, const double* stageFrames, const PlanPass* portalPass);
   VkPipeline pipelineFor(uint32_t progId, const ObjectState& s);
   void grab(Grabbed& list, bool packet);
@@ -202,10 +229,15 @@ void World::Impl::buildProgram(Prog& P, const Program& p, const UniformSlot* slo
 
 void World::Impl::prepareMaterial(uint32_t id) {
   MatGpu& g = matGpu[id]; if (g.ready) return; g.ready = true; const Material& m = mats[id]; if (m.programId == NO_PROGRAM || !progs[m.programId].ok) return; const Prog& P = progs[m.programId];
-  g.hasDiffuse = !diffuseNameOf(m).empty();
+  g.diffuse = diffuseNameOf(m);
   const size_t stageBytes = ((std::max<size_t>(P.stageVec4 * 16, 16) + 255) / 256) * 256;
   g.matOff = matBump; matBump += 512; g.stageOff = matBump; matBump += stageBytes; if (matBump > matBuf.size) fatal("material buffer full (%zu of %zu)", matBump, matBuf.size);
   VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; ai.descriptorPool = pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &P.set2; NC_CK(vkAllocateDescriptorSets(c.dev, &ai, &g.set));
+  writeMaterialDescriptors(id);
+}
+
+void World::Impl::writeMaterialDescriptors(uint32_t id) {
+  const MatGpu& g = matGpu[id]; const Material& m = mats[id]; const Prog& P = progs[m.programId];
   std::vector<VkWriteDescriptorSet> ws; VkDescriptorBufferInfo bi[2] = {{matBuf.buf, g.matOff, 512}, {matBuf.buf, g.stageOff, std::max<size_t>(P.stageVec4 * 16, 16)}}; std::vector<std::vector<VkDescriptorImageInfo>> ii; ii.reserve(P.slots.size() + 1);
   for (uint32_t b = 0; b < 2; ++b) { VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; w.dstSet = g.set; w.dstBinding = b; w.descriptorCount = 1; w.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w.pBufferInfo = &bi[b]; ws.push_back(w); }
   for (auto& u : P.slots) {
@@ -213,7 +245,7 @@ void World::Impl::prepareMaterial(uint32_t id) {
     const Image* img = &white; VkSampler smp = samp; std::vector<const Image*> frames;
     if (u.source == US_LIGHTMAP || u.source == US_SKY_FACE) smp = sampClamp;
     switch (u.source) {
-      case US_DIFFUSE: { const std::string dn = diffuseNameOf(m); if (!dn.empty()) img = &texByName(dn); break; }
+      case US_DIFFUSE: if (!g.diffuse.empty()) img = &texByName(g.diffuse); break;
       case US_LIGHTMAP:
         if (getenv("QRAZY_NC_NOLM")) break;   // diagnostic: every lightmap is white
         if (m.lightmapMode == LM_PAGE) { const int page = batchRec[(size_t)id * batchW + 14]; if (page >= 0 && page < (int)lmPages.size()) img = &lmPages[page]; }
@@ -250,7 +282,7 @@ void World::Impl::fillMaterial(uint32_t id, const double* stageFrames, const Pla
       case US_PORTAL_MATRIX: if (portalPass) {   // the core's texture matrix is in the browser's convention (v = 0 at the bottom of the target); the vertex wrapper flips y in every pass, targets included, so the target's row 0 is the top of the view: sample with v' = 1 - v, i.e. row 1 := row 3 - row 1 (column-major)
         double tm[16]; memcpy(tm, portalPass->textureMatrix, sizeof tm); for (int c = 0; c < 4; ++c) tm[c * 4 + 1] = portalPass->textureMatrix[c * 4 + 3] - portalPass->textureMatrix[c * 4 + 1];
         putSlot(mb, u, tm, 16); } continue;
-      case US_HAS_DIFFUSE: v[0] = g.hasDiffuse; break;
+      case US_HAS_DIFFUSE: v[0] = !g.diffuse.empty(); break;
       case US_HAS_LIGHTMAP: v[0] = m.lightmapMode != LM_NONE; break;
       case US_SKY_HAS_BOX: v[0] = (m.flags & MF_SKY_BOX) != 0; break;
       default: continue;
@@ -307,7 +339,10 @@ static void passSwitches(const World::Impl& w, uint8_t* slot) {   // the PassBlo
 #include "nc_post.inl"
 
 World::World() : m(new Impl()) {}
-World::~World() = default;
+World::~World() {
+  m->cancelPicmip = true;
+  if (m->picmipJob.valid()) m->picmipJob.wait();
+}
 const WorldStats& World::stats() const { return m->st; }
 const double* World::mapBounds() const { return m->mapBounds; }
 
@@ -621,7 +656,83 @@ int World::addBoard(const uint8_t* rgba, int w, int h, double z, double yCentre,
 }
 
 void World::setMirrors(bool on) { m->mirrors = on; }
-void World::setLoadOptions(int picmip, bool mapFx) { m->picmip = std::max(0, std::min(10, picmip)); m->mapFx = mapFx; }
+void World::setLoadOptions(int picmip, bool mapFx) { m->wantedPicmip = m->picmip = std::clamp(picmip, 0, 10); m->mapFx = mapFx; }
+
+void World::setPicmip(int level) {
+  level = std::clamp(level, 0, 10);
+  if (level == m->wantedPicmip) return;
+  m->wantedPicmip = level;
+  m->cancelPicmip = true;
+}
+
+void World::refreshPicmip() {
+  Impl& w = *m;
+  if (w.picmipJob.valid()) {
+    if (w.picmipJob.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+    try {
+      w.picmipUploads = w.picmipJob.get();
+    } catch (const std::exception& e) {
+      if (!w.cancelPicmip) {
+        logf("picmip %d refresh failed: %s", w.wantedPicmip, e.what());
+        w.wantedPicmip = w.picmip;
+      }
+    }
+  }
+  if (!w.picmipUploads.empty()) {
+    // A material prepared during the refresh can have added a texture at the old level.
+    if (!w.cancelPicmip && w.refreshCacheSize == w.texCache.size()) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+      do {
+        auto& pixels = w.picmipUploads[w.uploadedPicmip++];
+        pixels.replacement = pixels.upload(w.c);
+        std::vector<uint8_t>().swap(pixels.rgba);
+      } while (w.uploadedPicmip < w.picmipUploads.size() && std::chrono::steady_clock::now() < deadline);
+      if (w.uploadedPicmip < w.picmipUploads.size()) return;
+
+      for (auto& pixels : w.picmipUploads) {
+        Image& current = w.texCache.at({pixels.name, true});
+        std::swap(current, pixels.replacement);
+      }
+      w.picmip = w.wantedPicmip;
+      for (uint32_t i = 0; i < w.matGpu.size(); ++i)
+        if (w.matGpu[i].set) w.writeMaterialDescriptors(i);
+      logf("picmip %d applied to %zu map textures", w.picmip, w.picmipUploads.size());
+    }
+    for (size_t i = 0; i < w.uploadedPicmip; ++i) {
+      const Image& image = w.picmipUploads[i].replacement;
+      vkDestroyImageView(w.c.dev, image.view, nullptr);
+      vkDestroyImage(w.c.dev, image.img, nullptr);
+      vkFreeMemory(w.c.dev, image.mem, nullptr);
+    }
+    w.uploadedPicmip = 0;
+    w.picmipUploads.clear();
+  }
+  if (w.wantedPicmip == w.picmip) return;
+
+  std::vector<TexturePixels> textures;
+  for (const auto& [key, image] : w.texCache)
+    if (key.second && image.img != w.grey.img) textures.push_back(TexturePixels{key.first});
+  if (textures.empty()) {
+    w.picmip = w.wantedPicmip;
+    return;
+  }
+  w.refreshCacheSize = w.texCache.size();
+  w.cancelPicmip = false;
+  w.picmipJob = std::async(std::launch::async, [&cancel = w.cancelPicmip, fs = w.fs->snapshot(),
+                                            level = w.wantedPicmip, textures = std::move(textures)]() mutable {
+    for (auto& pixels : textures) {
+      if (cancel) break;
+      if (!pixels.load(fs, true, level)) throw std::runtime_error("could not reload " + pixels.name);
+      // Picmip compacts the pixels in place. Keep only the resulting image while decoding the rest.
+      const size_t size = static_cast<size_t>(pixels.size[0]) * pixels.size[1] * 4;
+      if (size < pixels.rgba.size()) {
+        std::vector<uint8_t> reduced(pixels.rgba.data(), pixels.rgba.data() + size);
+        pixels.rgba.swap(reduced);
+      }
+    }
+    return std::move(textures);
+  });
+}
 void World::setRender(bool sortTranslucent, bool volumeFog, bool fastSky) { Impl& w = *m; w.volumeFog = volumeFog; w.fastSky = fastSky; if (!w.worldless) rc_world_set_sorted(sortTranslucent ? 1 : 0); }
 void World::buildGhostPath(const double* rows, int n) {
   Impl& w = *m; if (!w.obj || w.obj->path[1].model < 0) return; World::Impl::Obj& o = *w.obj; o.pathCount = 0; if (n < 2) return;

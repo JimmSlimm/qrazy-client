@@ -89,6 +89,7 @@ class Hud {
   // The view and point arrays must stay valid through prepare().
   void setMinimap(const TextMinimapState& state, const QcMinimapOut& view, const float* trail, const float* ghost);
   void setSpeedometer(uint32_t mode, double maxSpeed);   // "speedometer": 0 off, 1-3 QL cg_speedometer styles (the engine draws them), 4 the Qrazy one (part of the core HUD)
+  void setPlayerHudView(bool playing, bool following);
   void setCgaz(bool on, const void* state136, double yawDeg, double fovX, double ypos, uint32_t flags);
   // The information board drawn over the HUD while board.held is true; nullptr or not held = nothing.
   void setBoard(const Scoreboard* board);

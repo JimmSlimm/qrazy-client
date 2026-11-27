@@ -51,6 +51,8 @@ struct Hud::Impl {
   std::mutex logMu; std::vector<LogEv> logEvs; double lastDownMs = 0; float lastDownX = 0, lastDownY = 0; uint32_t downClicks = 0;
   void pumpLog(); void pushLayout();
   uint32_t speedoMode = 0; double speedoMax = 1200;
+  bool playerHudVisible = true, playerHudFollowing = false;
+  float rasterScale = 1.f;
   std::map<int, Element> liveTpl; double livePitch = 0; bool liveSlick = false, livePaused = false; uint32_t liveKeys = 0; int liveLiquid = 0, liquidSent = -1;   // templates of the live elements and the state they show
   const QcMinimapOut* mmView = nullptr; TextMinimapState mm = {}; const float* mmTrail = nullptr; const float* mmGhost = nullptr;
   std::string pausedHint;
@@ -90,12 +92,12 @@ void Hud::setLayout(const std::vector<std::pair<std::string, double>>& fields) {
   text_hud_set_oled(oledRows, oledWidgets);
 }
 void Hud::Impl::pushLayout() {   // the player's layout into the engine; with a QL speedometer style (1-3) the Qrazy speedometer (speedFlags bit 0 = hidden) is not drawn
-  TextHudLayout L = hudLayout; if (speedoMode >= 1 && speedoMode <= 3) L.speedFlags |= 1u;
+  TextHudLayout L = hudLayout; if (!playerHudVisible || (speedoMode >= 1 && speedoMode <= 3)) L.speedFlags |= 1u;
   memcpy(text_hud_layout_addr(), &L, sizeof L);
 }
 void Hud::setUiScale(float scale) {
   Impl& h = *m; if (!h.ok || scale < 0.5f || scale > 8.f) return; const float s = std::floor(scale * 100.f + .5f) / 100.f; if (s == h.uiScale) return;
-  h.uiScale = s; text_set_ui_scale(s); text_hud_reset(); logf("HUD ui scale %.2f", s);
+  h.uiScale = s; logf("HUD ui scale %.2f", s);
 }
 double Hud::nowMs() { return (double)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 1000.0; }
 static bool isLiveEl(int e) { return e == 5 || e == 6 || e == 12 || e == 13; }
@@ -131,6 +133,16 @@ void Hud::setMinimap(const TextMinimapState& state, const QcMinimapOut& view, co
   h.mmTrail = trail; h.mmGhost = ghost;
 }
 void Hud::setSpeedometer(uint32_t mode, double maxSpeed) { m->speedoMode = mode; m->speedoMax = maxSpeed > 0 ? maxSpeed : 1200; if (m->ok) m->pushLayout(); }
+void Hud::setPlayerHudView(bool playing, bool following) {
+  Impl& h = *m;
+  const bool visible = playing || following;
+  if (h.playerHudVisible == visible && h.playerHudFollowing == following) return;
+  h.playerHudVisible = visible;
+  h.playerHudFollowing = following;
+  text_hud_el_clear(5);
+  text_hud_el_clear(12);
+  h.pushLayout();
+}
 void Hud::setCgaz(bool on, const void* state136, double yawDeg, double fovX, double ypos, uint32_t flags) {
   Impl& h = *m; h.cgazOn = on && state136; if (!h.cgazOn) return; static_assert(sizeof(TextCgazState) == 136, "TextCgazState"); memcpy(h.cgazState, state136, 136);
   TextCgazState* st = (TextCgazState*)h.cgazState; st->yaw = yawDeg; st->fovX = fovX; st->ypos = ypos; st->flags = flags;
@@ -331,7 +343,7 @@ bool Hud::init(const Context& ctx, VkRenderPass renderPass, const std::string& f
   // The text engine lives in the core library, which stays loaded for the whole process while matches come and go: it is set up ONCE (its font data must outlive every match, and text_init is once only); a later match
   // only asks it to resend every glyph and page to the new GPU objects (text_hud_reset).
   static bool s_textReady = false; static float s_uiScale = 1.f; static std::vector<std::vector<uint8_t>> s_fonts;
-  if (s_textReady) { h.uiScale = s_uiScale; text_hud_reset(); }
+  if (s_textReady) { h.uiScale = h.rasterScale = s_uiScale; text_hud_reset(); }
   else {
   text_init();
 #if defined(NC_WINDOWS)
@@ -339,7 +351,7 @@ bool Hud::init(const Context& ctx, VkRenderPass renderPass, const std::string& f
 #else
   const float uiDpi = 1.f;   // Linux: the compositor scales the surface; the HUD lays out in the swapchain's pixels (fractional scale is not read yet)
 #endif
-  h.uiScale = uiDpi; if (uiDpi != 1.f) text_set_ui_scale(uiDpi);
+  h.uiScale = h.rasterScale = uiDpi; if (uiDpi != 1.f) text_set_ui_scale(uiDpi);
   s_fonts.reserve(8); FileSource fonts; fonts.root = fontDir;
   for (const char* f : {"Arimo.ttf", "NotoSansArabic.ttf", "NotoSansSymbols.ttf"}) {
     std::vector<uint8_t> b; if (!fonts.read(f, b)) { logf("HUD font %s missing in %s", f, fontDir.c_str()); return false; }
@@ -442,8 +454,9 @@ void Hud::Impl::buildVertices(const uint8_t* wire) {
           const hud::Glyph& g = gl[m.first + k];
           const float px = S != 1.f ? floorf(S * (m.x + g.dx26 / 64.f) + .5f) / S : m.x + (float)((g.dx26 + 32) >> 6), py = S != 1.f ? floorf(S * (m.y + g.dy26 / 64.f) + .5f) / S : m.y + (float)((g.dy26 + 32) >> 6);   // whole pixels, rounded per glyph (9.5)
           auto d = defs.find(g.glyphId); if (d == defs.end() || !d->second.w) continue; const hud::GlyphDef& e = d->second;
-          const float st = (e.reserved ? e.reserved : 256) / 256.f;   // reserved: 256 * wanted / rasterised size (the horizontal stretch)
-          add(px + e.bearingX * st / S, py + e.bearingY * st / S, e.w * st / S, e.h * st / S, e.x / 512.f, e.y / 512.f, (e.x + e.w) / 512.f, (e.y + e.h) / 512.f, m.color, PAGE_TEX + e.page, blend);
+          // The core's atlas keeps its raster scale for the life of the process.
+          const float st = (e.reserved ? e.reserved : 256) / (256.f * rasterScale);
+          add(px + e.bearingX * st, py + e.bearingY * st, e.w * st, e.h * st, e.x / 512.f, e.y / 512.f, (e.x + e.w) / 512.f, (e.y + e.h) / 512.f, m.color, PAGE_TEX + e.page, blend);
         }
         break;
       case hud::K_CLIP_PUSH: case hud::K_CIRCLE_CLIP_PUSH:
@@ -475,16 +488,17 @@ void Hud::prepare(VkCommandBuffer cb, int W, int H, const HudNumbers& n) {
   text_hud_frame_go();
   for (const auto& kv : h.liveTpl) {   // the templates, filled with the client's own live data
     const Element& e = kv.second; char b[32];
+    if (!h.playerHudVisible && (e.element == 5 || e.element == 12)) continue;
     if (e.element == 6 && !h.liveSlick) { text_hud_el_clear(6); continue; }
     if (e.element == 13 && !h.livePaused) { text_hud_el_clear(13); continue; }
     if (e.element == 5) { snprintf(b, sizeof b, "%.1f\xC2\xB0", h.livePitch); elSet(e, e.flags, b); }
-    else if (e.element == 12) elSet(e, (e.flags & ~63u) | h.liveKeys, e.text);
+    else if (e.element == 12) elSet(e, h.playerHudFollowing ? e.flags : (e.flags & ~63u) | h.liveKeys, e.text);
     else if (e.element == 13 && e.text.empty()) elSet(e, e.flags, h.pausedHint);   // the page sends the template with an empty hint; the bound key is the client's (Unpause with "P" key)
     else elSet(e, e.flags, e.text);
   }
   if (h.liveLiquid != h.liquidSent) { h.liquidSent = h.liveLiquid; if (h.liveLiquid) { TextRecipeIn in; memset(&in, 0, sizeof in); in.elX = in.elY = -1; in.flags = (uint32_t)h.liveLiquid; text_hud_el_set(19, 19, &in, nullptr, 0); } else text_hud_el_clear(19); }
   text_hud_el_frame_part((uint32_t)W, (uint32_t)H, nowMs(), 0);   // the elements BELOW the chat box / console; part 1 (map info 16, loading 21, race panel 22 / invite 23) comes after them
-  if (h.speedoMode >= 1 && h.speedoMode <= 3) text_hud_ql_speedo((uint32_t)W, (uint32_t)H, h.speedoMode, (double)n.speed, h.speedoMax, nowMs());
+  if (h.playerHudVisible && h.speedoMode >= 1 && h.speedoMode <= 3) text_hud_ql_speedo((uint32_t)W, (uint32_t)H, h.speedoMode, (double)n.speed, h.speedoMax, nowMs());
   h.pumpLog();
   if (h.mmView) { h.mm.fbWidth = (uint32_t)W; h.mm.fbHeight = (uint32_t)H; text_hud_minimap_live(&h.mm, h.mmView, h.mmTrail, h.mmGhost); }
   if (h.cgazOn) { TextCgazState* st = (TextCgazState*)h.cgazState; st->fbWidth = (uint32_t)W; st->fbHeight = (uint32_t)H; text_hud_cgaz(st); }
@@ -492,7 +506,7 @@ void Hud::prepare(VkCommandBuffer cb, int W, int H, const HudNumbers& n) {
     const uint32_t st = tf::state();
     if (h.conHeight != h.tfCfgH || h.conOpacity != h.tfCfgO || h.conScale != h.tfCfgS) { h.tfCfgH = h.conHeight; h.tfCfgO = h.conOpacity; h.tfCfgS = h.conScale; text_tf_config(-1, -1, 0, 0, 0, h.conHeight, h.conOpacity, h.conScale); }   // on change only; the chat box keeps its default place and size
     if (st & (TF_STATE_CHAT | TF_STATE_TEAM | TF_STATE_CONSOLE)) text_tf_draw((uint32_t)W, (uint32_t)H, nowMs());
-    if (!(st & (TF_STATE_CHAT | TF_STATE_TEAM)) && !h.chat.empty()) {   // the chat feed: bottom-left at 36 / 90, at most 640 px wide (half the window minus 170), the last lines in white / green
+    if (!(st & (TF_STATE_CHAT | TF_STATE_TEAM | TF_STATE_CONSOLE)) && !h.chat.empty()) {   // the chat feed: bottom-left at 36 / 90, at most 640 px wide (half the window minus 170), the last lines in white / green
       const float s = 1.f; const float left = 36 * s, bottom = (float)H - 90 * s; const uint32_t width = (uint32_t)std::max(60.f, std::min(640.f * s, (float)W / 2.f - 170.f * s));
       const uint32_t sz = text_size_for_px((uint32_t)(16 * s + .5f)); const uint8_t* ct = (const uint8_t*)h.chat.data(); const uint32_t cn = (uint32_t)h.chat.size();
       if (h.chatHistory) {   // +chat held (hud-feed.mjs, ch.history): the same lines in a dark box, as tall as its wrapped lines (at most 440 px), padding 6 x 10, drawn with the same call inside it

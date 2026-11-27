@@ -15,25 +15,41 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 namespace nc {
 
 std::string lowerStr(std::string s) { for (auto& c : s) c = (char)tolower((unsigned char)c); return s; }
 
-struct FileSource::Zip { mz_zip_archive z; std::unordered_map<std::string, mz_uint> index; std::vector<std::pair<std::string, mz_uint>> entries; int shaderTier; };
+struct FileSource::Zip {
+  mz_zip_archive z = {};
+  std::mutex readerMutex;
+  std::unordered_map<std::string, mz_uint> index;
+  std::vector<std::pair<std::string, mz_uint>> entries;
+  int shaderTier;
+  ~Zip() { if (z.m_pState) mz_zip_reader_end(&z); }
+};
 
-FileSource::FileSource() {}
-FileSource::~FileSource() { for (Zip* z : zips_) { mz_zip_reader_end(&z->z); delete z; } }
-FileSource::FileSource(FileSource&& o) noexcept : root(std::move(o.root)), zips_(std::move(o.zips_)), vfiles_(std::move(o.vfiles_)) { o.zips_.clear(); }
-FileSource& FileSource::operator=(FileSource&& o) noexcept { if (this != &o) { for (Zip* z : zips_) { mz_zip_reader_end(&z->z); delete z; } root = std::move(o.root); zips_ = std::move(o.zips_); vfiles_ = std::move(o.vfiles_); o.zips_.clear(); } return *this; }
+FileSource::FileSource() = default;
+FileSource::~FileSource() = default;
+FileSource::FileSource(FileSource&&) noexcept = default;
+FileSource& FileSource::operator=(FileSource&&) noexcept = default;
+
+FileSource FileSource::snapshot() const {
+  FileSource fs;
+  fs.root = root;
+  fs.zips_ = zips_;
+  fs.vfiles_ = vfiles_;
+  return fs;
+}
 
 static std::string normName(std::string s) { for (auto& c : s) { if (c == (char)92) c = '/'; c = (char)tolower((unsigned char)c); } return s; }
 
 bool FileSource::mountZip(const std::string& path, std::string* error, uint64_t offset, int shaderTier) {
-  Zip* z = new Zip(); memset(&z->z, 0, sizeof z->z); z->shaderTier = shaderTier;
+  auto z = std::make_shared<Zip>(); z->shaderTier = shaderTier;
   // miniz takes archive_size 0 to mean the whole file, which is wrong behind an offset (it would look for the end of the archive `offset` bytes past the real end): say how long the archive is
   std::error_code sizeEc; const uint64_t fileSize = std::filesystem::file_size(path, sizeEc); const uint64_t archiveSize = !sizeEc && offset && fileSize > offset ? fileSize - offset : 0;
-  if (!mz_zip_reader_init_file_v2(&z->z, path.c_str(), 0, offset, archiveSize)) { if (error) *error = std::string("cannot open ") + path + ": " + mz_zip_get_error_string(mz_zip_get_last_error(&z->z)); delete z; return false; }
+  if (!mz_zip_reader_init_file_v2(&z->z, path.c_str(), 0, offset, archiveSize)) { if (error) *error = std::string("cannot open ") + path + ": " + mz_zip_get_error_string(mz_zip_get_last_error(&z->z)); return false; }
   const mz_uint n = mz_zip_reader_get_num_files(&z->z);
   for (mz_uint i = 0; i < n; ++i) {
     if (mz_zip_reader_is_file_a_directory(&z->z, i)) continue;
@@ -45,11 +61,12 @@ bool FileSource::mountZip(const std::string& path, std::string* error, uint64_t 
 int FileSource::archiveCount() const { return (int)zips_.size(); }
 
 bool FileSource::readFrom(int a, const std::string& rel, std::vector<uint8_t>& out) const {
-  if (a < 0 || a >= (int)zips_.size()) return false; Zip* z = zips_[a]; auto it = z->index.find(normName(rel)); if (it == z->index.end()) return false;
+  if (a < 0 || a >= (int)zips_.size()) return false; auto& z = zips_[a]; auto it = z->index.find(normName(rel)); if (it == z->index.end()) return false;
   return readEntry(a, it->second, out);
 }
 bool FileSource::readEntry(int a, unsigned index, std::vector<uint8_t>& out) const {
-  Zip* z = zips_[a];
+  auto& z = zips_[a];
+  std::lock_guard<std::mutex> lock(z->readerMutex);
   mz_zip_archive_file_stat st; if (!mz_zip_reader_file_stat(&z->z, index, &st)) return false;
   out.resize((size_t)st.m_uncomp_size); if (st.m_uncomp_size == 0) return true;
   if (!mz_zip_reader_extract_to_mem(&z->z, index, out.data(), out.size(), 0)) { out.clear(); return false; }
@@ -67,11 +84,12 @@ bool FileSource::read(const std::string& rel, std::vector<uint8_t>& out, int* ar
     } }
   const std::string key = normName(rel);
   for (int a = 0; a < (int)zips_.size(); ++a) {
-    Zip* z = zips_[a];
+    auto& z = zips_[a];
     const auto entry = z->index.find(key);
     if (entry == z->index.end() || !readEntry(a, entry->second, out)) continue;
     if (archive) *archive = a;
     if (actualName) {
+      std::lock_guard<std::mutex> lock(z->readerMutex);
       char name[512];
       if (mz_zip_reader_get_filename(&z->z, entry->second, name, sizeof name)) *actualName = name;
     }
@@ -83,12 +101,12 @@ bool FileSource::read(const std::string& rel, std::vector<uint8_t>& out, int* ar
   const bool ok = n == 0 || fread(out.data(), 1, (size_t)n, f) == (size_t)n; fclose(f); if (!ok) out.clear(); return ok;
 }
 bool FileSource::exists(const std::string& rel) const {
-  const std::string key = normName(rel); for (const VFile& v : vfiles_) if (v.name == key) return true; for (Zip* z : zips_) if (z->index.count(key)) return true;
+  const std::string key = normName(rel); for (const VFile& v : vfiles_) if (v.name == key) return true; for (const auto& z : zips_) if (z->index.count(key)) return true;
   if (root.empty()) return false; FILE* f = fopen((root + "/" + rel).c_str(), "rb"); if (!f) return false; fclose(f); return true;
 }
 std::vector<std::string> FileSource::listArchives() const {
   std::vector<std::string> out;
-  for (const Zip* z : zips_) for (const auto& entry : z->entries) out.push_back(entry.first);
+  for (const auto& z : zips_) for (const auto& entry : z->entries) out.push_back(entry.first);
   for (const VFile& v : vfiles_) out.push_back(v.name);
   if (!root.empty()) {
     std::error_code ec;
@@ -101,7 +119,7 @@ std::vector<std::string> FileSource::listArchives() const {
 
 bool FileSource::readShaderSources(int selectedArchive, std::vector<ShaderSource>& out) const {
   for (int a = 0; a < archiveCount(); ++a) {
-    const Zip* z = zips_[a];
+    const auto& z = zips_[a];
     const int tier = a == selectedArchive ? 3 : z->shaderTier;
     for (const auto& entry : z->entries) {
       const std::string name = normName(entry.first);
@@ -160,9 +178,20 @@ static bool decodeTga(const std::vector<uint8_t>& d, std::vector<uint8_t>& rgba,
 
 #if defined(NC_WINDOWS)
 static IWICImagingFactory* wicFactory() {
-  static IWICImagingFactory* fac = nullptr;
-  if (!fac) { CoInitializeEx(nullptr, COINIT_MULTITHREADED); if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac)))) fac = nullptr; }
-  return fac;
+  struct Factory {
+    HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory* fac = nullptr;
+    Factory() {
+      if (SUCCEEDED(init) || init == RPC_E_CHANGED_MODE)
+        CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac));
+    }
+    ~Factory() {
+      if (fac) fac->Release();
+      if (SUCCEEDED(init)) CoUninitialize();
+    }
+  };
+  thread_local Factory factory;
+  return factory.fac;
 }
 
 bool decodeEncodedImage(const uint8_t* data, size_t len, std::vector<uint8_t>& rgba, int& w, int& h) {

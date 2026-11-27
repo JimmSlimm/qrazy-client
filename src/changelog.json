@@ -1,6 +1,22 @@
 {
   "releases": [
     {
+      "version": "0.6.1",
+      "date": "2026-11-27",
+      "added": [],
+      "changed": [
+        "Windows native matches now apply texture quality changes without reloading the map."
+      ],
+      "fixed": [
+        "Windows native matches no longer show the bottom-left chat feed while the console is open. Console scrollback and chat history are still available.",
+        "Windows native matches refresh ground pickup models when switching between Strafe and Weapons, including the rocket launcher on Darkmine.",
+        "The Windows native Tab scoreboard now reads the player and spectator lists from the game page.",
+        "Fixed native HUD text sizing when changing UI scale on Windows.",
+        "Windows native spectator view hides the player speedometer, pitch readout, and key display in free camera.",
+        "The console key in Windows native matches now checks the currently held modifiers after a window move."
+      ]
+    },
+    {
       "version": "0.6.0",
       "date": "2026-11-27",
       "added": [

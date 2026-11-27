@@ -105,7 +105,17 @@ bool Input::keyScan(int scan, bool down, bool repeat, int64_t at) {
     const bool isDown = std::find(typeDown_.begin(), typeDown_.end(), scan) != typeDown_.end();
     if (boxOpen && down && isDown && !repeat) return true;   // the same press twice (two raw-input routes)
     if (down && !isDown) typeDown_.push_back(scan); if (!down) typeDown_.erase(std::remove(typeDown_.begin(), typeDown_.end(), scan), typeDown_.end());
-    const uint32_t r = textKey(tfKeyOf(scan), mods(repeat), down, (uint32_t)scan + 1u);
+    uint32_t textMods = mods(repeat);
+#if defined(NC_WINDOWS)
+    if (scan == BACKQUOTE && down) {
+      // A system shortcut can consume modifier releases during a window move.
+      textMods &= ~(TF_MOD_CTRL | TF_MOD_ALT | TF_MOD_META);
+      if (GetAsyncKeyState(VK_CONTROL) & 0x8000) textMods |= TF_MOD_CTRL;
+      if (GetAsyncKeyState(VK_MENU) & 0x8000) textMods |= TF_MOD_ALT;
+      if ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) textMods |= TF_MOD_META;
+    }
+#endif
+    const uint32_t r = textKey(tfKeyOf(scan), textMods, down, (uint32_t)scan + 1u);
     if (boxOpen) {
 #if defined(NC_WINDOWS)
       { const bool modifier = modBitOf(scan) != 0 || scan == 0x3A;
