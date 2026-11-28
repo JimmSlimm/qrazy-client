@@ -44,6 +44,12 @@ if args.native_core:
  native_source=source.parent/'nativeclient'
  shutil.copytree(native_source/'assets',runtime/'native-assets')
  shutil.copytree(native_source/'licences',runtime/'native-licences')
+ # libmpg123 (LGPL 2.1, loaded as a separate library) ships beside the client; libcurl is linked in statically.
+ system=old/'deps/baseline/sysroot/usr'
+ shutil.copyfile(system/'lib/x86_64-linux-gnu/libmpg123.so.0',runtime/'libmpg123.so.0')
+ shutil.copyfile(system/'share/doc/libmpg123-0/copyright',runtime/'native-licences/libmpg123-copyright.txt')
+ (runtime/'native-licences/libmpg123-source.txt').write_text('libmpg123.so.0 is the unmodified Debian 12 build (package mpg123 1.31.2-1+deb12u1).\nSource: https://snapshot.debian.org/package/mpg123/1.31.2-1%2Bdeb12u1/\n')
+ shutil.copyfile(root/'build-curl/source/curl-8.23.0/COPYING',runtime/'native-licences/curl-LICENSE.txt')
 licenses=runtime/'licenses';licenses.mkdir()
 for src,name in [(cef/'LICENSE.txt','CEF-LICENSE.txt'),(cef/'CREDITS.html','CEF-CREDITS.html'),(old/'deps/baseline/sdl/share/licenses/SDL3/LICENSE.txt','SDL3-LICENSE.txt'),(old/'PROJECT-LICENSE.txt','PROJECT-LICENSE.txt')]:shutil.copyfile(src,licenses/name)
 for p in runtime.rglob('*'):

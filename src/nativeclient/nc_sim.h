@@ -15,7 +15,7 @@ struct PlayerView {   // what the renderer needs after a tick (world axes of the
 };
 
 struct HudNumbers;
-struct ItemSpot { double pos[3]; std::string classname; };
+struct ItemSpot { int index; double pos[3]; std::string classname; };
 
 class Sim {
  public:
@@ -34,6 +34,7 @@ class Sim {
   int poses(std::vector<uint8_t>& out) const;
   // The map's item spots (where pickups sit, world axes) with the entity's classname. Spot i is the id the sim's item-visibility events carry.
   std::vector<ItemSpot> items() const;
+  bool itemVisible(int index) const;
   int weaponHeld() const;
   // A ray traced against the loaded map (the dry railgun query, range 8192): the distance to the first surface and its normal and flags; false = nothing hit within 8192. dir need not be a unit vector.
   bool trace(const double from[3], const double dir[3], double& dist, double normal[3], int& flags) const;

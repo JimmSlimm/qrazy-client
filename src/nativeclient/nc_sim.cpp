@@ -90,9 +90,15 @@ bool Sim::trace(const double from[3], const double dir[3], double& dist, double 
 
 std::vector<ItemSpot> Sim::items() const {
   std::vector<ItemSpot> out; const int n = qc_sim_item_count();
-  for (int k = 0; k < n; ++k) { QcItem it; if (!qc_sim_item(k, &it)) continue; ItemSpot s; s.pos[0] = it.pos[0]; s.pos[1] = it.pos[1]; s.pos[2] = it.pos[2]; s.classname = it.classname; out.push_back(std::move(s)); }
+  out.reserve(n);
+  for (int index = 0; index < n; ++index) {
+    QcItem item;
+    if (qc_sim_item(index, &item)) out.push_back({index, {item.pos[0], item.pos[1], item.pos[2]}, item.classname});
+  }
   return out;
 }
+
+bool Sim::itemVisible(int index) const { return qc_sim_item_visible(index) != 0; }
 
 PlayerView Sim::player() const {
   PlayerView v; const double* o = qc_sim_out(); v.pos[0] = o[0]; v.pos[1] = o[1]; v.pos[2] = o[2]; v.vel[0] = o[3]; v.vel[1] = o[4]; v.vel[2] = o[5]; v.crouched = o[13] != 0; v.yaw = m->yaw; v.pitch = m->pitch; return v;

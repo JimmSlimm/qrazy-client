@@ -264,6 +264,7 @@ int qc_sim_poses(uint8_t* out, int capacityBytes);   // fills out and returns th
 
 int qc_sim_item_count(void);
 int qc_sim_item(int index, QcItem* out);   // item spot `index` (the id the sim's item-visibility events carry); 0 = no such spot
+int qc_sim_item_visible(int index);   // local sim visibility now: 1 visible, 0 hidden or invalid index
 
 void qc_sim_hud(QcHud* out);   // call after a tick. Version 3 adds the weapon state: weaponInHand = the weapon id drawn now, selected = the weapon the player wants (a switch is under way when they differ), weaponState 0 ready / 1 firing / 2 dropping / 3 raising, cooldownMs = milliseconds until the weapon can fire or the switch finishes. Weapon ids are the game's (game-rules.js WP_*: 1 gauntlet, 2 machinegun, 3 shotgun, 4 grenade launcher, 5 rocket, 7 railgun, 8 plasma, 9 BFG, 10 grappling hook). barAmmo / barOwned are indexed by the HUD weapon bar slot, as before.
 
@@ -355,6 +356,15 @@ int qc_dry_grapple_fire(const double feet[3], int crouched, double yaw, double p
 // EFFECT_SHADOW program (rc_variant_build, effect family): uniforms fade, ext, R, y0, y1, rw from this record; transparent, depth test on, depth write off, double sided. Returns visible, -1 no map, -2 null argument.
 typedef struct QcShadow { int32_t visible, pad; double position[3], quat[4], size, fade, ext, R, y0, y1, rw; } QcShadow;   // 120 bytes: visible 0, position 8, quat 32, size 64, fade 72, ext 80, R 88, y0 96, y1 104, rw 112
 int qc_dry_player_shadow(const double feet[3], double yaw, double accScaleX, double accScaleZ, QcShadow* out);
+
+// Impact decal grid through the dry world (including qc_dry_set_movers). Pass a unit normal, positive radius, and runway=1 for Runway's invisible walls.
+// Output: index count, QC_MARK_CLIP_VERTICES position triples (world-space, already lifted), the same number of UV pairs, then triangle indices.
+// Returns doubles written, 0 for no supported geometry, -1 for no map, -2 for invalid input or insufficient capacity. On <=0, out is untouched.
+enum { QC_MARK_CLIP_VERTICES=289, QC_MARK_CLIP_DOUBLES=2982 };
+int qc_dry_mark_clip(const double pos[3], const double normal[3], double radius, int runway, double* out, int capacity);
+
+// Point trace 65536 units down from local or followed feet through the dry world. Returns 1 for a slick first hit, 0 for other surfaces, misses, solid starts, invalid feet or no map.
+int qc_dry_slick_below(const double feet[3]);
 // The SOUNDS of what the host shows of other players / recordings (stateless; the browser's soundDryCues). Writes the cues of `kind` for `args` (n doubles, at most 16 read, missing ones 0) into out; returns their count,
 // -1 cap too small (QC_DRY_MAX_CUES always suffices), -2 bad arguments, -3 unknown kind. QcCue.flags POS 1 = pos is a world position (without it: heard at the listener); LOOP_START 2 / LOOP_MOVE 8 / LOOP_STOP 4 with emitter = the loop's id.
 // kind 0 SHOT: args = weapon, quad 0/1, x, y, z (muzzle), atListener 1 (heard at the listener, no pos). weapon 1 gauntlet 2 MG 3 SG 4 GL 5 RL 6 LG 7 RG 8 PG 9 BFG 10 grapple; the fire sound, plus the quad sound when quad (not for the grapple).

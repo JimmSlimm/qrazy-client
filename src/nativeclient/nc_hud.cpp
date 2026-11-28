@@ -423,10 +423,19 @@ void Hud::Impl::apply(VkCommandBuffer cb, const uint8_t* wire, size_t len) {
 // the executor proper: the list's bytes -> vertices and draw ranges
 void Hud::Impl::buildVertices(const uint8_t* wire) {
   const hud::Header* h = (const hud::Header*)wire; const hud::Item* it = (const hud::Item*)(wire + sizeof(hud::Header)); const hud::Glyph* gl = (const hud::Glyph*)(it + h->itemCount);
-  draws.clear(); HudVertex* v = (HudVertex*)vb.ptr; uint32_t nv = 0; const uint32_t cap = 6 * 8192; const float sx = 2.f / h->fbWidth, sy = 2.f / h->fbHeight; const float S = uiScale;
+  const size_t required = 6 * sizeof(HudVertex) * (size_t(h->itemCount) + h->glyphCount);
+  if (required > vb.size) {
+    size_t capacity = vb.size;
+    while (capacity < required) capacity *= 2;
+    vkDeviceWaitIdle(c.dev);
+    vkDestroyBuffer(c.dev, vb.buf, nullptr);
+    vkFreeMemory(c.dev, vb.mem, nullptr);
+    vb = makeBuf(c, capacity, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+  }
+  draws.clear(); HudVertex* v = (HudVertex*)vb.ptr; uint32_t nv = 0; const float sx = 2.f / h->fbWidth, sy = 2.f / h->fbHeight; const float S = uiScale;
   struct Clip { int x, y, w, h; }; Clip stack[5]; int depth = 0; stack[0] = {0, 0, (int)h->fbWidth, (int)h->fbHeight}; float circ[3] = {0, 0, 0};   // circ: the circle clip (centre, radius in pixels), radius 0 = none; circles do not nest
   auto emit = [&](const HudVertex* q, uint32_t n, uint32_t tex, uint32_t blend) {
-    if (nv + n > cap) return; memcpy(v + nv, q, n * sizeof(HudVertex)); const Clip& cl = stack[depth];
+    memcpy(v + nv, q, n * sizeof(HudVertex)); const Clip& cl = stack[depth];
     if (!draws.empty()) { HudDraw& d = draws.back(); if (d.tex == tex && d.blend == blend && d.sx == cl.x && d.sy == cl.y && d.sw == (uint32_t)cl.w && d.sh == (uint32_t)cl.h && d.first + d.count == nv) { d.count += n; nv += n; return; } }
     draws.push_back({tex, blend, nv, n, cl.x, cl.y, (uint32_t)cl.w, (uint32_t)cl.h}); nv += n;
   };
@@ -492,7 +501,7 @@ void Hud::prepare(VkCommandBuffer cb, int W, int H, const HudNumbers& n) {
     if (e.element == 6 && !h.liveSlick) { text_hud_el_clear(6); continue; }
     if (e.element == 13 && !h.livePaused) { text_hud_el_clear(13); continue; }
     if (e.element == 5) { snprintf(b, sizeof b, "%.1f\xC2\xB0", h.livePitch); elSet(e, e.flags, b); }
-    else if (e.element == 12) elSet(e, h.playerHudFollowing ? e.flags : (e.flags & ~63u) | h.liveKeys, e.text);
+    else if (e.element == 12) elSet(e, (e.flags & ~63u) | h.liveKeys, e.text);
     else if (e.element == 13 && e.text.empty()) elSet(e, e.flags, h.pausedHint);   // the page sends the template with an empty hint; the bound key is the client's (Unpause with "P" key)
     else elSet(e, e.flags, e.text);
   }
@@ -510,7 +519,7 @@ void Hud::prepare(VkCommandBuffer cb, int W, int H, const HudNumbers& n) {
       const float s = 1.f; const float left = 36 * s, bottom = (float)H - 90 * s; const uint32_t width = (uint32_t)std::max(60.f, std::min(640.f * s, (float)W / 2.f - 170.f * s));
       const uint32_t sz = text_size_for_px((uint32_t)(16 * s + .5f)); const uint8_t* ct = (const uint8_t*)h.chat.data(); const uint32_t cn = (uint32_t)h.chat.size();
       if (h.chatHistory) {   // +chat held (hud-feed.mjs, ch.history): the same lines in a dark box, as tall as its wrapped lines (at most 440 px), padding 6 x 10, drawn with the same call inside it
-        const float hw = (float)width; text_lv_config(0, 100, 100, sz, 0, 0, 1); const uint32_t lh = text_lv_line_height(0);   // the engine's chat line height (view 0 is free: no chat box is open here)
+        const float hw = (float)width; text_lv_config(0, 100, 100, sz, 0, 3, 200); const uint32_t lh = text_lv_line_height(0);
         const float bh = std::min(440.f * s, (float)(text_hud_chat(0, 0, (uint32_t)(hw - 20 * s), 0, sz, 0, ct, cn, 0, 2 | 0x100) & 0xFFFF) * (float)lh + 12 * s);
         text_hud_rect(3, left, bottom - bh, hw, bh, 0xCC1C150Cu);
         text_hud_chat(left + 10 * s, bottom - 6 * s, (uint32_t)(hw - 20 * s), (uint32_t)(428 * s), sz, 0xFFFFFFFFu, ct, cn, 0, 2);

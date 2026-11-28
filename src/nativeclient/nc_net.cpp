@@ -201,6 +201,12 @@ bool Net::connect(const std::string& url) {
   return true;
 }
 
+// libcurl before 8.x declares the frame pointer without const (the Debian 12 build baseline), newer releases with it.
+template <class Frame>
+static CURLcode wsRecv(CURLcode (*recv)(CURL*, void*, size_t, size_t*, Frame**), CURL* socket, void* data, size_t size, size_t* got, const curl_ws_frame*& meta) {
+  Frame* frame = nullptr; const CURLcode rc = recv(socket, data, size, got, &frame); meta = frame; return rc;
+}
+
 void Net::close() {
   stop_ = true; up_ = false; if (th_.joinable()) th_.join();
   if (ws_) { size_t sent = 0; curl_ws_send((CURL*)ws_, "", 0, &sent, 0, CURLWS_CLOSE); curl_easy_cleanup((CURL*)ws_); ws_ = nullptr; }
@@ -238,7 +244,7 @@ void Net::run() {
     }
     size_t got = 0;
     const struct curl_ws_frame* meta = nullptr;
-    const auto rc = curl_ws_recv(socket, buffer.data(), buffer.size(), &got, &meta);
+    const auto rc = wsRecv(curl_ws_recv, socket, buffer.data(), buffer.size(), &got, meta);
     if (rc == CURLE_AGAIN) {
       curl_socket_t fd = CURL_SOCKET_BAD;
       curl_easy_getinfo(socket, CURLINFO_ACTIVESOCKET, &fd);

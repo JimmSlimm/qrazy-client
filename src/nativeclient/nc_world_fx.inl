@@ -6,12 +6,14 @@ struct Rgba { float r, g, b, a; };
 struct Stop { float at; Rgba c; };
 
 // the radial canvas gradients of marks.js, 128 x 128 straight-alpha RGBA
-static std::vector<uint8_t> radialTexture(const std::vector<Stop>& stops) {
-  std::vector<uint8_t> px(128 * 128 * 4);
-  for (int y = 0; y < 128; ++y) for (int x = 0; x < 128; ++x) {
-    const float d = std::min(1.f, std::sqrt((x + .5f - 64) * (x + .5f - 64) + (y + .5f - 64) * (y + .5f - 64)) / 64.f); Rgba c = stops.back().c;
+static std::vector<uint8_t> radialTexture(const std::vector<Stop>& stops, int size = 128) {
+  const float radius = size * .5f;
+  std::vector<uint8_t> px((size_t)size * size * 4);
+  for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+    const float dx = x + .5f - radius, dy = y + .5f - radius;
+    const float d = std::min(1.f, std::sqrt(dx * dx + dy * dy) / radius); Rgba c = stops.back().c;
     for (size_t k = 0; k + 1 < stops.size(); ++k) if (d <= stops[k + 1].at) { const float t = stops[k + 1].at > stops[k].at ? (d - stops[k].at) / (stops[k + 1].at - stops[k].at) : 0.f; const Rgba& a = stops[k].c; const Rgba& b = stops[k + 1].c; c = {a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t}; break; }
-    uint8_t* p = &px[((size_t)y * 128 + x) * 4]; p[0] = (uint8_t)(c.r + .5f); p[1] = (uint8_t)(c.g + .5f); p[2] = (uint8_t)(c.b + .5f); p[3] = (uint8_t)(std::min(1.f, c.a) * 255.f + .5f);
+    uint8_t* p = &px[((size_t)y * size + x) * 4]; p[0] = (uint8_t)(c.r + .5f); p[1] = (uint8_t)(c.g + .5f); p[2] = (uint8_t)(c.b + .5f); p[3] = (uint8_t)(std::min(1.f, c.a) * 255.f + .5f);
   }
   return px;
 }
@@ -38,6 +40,7 @@ struct FxState {
   struct MarkStyle { double radius; bool additive; std::vector<Stop> stops; int cap; };
   struct Slot { int model = -1, node = -1; double age = 0, life = 0; bool on = false; };
   std::vector<MarkStyle> styles; std::vector<std::vector<Slot>> marks; std::vector<size_t> next;   // marks[style]: a ring of slots
+  double markClip[QC_MARK_CLIP_DOUBLES];
   struct Spark { int node = -1; double age = 0, life = 0, v[3] = {}, p[3] = {}, size = 1; bool on = false; };
   std::vector<Spark> sparks; size_t sparkNext = 0; int sparkModel = -1;
   struct Blast { int model = -1, node = -1, smodel = -1, snode = -1; double age = 0, life = 0, radius = 1, at[3] = {}, normal[3] = {}; bool on = false, splash = false, hasNormal = false, ghost = false; };   // sphere (model/node) or the plasma splash (smodel/snode, the core's rc_splash_pose)
@@ -73,17 +76,71 @@ static void fxNode(World::Impl& w, int handle, const double* pos, const double* 
 
 static void fxNodeHide(World::Impl& w, int handle) { const double away[3] = {0, -1e5, 0}; fxNode(w, handle, away, nullptr, 1, 1, 1, false); }   // a new node starts visible at the origin: hidden until it is posed
 
-static void fxMarkImpl(World::Impl& w, int style, const double pos[3], const double n[3], double radius) {
-  FxState& fx = fxOf(w); if (style < 0 || style >= (int)fx.styles.size()) return; const FxState::MarkStyle& st = fx.styles[(size_t)style];
-  FxState::Slot& s = fx.marks[(size_t)style][fx.next[(size_t)style]]; fx.next[(size_t)style] = (fx.next[(size_t)style] + 1) % fx.marks[(size_t)style].size();
-  if (s.model < 0) {   // made on first use: a unit quad with the style's gradient and its own material block
-    const std::vector<uint8_t> tex = radialTexture(st.stops); const std::vector<float> pos4 = {-1, 1, 0, 1, 1, 0, -1, -1, 0, 1, -1, 0}, uv4 = {0, 0, 1, 0, 0, 1, 1, 1}; const std::vector<uint32_t> idx = {0, 1, 2, 2, 1, 3}; const double white[3] = {1, 1, 1};
-    s.model = objBasicModel(w, pos4, uv4, idx, tex.data(), 128, 128, white, 1.0, true); s.node = objAddNode(w, s.model, 2.0, st.additive ? 4 : 3); fxNodeHide(w, s.node);
+static void fxMarkImpl(World::Impl& w, int style, const double pos[3], const double normal[3], double radius, bool runway) {
+  FxState& fx = fxOf(w);
+  if (style < 0 || style >= (int)fx.styles.size()) return;
+  const FxState::MarkStyle& st = fx.styles[style];
+  const double r = radius > 0 ? radius : st.radius;
+  const double len = std::hypot(normal[0], normal[1], normal[2]);
+  if (!std::isfinite(len) || len < 1e-9) return;
+  const double n[3] = {normal[0] / len, normal[1] / len, normal[2] / len};
+  constexpr int vertices = QC_MARK_CLIP_VERTICES;
+  constexpr int indexOffset = 1 + vertices * 5;
+  constexpr int maxIndices = QC_MARK_CLIP_DOUBLES - indexOffset;
+  const bool clipped = r > 4;
+  int indexCount = 6;
+  if (clipped) {
+    const int written = qc_dry_mark_clip(pos, n, r, runway, fx.markClip, QC_MARK_CLIP_DOUBLES);
+    if (written <= indexOffset) return;
+    indexCount = static_cast<int>(fx.markClip[0]);
+    if (indexCount <= 0 || indexCount > maxIndices || indexCount != written - indexOffset) return;
   }
-  const double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]); if (len < 1e-9) return; const double nn[3] = {n[0] / len, n[1] / len, n[2] / len};
-  double q0[4], qz[4], q[4]; quatFromUnitVectors(0, 0, 1, nn[0], nn[1], nn[2], q0); const double roll = fx.rnd() * 6.283185307; qz[0] = qz[1] = 0; qz[2] = sin(roll / 2); qz[3] = cos(roll / 2); quatMul(q0, qz, q);   // each mark turned about its normal at random
-  const double r = radius > 0 ? radius : st.radius, at[3] = {pos[0] + nn[0] * 0.1, pos[1] + nn[1] * 0.1, pos[2] + nn[2] * 0.1};
-  fxNode(w, s.node, at, q, r, r, r, true); if (w.obj->models[(size_t)s.model].opacityPtr) *w.obj->models[(size_t)s.model].opacityPtr = 1.f; s.age = 0; s.life = fx.markTime; s.on = true;
+
+  auto& ring = fx.marks[style];
+  FxState::Slot& s = ring[fx.next[style]];
+  fx.next[style] = (fx.next[style] + 1) % ring.size();
+  if (s.model < 0) {
+    const auto tex = radialTexture(st.stops);
+    const double white[3] = {1, 1, 1};
+    s.model = objBasicModel(w, std::vector<float>(vertices * 3), {}, std::vector<uint32_t>(maxIndices),
+                            tex.data(), 128, 128, white, 1, true);
+    s.node = objAddNode(w, s.model, 2, st.additive ? 4 : 3);
+  }
+  if (s.node < 0) return;
+  ObjModel& model = w.obj->models[s.model];
+  auto* indices = reinterpret_cast<uint32_t*>(model.ib.ptr);
+  auto* vertexBuffer = reinterpret_cast<float*>(model.vb.ptr);
+  const Prog& program = w.progs[model.prog];
+  double q[4] = {0, 0, 0, 1};
+  double at[3] = {pos[0], pos[1], pos[2]};
+  if (clipped) {
+    float points[vertices * 3], uv[vertices * 2];
+    for (int i = 0; i < vertices * 3; ++i) points[i] = static_cast<float>(fx.markClip[1 + i] - pos[i % 3]);
+    for (int i = 0; i < vertices * 2; ++i) uv[i] = static_cast<float>(fx.markClip[1 + vertices * 3 + i]);
+    for (int i = 0; i < indexCount; ++i) indices[i] = static_cast<uint32_t>(fx.markClip[indexOffset + i]);
+    objWriteBasicVertices(program, vertexBuffer, points, uv, vertices);
+  } else {
+    const float points[] = {-1, 1, 0, 1, 1, 0, -1, -1, 0, 1, -1, 0}, uv[] = {0, 0, 1, 0, 0, 1, 1, 1};
+    const uint32_t quad[] = {0, 1, 2, 2, 1, 3};
+    std::copy(std::begin(quad), std::end(quad), indices);
+    objWriteBasicVertices(program, vertexBuffer, points, uv, 4);
+    double facing[4];
+    quatFromUnitVectors(0, 0, 1, n[0], n[1], n[2], facing);
+    const double roll = fx.rnd() * 3.141592654;
+    const double spin[4] = {0, 0, sin(roll), cos(roll)};
+    quatMul(facing, spin, q);
+    for (int i = 0; i < 3; ++i) at[i] += n[i] * 0.1;
+  }
+  model.parts[0].count = indexCount;
+  const int node = w.obj->insts[s.node].node;
+  auto* sphere = static_cast<double*>(rc_scene_array(A_SPHERE));
+  sphere[node * 4 + 3] = clipped ? 2 * r : 2;
+  const double scale = clipped ? 1 : r;
+  fxNode(w, s.node, at, q, scale, scale, scale, true);
+  if (model.opacityPtr) *model.opacityPtr = 1.f;
+  s.age = 0;
+  s.life = fx.markTime;
+  s.on = true;
 }
 
 static void fxSparksImpl(World::Impl& w, const double pos[3], const double n[3]) {

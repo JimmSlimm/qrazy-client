@@ -126,7 +126,8 @@ void Hub::dropMapState() {
 
 void Hub::mapReady(std::string_view map) {
   readyMap_ = map;
-  if (coreNet()) qc_peer_clear_samples();
+  // The hub can deliver the roster and loaded notices while the local map is
+  // opening. Clearing here would mark those peers as loading again.
   submitLoaded();
 }
 

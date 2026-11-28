@@ -128,7 +128,7 @@ class PeerFxView {
   void update(World& w, double now, bool runway, int followed, const double* followedFrom) {
     nextMissiles_.clear(); nextHooks_.clear(); const int n = qc_peer_fx_frame(now, fx_, QC_FX_MAX);
     for (int i = 0; i < n; ++i) { const QcPeerFx& r = fx_[i];
-      if (r.kind == QC_FX_MISSILE) { const int id = 1000000 + r.id; insert(nextMissiles_, id); const bool isNew = !contains(missiles_, id); w.fxProjectile(id, r.weapon, r.pos, r.dir, isNew); }
+      if (r.kind == QC_FX_MISSILE) { const int id = World::PEER_PROJECTILE_BASE + r.id; insert(nextMissiles_, id); const bool isNew = !contains(missiles_, id); w.fxProjectile(id, r.weapon, r.pos, r.dir, isNew); }
       else if (r.kind == QC_FX_HOOK) { const int s = r.slot + 1; insert(nextHooks_, s); w.fxHook(followed > 0 && r.id == followed ? followedFrom : r.from, r.pos, r.t, (r.flags & QC_FXF_ATTACHED) != 0, s); }
     }
     for (int id : missiles_) if (!contains(nextMissiles_, id)) w.fxProjectileEnd(id);

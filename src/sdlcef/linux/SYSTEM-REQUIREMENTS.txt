@@ -8,6 +8,9 @@ accelerated CEF offscreen rendering are required. VSync ON is required.
 
 Keep the entire distribution together in a writable local filesystem directory.
 Required external runtime: /usr/bin/python3 version 3.11 or newer (stdlib only).
+Matches run in the native Vulkan client: a Vulkan driver and system OpenSSL 3
+(libssl.so.3, with its certificate store) are required. libcurl and libmpg123
+are included.
 CEF, SDL3 and the isolated Node updater are bundled, with original licenses.
 System libraries/drivers are not bundled: GTK3/GLib, ATK/AT-SPI, NSS/NSPR, DBus,
 fontconfig, ALSA, system EGL/GLES/Wayland graphics stack and compatible GPU driver.

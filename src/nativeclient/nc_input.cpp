@@ -37,6 +37,14 @@ void Input::reset(double now) {
   motionReceipt = {};
 }
 
+void Input::resetForPlacement(double now) {
+  reset(now);
+  // Repeat events restore the core's held state without firing press-only binds again.
+  for (size_t scan = 0; scan < down_.size(); ++scan) {
+    if (down_[scan] && qc_ses_key(codes_[scan].id, 2, now) < 0) overflow_ = true;
+  }
+}
+
 void Input::releaseAllKeys() {
   modBits_ = 0;
   down_.fill(false);
@@ -148,6 +156,7 @@ void Input::sendKey(int scan, int kind, int64_t at) {
 }
 
 void Input::mouseButton(int dom, bool down, int64_t at) {
+  down_[1000 + dom] = down;   // held across a placement (resetForPlacement), as a key is
   sendKey(1000 + dom, down ? 1 : 0, at);
 }
 

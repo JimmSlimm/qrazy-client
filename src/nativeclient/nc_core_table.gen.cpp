@@ -76,6 +76,7 @@ static const char* const kCoreFunctions[] = {
   "qc_sim_poses",
   "qc_sim_item_count",
   "qc_sim_item",
+  "qc_sim_item_visible",
   "qc_sim_hud",
   "qc_sim_cgaz",
   "qc_sim_trail",
@@ -97,6 +98,8 @@ static const char* const kCoreFunctions[] = {
   "qc_dry_flight_state",
   "qc_dry_grapple_fire",
   "qc_dry_player_shadow",
+  "qc_dry_mark_clip",
+  "qc_dry_slick_below",
   "qc_dry_cues",
   "qc_wire_decode",
   "qc_wire_encode_state",
@@ -522,6 +525,7 @@ static int (*p_qc_sim_pose_count)(void);
 static int (*p_qc_sim_poses)(uint8_t* out, int capacityBytes);
 static int (*p_qc_sim_item_count)(void);
 static int (*p_qc_sim_item)(int index, QcItem* out);
+static int (*p_qc_sim_item_visible)(int index);
 static void (*p_qc_sim_hud)(QcHud* out);
 static int (*p_qc_sim_cgaz)(QcCgaz* out);
 static int (*p_qc_sim_trail)(float* out_xz, int maxPoints);
@@ -543,6 +547,8 @@ static int (*p_qc_dry_flight_shooter)(int entity, int hasTarget, const double ta
 static int (*p_qc_dry_flight_state)(int weapon, const double base[3], const double pos[3], const double delta[3], double time, double born, int gravity, int stopped, int hostile, double radius, double start, QcFlight* head, double* samples, int sampleCapacity, int32_t* bounces, int bounceCapacity);
 static int (*p_qc_dry_grapple_fire)(const double feet[3], int crouched, double yaw, double pitch, double now, double scale, QcGrapple* out);
 static int (*p_qc_dry_player_shadow)(const double feet[3], double yaw, double accScaleX, double accScaleZ, QcShadow* out);
+static int (*p_qc_dry_mark_clip)(const double pos[3], const double normal[3], double radius, int runway, double* out, int capacity);
+static int (*p_qc_dry_slick_below)(const double feet[3]);
 static int (*p_qc_dry_cues)(int kind, const double* args, int n, QcCue* out, int cap);
 static int (*p_qc_wire_decode)(const uint8_t* p, size_t n, QcWireState* out);
 static int (*p_qc_wire_encode_state)(const QcWireState* s, uint8_t out26[26]);
@@ -955,6 +961,7 @@ int qc_sim_pose_count(void) { return p_qc_sim_pose_count(); }
 int qc_sim_poses(uint8_t* out, int capacityBytes) { return p_qc_sim_poses(out, capacityBytes); }
 int qc_sim_item_count(void) { return p_qc_sim_item_count(); }
 int qc_sim_item(int index, QcItem* out) { return p_qc_sim_item(index, out); }
+int qc_sim_item_visible(int index) { return p_qc_sim_item_visible(index); }
 void qc_sim_hud(QcHud* out) { p_qc_sim_hud(out); }
 int qc_sim_cgaz(QcCgaz* out) { return p_qc_sim_cgaz(out); }
 int qc_sim_trail(float* out_xz, int maxPoints) { return p_qc_sim_trail(out_xz, maxPoints); }
@@ -976,6 +983,8 @@ int qc_dry_flight_shooter(int entity, int hasTarget, const double target[3], dou
 int qc_dry_flight_state(int weapon, const double base[3], const double pos[3], const double delta[3], double time, double born, int gravity, int stopped, int hostile, double radius, double start, QcFlight* head, double* samples, int sampleCapacity, int32_t* bounces, int bounceCapacity) { return p_qc_dry_flight_state(weapon, base, pos, delta, time, born, gravity, stopped, hostile, radius, start, head, samples, sampleCapacity, bounces, bounceCapacity); }
 int qc_dry_grapple_fire(const double feet[3], int crouched, double yaw, double pitch, double now, double scale, QcGrapple* out) { return p_qc_dry_grapple_fire(feet, crouched, yaw, pitch, now, scale, out); }
 int qc_dry_player_shadow(const double feet[3], double yaw, double accScaleX, double accScaleZ, QcShadow* out) { return p_qc_dry_player_shadow(feet, yaw, accScaleX, accScaleZ, out); }
+int qc_dry_mark_clip(const double pos[3], const double normal[3], double radius, int runway, double* out, int capacity) { return p_qc_dry_mark_clip(pos, normal, radius, runway, out, capacity); }
+int qc_dry_slick_below(const double feet[3]) { return p_qc_dry_slick_below(feet); }
 int qc_dry_cues(int kind, const double* args, int n, QcCue* out, int cap) { return p_qc_dry_cues(kind, args, n, out, cap); }
 int qc_wire_decode(const uint8_t* p, size_t n, QcWireState* out) { return p_qc_wire_decode(p, n, out); }
 int qc_wire_encode_state(const QcWireState* s, uint8_t out26[26]) { return p_qc_wire_encode_state(s, out26); }
@@ -1395,6 +1404,7 @@ bool bindCoreTable(void* library, std::string& missing, bool bind) {
     {"qc_sim_poses", (void**)&p_qc_sim_poses},
     {"qc_sim_item_count", (void**)&p_qc_sim_item_count},
     {"qc_sim_item", (void**)&p_qc_sim_item},
+    {"qc_sim_item_visible", (void**)&p_qc_sim_item_visible},
     {"qc_sim_hud", (void**)&p_qc_sim_hud},
     {"qc_sim_cgaz", (void**)&p_qc_sim_cgaz},
     {"qc_sim_trail", (void**)&p_qc_sim_trail},
@@ -1416,6 +1426,8 @@ bool bindCoreTable(void* library, std::string& missing, bool bind) {
     {"qc_dry_flight_state", (void**)&p_qc_dry_flight_state},
     {"qc_dry_grapple_fire", (void**)&p_qc_dry_grapple_fire},
     {"qc_dry_player_shadow", (void**)&p_qc_dry_player_shadow},
+    {"qc_dry_mark_clip", (void**)&p_qc_dry_mark_clip},
+    {"qc_dry_slick_below", (void**)&p_qc_dry_slick_below},
     {"qc_dry_cues", (void**)&p_qc_dry_cues},
     {"qc_wire_decode", (void**)&p_qc_wire_decode},
     {"qc_wire_encode_state", (void**)&p_qc_wire_encode_state},

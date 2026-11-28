@@ -1,6 +1,32 @@
 {
   "releases": [
     {
+      "version": "0.6.2",
+      "date": "2026-11-28",
+      "added": [
+        "Linux: Matches now run in the native Vulkan client. It needs a Vulkan driver.",
+        "Native matches: Pickups have a coloured glow.",
+        "Native matches: Your held weapon glows while you have Quad Damage, Battle Suit or Haste."
+      ],
+      "changed": [
+        "Native matches: Grapple, rocket launch, Quad Damage firing and Haste pickup sounds now match the browser game."
+      ],
+      "fixed": [
+        "Native matches: Fixed a crash while loading some large maps, such as dfwc2017-6.",
+        "Native matches: Distant parts of large maps are no longer cut off.",
+        "Native matches: Collected pickups now disappear until they respawn.",
+        "Native matches: Held movement keys and mouse buttons keep working through !loadpos.",
+        "Native multiplayer: Fixed other players sometimes disappearing from the 3D view after reconnecting.",
+        "Native spectator POV: The mouse pointer stays free, and the movement key display shows the followed player's inputs.",
+        "Native multiplayer: The restart bind returns free-camera spectators to spawn.",
+        "Native matches: Resetting a run clears rockets, plasma and other projectiles you fired.",
+        "Native matches: Chat history stays available when you open the chat box.",
+        "Native matches: Fixed a drawing limit that could hide the console input when scrollback filled the screen.",
+        "Native matches: Rocket and plasma marks follow surface edges and stay off invisible walls.",
+        "Native matches: The slick surface indicator detects slick ground below you or the player you're following, even while airborne."
+      ]
+    },
+    {
       "version": "0.6.1",
       "date": "2026-11-27",
       "added": [],

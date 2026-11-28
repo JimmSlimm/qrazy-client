@@ -39,6 +39,7 @@ class Input {
   void pollFocus();
   bool focused() const { return focused_; }
   void reset(double now);
+  void resetForPlacement(double now);
   const char* domCode(uint32_t id, int* scan = nullptr) const;
   bool keyStillDown(int scan) const { return scan > 0 && scan < int(down_.size()) && down_[scan]; }
   bool takeOverflow() { const bool had = overflow_; overflow_ = false; return had; }
@@ -49,7 +50,8 @@ class Input {
   std::atomic<bool> typing{false};   // a text box (the core's text field) is open: every key goes to it
   std::atomic<bool> cursor{false};   // the page wants a free mouse (chat / console open, or a clickable element on screen): no capture, no look, no clicks into the game. Keyboard routing stays `typing`.
   std::atomic<bool> paused{false};   // the page's /pause: the mouse is free and nothing reaches the game (the app sets it each frame)
-  bool mouseFree() const { return typing.load() || cursor.load() || paused.load(); }
+  std::atomic<bool> followingPov{false};
+  bool mouseFree() const { return typing.load() || cursor.load() || paused.load() || followingPov.load(); }
   // The core text field (chat / team chat / console): while its state is non-zero (or for the console key, always) every key goes to `textKey` on the render thread instead of the game or the page:
   // (TF_KEY_*, TF_MOD_* bits, down, host key id) -> TF_R_* bits (bit 0 = consumed). The app keeps `textState` (TF_STATE_* bits) current after each call; `typing` is the app's "the state is non-zero".
   std::function<uint32_t(uint32_t, uint32_t, bool, uint32_t)> textKey;

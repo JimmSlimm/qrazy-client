@@ -1,5 +1,6 @@
 #define _USE_MATH_DEFINES
 #include "nc_audio.h"
+#include "nc_weapon_audio.gen.h"
 #include "qrazy_core_api.h"
 #include "nc_vk.h"   // logf
 #include <algorithm>
@@ -210,6 +211,13 @@ struct Audio::Impl {
   std::atomic<bool> run{false};
   int rate = 48000, channels = 2; uint32_t bufferFrames = 0; AudioStats st; std::atomic<uint64_t> underruns{0}, played{0}, missing{0};
 
+  void cacheWeaponAudio() {
+    for (const auto& asset : weapon_audio::assets) {
+      std::vector<float> pcm(asset.begin, asset.end);
+      cache[asset.cue] = makeSound(pcm, 1, asset.rate, rate);
+    }
+  }
+
   std::shared_ptr<Sound> load(const std::string& name) {
     auto it = cache.find(name); if (it != cache.end()) return it->second;
     if (name.compare(0, 6, "synth:") == 0) return cache[name] = synthSound(name.substr(6), rate);
@@ -304,6 +312,7 @@ bool Audio::init(const FileSource* files) {
   }
   CoTaskMemFree(fmt);
   if (FAILED(a.client->SetEventHandle(a.event)) || FAILED(a.client->GetBufferSize(&a.bufferFrames)) || FAILED(a.client->GetService(__uuidof(IAudioRenderClient), (void**)&a.render))) return false;
+  a.cacheWeaponAudio();
   { BYTE* buf; if (SUCCEEDED(a.render->GetBuffer(a.bufferFrames, &buf))) { memset(buf, 0, (size_t)a.bufferFrames * (size_t)a.channels * 4); a.render->ReleaseBuffer(a.bufferFrames, 0); } }
   a.run = true; a.thread = std::thread([&a] { a.loop(); }); if (FAILED(a.client->Start())) { a.run = false; a.thread.join(); return false; }
   a.st.rate = a.rate; a.st.channels = a.channels; a.st.periodMs = periodMs; a.st.lowLatency = low;
@@ -330,6 +339,7 @@ bool Audio::init(const FileSource* files) {
   SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");   // a small buffer: about 5 ms at 48 kHz (the backend may round it)
   SDL_AudioSpec spec; SDL_zero(spec); spec.format = SDL_AUDIO_F32; spec.channels = 2; spec.freq = 48000;
   a.rate = spec.freq; a.channels = spec.channels;
+  a.cacheWeaponAudio();
   a.run = true; a.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, sdlFeed, &a);
   if (!a.stream) { a.run = false; logf("audio: no output device: %s", SDL_GetError()); return false; }
   if (!SDL_ResumeAudioStreamDevice(a.stream)) { shutdown(); return false; }
@@ -401,6 +411,7 @@ void Audio::cue(const char* nameIn, const double* pos, double gain, int flags, i
   name += nameIn;
   if (name.empty() || name.front() == '/' || name.find("..") != std::string::npos ||
       name.find_first_of("\\") != std::string::npos) return;
+  if (start && name == "weapons/grapple/grappull") gain *= 0.5;
   startVoice(a, name, (flags & 1) ? pos : nullptr, gain, start, group, start ? emitter : 0,
     flags, (flags & QC_CUE_WR_CLIP) ? pos[0] : 0);
 }

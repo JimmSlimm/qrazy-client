@@ -59,23 +59,20 @@ static void finishCamera(CameraIn& c, const double eye[3], double aspect, double
   memcpy(c.proj, p.data(), 128); memcpy(c.pos, eye, 24); c.fovY = fovY;
 }
 
-CameraIn makeCamera(const double eye[3], double yawDeg, double pitchDeg, double aspect, double fovY) {
+CameraIn makeCamera(const double eye[3], double yawDeg, double pitchDeg, double aspect, double fovY, double farZ) {
   const double yaw = yawDeg * M_PI / 180, pit = pitchDeg * M_PI / 180;
   const double f[3] = {cos(yaw) * cos(pit), sin(pit), -sin(yaw) * cos(pit)};
-  return makeCameraFwd(eye, f, aspect, fovY);
-}
-CameraIn makeCameraFwd(const double eye[3], const double f[3], double aspect, double fovY) {
   double up0[3] = {0, 1, 0};
   double r[3] = {f[1] * up0[2] - f[2] * up0[1], f[2] * up0[0] - f[0] * up0[2], f[0] * up0[1] - f[1] * up0[0]}; const double rl = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]); for (double& x : r) x /= rl;
   double u[3] = {r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]};
-  CameraIn c; M4 v = ident();
+  CameraIn c; c.farZ = farZ; M4 v = ident();
   for (int i = 0; i < 3; ++i) { v[i * 4 + 0] = r[i]; v[i * 4 + 1] = u[i]; v[i * 4 + 2] = -f[i]; }
   v[12] = -(r[0] * eye[0] + r[1] * eye[1] + r[2] * eye[2]); v[13] = -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]); v[14] = f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2];
   memcpy(c.view, v.data(), 128); finishCamera(c, eye, aspect, fovY); return c;
 }
-CameraIn makeCameraView(const double eye[3], const double quat[4], double aspect, double fovY) {
+CameraIn makeCameraView(const double eye[3], const double quat[4], double aspect, double fovY, double farZ) {
   CameraIn c; if (rc_camera_view(eye, quat, c.view) != 0) fatal("rc_camera_view failed");
-  const double* clips = rc_camera_clips(); c.nearZ = clips[0]; c.farZ = clips[1];
+  c.nearZ = rc_camera_clips()[0]; c.farZ = farZ;
   finishCamera(c, eye, aspect, fovY); return c;
 }
 
@@ -131,6 +128,7 @@ struct World::Impl {
   std::string entities;
   // core tables copied out of the first packet
   double mapBounds[6] = {-1000, 0, -1000, 1000, 200, 1000};
+  double mapFar = 0;
   std::string blob; std::vector<Material> mats; std::vector<Stage> stages; std::vector<Prog> progs; std::vector<MatGpu> matGpu;
   std::vector<int32_t> batchRec; int batchW = 0; std::vector<uint32_t> stageOffsets; bool stageOk = false;
   // GPU
@@ -345,6 +343,7 @@ World::~World() {
 }
 const WorldStats& World::stats() const { return m->st; }
 const double* World::mapBounds() const { return m->mapBounds; }
+double World::farPlane() const { return std::max(rc_camera_clips()[1], m->mapFar); }
 
 void World::warmPipelines() {
   Impl& w = *m;
@@ -453,6 +452,8 @@ bool World::load(const Context& ctx, const FileSource& fsrc, const std::string& 
     float b[6]; memcpy(b, bsp.data() + modelOff, sizeof b);
     const double bounds[6] = {b[0], b[2], -b[4], b[3], b[5], -b[1]};
     memcpy(w.mapBounds, bounds, sizeof bounds);
+    // Match map-view.js using BSP model 0, before any renderer-specific bounds changes.
+    w.mapFar = 1.1 * std::hypot(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2]);
   }
   const std::string mapName = mapBaseName(actualBsp);
   std::vector<FileSource::ShaderSource> shaderSources;
@@ -539,7 +540,7 @@ bool World::load(const Context& ctx, const FileSource& fsrc, const std::string& 
 
   // ---- the first frame carries the load tables (programs, materials, stages): read them from a priming frame at the spawn point
   double eye[3] = {0, 100, 0}, yaw = 0; spawn(eye, yaw);
-  { const CameraIn ci = makeCamera(eye, yaw, 0, 16.0 / 9.0, 100); Camera cam = {}; memcpy(cam.view, ci.view, 128); memcpy(cam.proj, ci.proj, 128); memcpy(cam.position, ci.pos, 24); cam.nearZ = ci.nearZ; cam.farZ = ci.farZ; cam.fovY = ci.fovY; cam.flags = PASS_WORLD;
+  { const CameraIn ci = makeCamera(eye, yaw, 0, 16.0 / 9.0, 100, farPlane()); Camera cam = {}; memcpy(cam.view, ci.view, 128); memcpy(cam.proj, ci.proj, 128); memcpy(cam.position, ci.pos, 24); cam.nearZ = ci.nearZ; cam.farZ = ci.farZ; cam.fovY = ci.fovY; cam.flags = PASS_WORLD;
     rc_frame_begin(); uint8_t* cp = (uint8_t*)rc_alloc(sizeof cam); memcpy(cp, &cam, sizeof cam); RC(rc_frame_objects(cp, 0, nullptr, 0, 1, 1, -1));
     const uint8_t* pk = rc_packet_ptr(); const Header* h = (const Header*)pk;
     w.blob.assign((const char*)pk + h->sec[SEC_BLOB].offset, h->sec[SEC_BLOB].count);
@@ -760,11 +761,17 @@ void World::drawGhostPath(bool on, int k, double width, double opacity, const do
     L.res[0] = (float)resW; L.res[1] = (float)resH; *L.width = (float)width; *L.opacity = (float)opacity; for (int c = 0; c < 3; ++c) L.diffuse[c] = (float)rgb[c];
     o.models[(size_t)L.model].parts[0].count = (uint32_t)segs * 18; flags[L.node] |= 2u; }
 }
-void World::fxMark(int style, const double pos[3], const double normal[3], double radius) { if (m->obj) fxMarkImpl(*m, style, pos, normal, radius); }
+void World::fxMark(int style, const double pos[3], const double normal[3], double radius, bool runway) { if (m->obj) fxMarkImpl(*m, style, pos, normal, radius, runway); }
 void World::fxSparks(const double pos[3], const double normal[3]) { if (m->obj) fxSparksImpl(*m, pos, normal); }
 void World::fxBlast(int weapon, const double pos[3], double radius, const double* normal, bool ghost) { if (m->obj) fxBlastImpl(*m, weapon, pos, radius, normal, ghost); }
 void World::fxProjectile(int id, int weapon, const double pos[3], const double vel[3], bool spawn) { if (m->obj) fxProjectileImpl(*m, id, weapon, pos, vel, spawn); }
 void World::fxProjectileEnd(int id) { if (m->obj) fxProjectileEndImpl(*m, id); }
+void World::fxClearOwnProjectiles() {
+  if (!m->obj || !m->fxp) return;
+  auto& projs = fxOf(*m).projs;
+  while (!projs.empty() && projs.begin()->first < PEER_PROJECTILE_BASE)
+    fxProjectileEndImpl(*m, projs.begin()->first);
+}
 void World::fxBeam(const double from[3], const double to[3]) { if (m->obj) fxBeamImpl(*m, from, to); }
 void World::fxHook(const double from[3], const double to[3], double time, bool attached, int slot) { if (m->obj) fxHookImpl(*m, from, to, time, attached, slot); }
 void World::fxHookEnd(int slot) { if (m->obj) fxHookEndImpl(*m, slot); }
@@ -801,15 +808,50 @@ void World::setNodePose(int handle, const double pos[3], const double quat[4], c
   for (int k = 0; k < 3; ++k) { p[node * 3 + k] = pos[k]; s[node * 3 + k] = scale[k]; } for (int k = 0; k < 4; ++k) q[node * 4 + k] = quat[k]; if (visible) flags[node] |= 2u; else flags[node] &= ~2u;
 }
 void World::setOpacity(int handle, double opacity) { Impl& w = *m; if (!w.obj || handle < 0 || handle >= (int)w.obj->insts.size()) return; float* o = w.obj->models[(size_t)w.obj->insts[handle].model].opacityPtr; if (o) *o = (float)opacity; }
-static bool objParseGlb(const std::vector<uint8_t>& glb) { if (glb.empty()) return false; uint8_t* cp = (uint8_t*)rc_alloc((int)glb.size() + 1); memcpy(cp, glb.data(), glb.size()); if (rc_model_parse_glb(cp, (int)glb.size()) < 0) { logf("custom model: %s", rc_model_error()); return false; } return true; }
+static bool objParseGlb(const std::vector<uint8_t>& glb) { if (glb.empty()) return false; rc_frame_begin(); const uint8_t* cp = putCore(glb); if (rc_model_parse_glb(cp, (int)glb.size()) < 0) { logf("custom model: %s", rc_model_error()); return false; } return true; }
 int World::addViewWeaponGlb(const std::vector<uint8_t>& glb, double scale) {
   Impl& w = *m; if (!w.obj) return -1; const double* f = rc_fit_standard(scale); if (!f) return -1; const double xf[5] = {f[4], f[0], f[1], f[2], f[3]}; if (!objParseGlb(glb)) return -1;
   const std::string id = "custom-gun-" + std::to_string(w.obj->models.size()); const int model = objModelFromRecord(w, id, id, 1.0, false, true, xf); if (model < 0) return -1;
   const int h = objAddNode(w, model, 90.0, 1, 2u); w.obj->gunHandles.push_back(h); return h;
 }
-int World::addObjectGlb(const std::vector<uint8_t>& glb, double size) {
+static int addPickupNode(World::Impl& w, int model, double radius, uint32_t color, bool hasModel) {
+  auto& o = *w.obj;
+  const int handle = objAddNode(w, model, radius, o.models[model].transparent ? 2 : 1);
+  if (handle < 0) return handle;
+  const bool emissive = o.models[model].hasEmission;
+  const double size = emissive ? 60 : hasModel ? 44 : 36;
+  const auto [it, inserted] = o.pickupGlowModels.try_emplace(std::make_pair(color, emissive), -1);
+  if (inserted) {
+    if (!o.pickupGlowTexture.img) {
+      const auto rgba = radialTexture({{0, {255, 255, 255, .9f}}, {.4f, {255, 255, 255, .3f}}, {1, {255, 255, 255, 0}}}, 64);
+      o.pickupGlowTexture = makeTexture(w.c, rgba.data(), 64, 64, false);
+    }
+    const double rgb[] = {srgbToLinear(((color >> 16) & 255) / 255.0),
+                          srgbToLinear(((color >> 8) & 255) / 255.0),
+                          srgbToLinear((color & 255) / 255.0)};
+    it->second = objBasicModel(w, {-.5f, .5f, 0, .5f, .5f, 0, -.5f, -.5f, 0, .5f, -.5f, 0},
+      {0, 0, 1, 0, 0, 1, 1, 1}, {0, 2, 1, 2, 3, 1}, nullptr, 0, 0, rgb,
+      emissive ? .6 : .35, true, &o.pickupGlowTexture);
+    ObjectState state;
+    memcpy(&state, rc_scene_material_state(PICKUP_GLOW_MATERIAL), sizeof state);
+    w.pipelineFor((uint32_t)o.models[it->second].prog, state);
+  }
+  const int halo = objAddNode(w, it->second, 1, PICKUP_GLOW_MATERIAL);
+  if (halo >= 0) {
+    const int node = o.insts[halo].node;
+    o.insts[handle].glowNode = node;
+    static_cast<uint32_t*>(rc_scene_array(A_FLAGS))[node] |= NODE_SPRITE;
+    // The child halo inherits the pickup's position and visibility on collection and respawn.
+    static_cast<int32_t*>(rc_scene_array(A_PARENT))[node] = o.insts[handle].node;
+    double* scale = static_cast<double*>(rc_scene_array(A_SCALE)) + 3 * node;
+    scale[0] = scale[1] = scale[2] = size;
+  }
+  return handle;
+}
+
+int World::addObjectGlb(const std::vector<uint8_t>& glb, double size, uint32_t glow) {
   Impl& w = *m; if (!w.obj || !objParseGlb(glb)) return -1; const std::string id = "custom-object-" + std::to_string(w.obj->models.size()); const int model = objModelFromRecord(w, id, id, size, true); if (model < 0) return -1;
-  return objAddNode(w, model, size * 0.9);
+  return addPickupNode(w, model, size * 0.9, glow, true);
 }
 
 int World::addViewWeaponFile(const std::string& glbRel, int fitKind) {
@@ -865,6 +907,16 @@ void World::placeViewGun(int heldHandle, const double* p) {
 int World::addCoreModel(int kind, double radius) {
   Impl& w = *m; if (!w.obj) return -1; const int model = objAddCoreModel(w, kind); if (model < 0) return -1;
   return objAddNode(w, model, radius, 1, 1u | (kind == 16 ? MINIMAP_LAYER : 0u));
+}
+
+void World::setGunGlow(uint32_t mask, double time) {
+  Impl& w = *m; if (!w.obj) return; const float phase = (float)fmod(time, 1.0 / 0.35);   // the shader's bands repeat every 1 / 0.35 s
+  for (int h : w.obj->gunHandles) { ObjModel& model = w.obj->models[(size_t)w.obj->insts[h].model];
+    for (float* v : model.glowPtrs) { v[0] = (mask & 1) ? 1.f : 0.f; v[1] = (mask & 2) ? 1.f : 0.f; v[2] = (mask & 4) ? 1.f : 0.f; }
+    for (float* v : model.glowTimePtrs) *v = phase; }
+  for (const auto& r : w.obj->rotors) { const int node = r.first; for (const auto& in : w.obj->insts) if (in.node == node) { ObjModel& model = w.obj->models[(size_t)in.model];   // the spinning barrel / rotor is its own node
+      for (float* v : model.glowPtrs) { v[0] = (mask & 1) ? 1.f : 0.f; v[1] = (mask & 2) ? 1.f : 0.f; v[2] = (mask & 4) ? 1.f : 0.f; }
+      for (float* v : model.glowTimePtrs) *v = phase; } }
 }
 
 static void recordDraws(World::Impl& w, VkCommandBuffer cb, int i, uint32_t base, size_t count,
@@ -1056,7 +1108,7 @@ void World::showTriggerOverlay(bool on) {
 }
 
 int World::addPickup(uint32_t weapon, const std::string& glbRel, const char* icons, double size,
-                     uint32_t marker, double radius, double stretch) {
+                     uint32_t marker, uint32_t glow, double radius, double stretch) {
   Impl& w = *m;
   if (!w.obj) return -1;
   auto& cache = w.obj->modelByFile;
@@ -1068,6 +1120,7 @@ int World::addPickup(uint32_t weapon, const std::string& glbRel, const char* ico
     int model = found == cache.end() ? -1 : found->second;
     if (found == cache.end()) {
       if (weapon) {
+        rc_frame_begin();
         if (rc_model_build(14) >= 0)
           model = objModelFromRecord(w, id, id, size, true, false, nullptr, 0, nullptr, nullptr, name.c_str());
       } else {
@@ -1075,7 +1128,7 @@ int World::addPickup(uint32_t weapon, const std::string& glbRel, const char* ico
       }
       cache[id] = model;
     }
-    if (model >= 0) return objAddNode(w, model, size * 0.9, w.obj->models[model].transparent ? 2 : 1);
+    if (model >= 0) return addPickupNode(w, model, size * 0.9, glow, true);
   }
 
   const std::string id = "pickup-marker:" + std::to_string(marker) + ":" +
@@ -1095,12 +1148,13 @@ int World::addPickup(uint32_t weapon, const std::string& glbRel, const char* ico
     cache.emplace(id, model);
     logf("pickup marker: #%06x, radius %.1f, Y stretch %.2f", marker, radius, stretch);
   }
-  return objAddNode(w, model, radius * std::max(1.0, stretch));
+  return addPickupNode(w, model, radius * std::max(1.0, stretch), glow, false);
 }
-void World::setObject(int handle, const double pos[3], double yaw, bool visible) {
-  Impl& w = *m; if (!w.obj || handle < 0 || handle >= (int)w.obj->insts.size()) return; const int node = w.obj->insts[handle].node;
+void World::setObject(int handle, const double pos[3], double yaw, bool visible, double glowOffsetY) {
+  Impl& w = *m; if (!w.obj || handle < 0 || handle >= (int)w.obj->insts.size()) return; const auto& inst = w.obj->insts[handle]; const int node = inst.node;
   double* p = (double*)rc_scene_array(A_POS); double* q = (double*)rc_scene_array(A_QUAT); uint32_t* flags = (uint32_t*)rc_scene_array(A_FLAGS);
   for (int k = 0; k < 3; ++k) p[node * 3 + k] = pos[k];
+  if (inst.glowNode >= 0) p[inst.glowNode * 3 + 1] = glowOffsetY;
   q[node * 4] = 0; q[node * 4 + 1] = sin(yaw * 0.5); q[node * 4 + 2] = 0; q[node * 4 + 3] = cos(yaw * 0.5);   // about +y
   if (visible) flags[node] |= 2u; else flags[node] &= ~2u;   // F_VISIBLE
 }

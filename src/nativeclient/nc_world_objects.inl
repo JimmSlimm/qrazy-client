@@ -3,14 +3,17 @@
 // Models come from the core's GLB reader (rc_model_parse_glb); programs are the core's LIT variants in the Vulkan dialect.
 
 struct GeoPart { uint32_t first = 0, count = 0; Image tex; bool hasTex = false, flat = false, clamp = false; /* flat: sampled with repeat wrapping, level 0 only (Material.wrapS 10497) */ double color[3] = {1, 1, 1}; double rough = 1, metal = 0, opacity = 1; };
-struct ObjModel { bool transparent = false; float* opacityPtr = nullptr; float* diffusePtr = nullptr; int prog = -1; Buf vb, ib; std::vector<GeoPart> parts; std::vector<VkDescriptorSet> sets; std::vector<size_t> matOffs; double size = 1; };   // matOffs: each part's material block (768 bytes: 512 material + 256 stage)
-enum { NODE_MESH = 16, NODE_CLAIMED = 256, NODE_LINES = 4096 };   // NODE_LINES: the mesh is line segments (scene_store.hpp F_LINES -> the state's topology)
+struct ObjModel { bool transparent = false, hasEmission = false; float* opacityPtr = nullptr; float* diffusePtr = nullptr; int prog = -1; Buf vb, ib; std::vector<GeoPart> parts; std::vector<VkDescriptorSet> sets; std::vector<size_t> matOffs; double size = 1; std::vector<float*> glowPtrs, glowTimePtrs; };   // matOffs: each part's material block (768 bytes: 512 material + 256 stage); glow*: each part's powerup glow uniforms (view weapons)
+enum { NODE_MESH = 16, NODE_SPRITE = 32, NODE_CLAIMED = 256, NODE_LINES = 4096 };   // NODE_LINES: the mesh is line segments (scene_store.hpp F_LINES -> the state's topology)
+constexpr int PICKUP_GLOW_MATERIAL = 9;
 enum { A_POS = 0, A_QUAT = 1, A_SCALE = 2, A_SPHERE = 5, A_PARENT = 16, A_RENDER_ORDER = 17, A_MATERIAL = 18, A_OBJECT_ID = 19, A_FLAGS = 20, A_LAYERS = 21, A_CLAIM_MASK = 23, A_MAT_FLAGS = 32, A_MAT_ID = 33 };
 
 struct World::Impl::Obj {
   std::map<std::string, uint32_t> C;                       // the core's variant constants by name
   std::vector<ObjModel> models; std::map<std::string, int> modelByFile;
-  struct Inst { int node, model; };
+  Image pickupGlowTexture;
+  std::map<std::pair<uint32_t, bool>, int> pickupGlowModels;
+  struct Inst { int node, model, glowNode = -1; };
   std::vector<Inst> insts; std::vector<int> modelOfObjectId;   // objectId = 100 + handle -> model
   int nDir = 0, nHemi = 0; std::vector<int> gunHandles; std::map<int, std::array<double, 3>> gunLocal;   /* gunLocal: a weapon's own offset inside the rig (the page's hook choice group sits at z -5) */ std::vector<std::pair<int, int>> rotors; bool ready = false; /* rotors: scene node, spin axis (1 y, 2 z) */ std::map<uint32_t, int> litByKey; Image checker;   // litByKey: variant key -> program
   uint32_t objDraws = 0;
@@ -60,7 +63,13 @@ static void objInit(World::Impl& w) {
     // class 7: as 6 but double sided in one pass (the player shadows, player-shadows.js)
     fa[factIndex["side"]] = 2; fa[factIndex["allowTwoPass"]] = 0; if (rc_scene_material_set(7) != 0) fatal("rc_scene_material_set(7) failed");
     // class 8: the ghost path (ghost-path.js lineMaterial: transparent, no depth write, front side, polygon offset -4 / -4)
-    fa[factIndex["side"]] = 0; fa[factIndex["allowTwoPass"]] = 1; fa[factIndex["polygonOffset"]] = 1; fa[factIndex["polygonOffsetFactor"]] = -4; fa[factIndex["polygonOffsetUnits"]] = -4; if (rc_scene_material_set(8) != 0) fatal("rc_scene_material_set(8) failed"); }
+    fa[factIndex["side"]] = 0; fa[factIndex["allowTwoPass"]] = 1; fa[factIndex["polygonOffset"]] = 1; fa[factIndex["polygonOffsetFactor"]] = -4; fa[factIndex["polygonOffsetUnits"]] = -4; if (rc_scene_material_set(8) != 0) fatal("rc_scene_material_set(8) failed");
+    // Pickup halos use the sprite pass: additive, depth tested, no depth write.
+    matFlags[PICKUP_GLOW_MATERIAL] = 1;   // MC_TRANSPARENT
+    matId[PICKUP_GLOW_MATERIAL] = 10 + PICKUP_GLOW_MATERIAL;
+    fa[factIndex["blending"]] = 2; fa[factIndex["polygonOffset"]] = 0;
+    if (rc_scene_material_set(PICKUP_GLOW_MATERIAL) != 0) fatal("pickup glow material failed");
+  }
   const double ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}; objPackLights(ident); o->nDir = rc_lights_info(1); o->nHemi = rc_lights_info(2);
   if (rc_lights_info(0) == 0) logf("note: the placeholder light rig does not fit the core's light packing; lit objects would be left out");
   const uint8_t px[4] = {255, 255, 255, 255}; o->checker = makeTexture(w.c, px, 1, 1, false);
@@ -95,6 +104,7 @@ static int objModelFromRecord(World::Impl& w, const std::string& id, const std::
   if (rd32(rec + 4) >= 2 && rc_layout(27) != 104) logf("note: the core's Material is %d bytes, this client reads 104", rc_layout(27));
   const uint8_t* imgs = mats + matStride * nMaterials;
   std::vector<float> pos, nrm, uv, col; std::vector<uint32_t> idx; ObjModel m; m.size = size; bool anyColors = false, basic = false, transparent = false, line = false;   // col: vertex colours (a mesh whose normal slot holds colours, hasNormal == 2)
+  m.hasEmission = (rd32(rec + 8) & 1u) != 0;
   struct Raw { uint32_t first, count; double color[3]; double rough = 1, metal = 0, opacity = 1; std::vector<uint8_t> rgba; int iw, ih; bool raw = false, flat = false, icon = false; }; bool standard = false, anyMap = false, haveIcon = false; std::vector<Raw> raws;
   int rotorNode = -1; double pivot[3] = {0, 0, 0};
   if (rotorName) for (uint32_t n = 0; n < nNodes; ++n) { const uint8_t* nd = rec + 40 + 280 * n; const uint32_t no = rd32(nd), nl = rd32(nd + 4); if (nl == strlen(rotorName) && !memcmp(blob + no, rotorName, nl)) { rotorNode = (int)n; break; } }
@@ -144,6 +154,7 @@ static int objModelFromRecord(World::Impl& w, const std::string& id, const std::
   uint32_t facts = 0; if (anyMap || fit) facts |= o.C["FACT_MAP"]; if (standard) facts |= o.C["FACT_STANDARD"]; if (!fit) facts |= o.C["FACT_OPAQUE"];
   if (basic) { facts = (anyColors ? o.C["FACT_COLORS"] : 0u) | (anyMap ? o.C["FACT_MAP"] : 0u) | (transparent ? 0u : o.C["FACT_OPAQUE"]); }   // an unlit material (SHADE_BASIC): the basic program
   m.transparent = transparent;
+  if (gun && !line) facts |= o.C["FACT_GLOW"];   // the powerup glow bands on every view weapon material (weapon-powerup-glow.js)
   // rc_viewgun_lights packs one directional light and no hemisphere lights.
   m.prog = line ? objProgram(w, "FAMILY_LINE", anyColors ? o.C["FACT_COLORS"] : 0u, 0, 0, gun ? 0 : w.fogMode) : basic ? objProgram(w, "FAMILY_BASIC", facts, 0, 0, gun ? 0 : w.fogMode) : gun ? objProgram(w, "FAMILY_LIT", facts, 1, 0, 0) : objLitProgram(w, facts);
   // (the view weapon uses its own light counts and no fog)
@@ -171,6 +182,7 @@ static int objModelFromRecord(World::Impl& w, const std::string& id, const std::
     const double one[1] = {part.opacity}, zero3[3] = {0, 0, 0}, rough[1] = {part.rough}, metal[1] = {part.metal}, at0[1] = {0}, mt[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
     for (auto& u : P.slots) { if (u.block != BLK_MATERIAL) continue; const std::string n(P.names + u.nameOffset, u.nameLen);
       if (n == "diffuse") { putSlot(mb, u, part.color, 3); if (&part == &m.parts[0]) m.diffusePtr = (float*)(mb + u.offset); } else if (n == "emissive") putSlot(mb, u, zero3, 3); else if (n == "opacity") { putSlot(mb, u, one, 1); if (&part == &m.parts[0]) m.opacityPtr = (float*)(mb + u.offset); }
+      else if (n == "weaponPowerups") m.glowPtrs.push_back((float*)(mb + u.offset)); else if (n == "weaponPowerupTime") m.glowTimePtrs.push_back((float*)(mb + u.offset));
       else if (n == "roughness") putSlot(mb, u, rough, 1); else if (n == "metalness") putSlot(mb, u, metal, 1); else if (n == "alphaTest") putSlot(mb, u, at0, 1);
       else if (n == "mapTransform" || n == "emissiveMapTransform") putSlot(mb, u, mt, 9); }
   }
@@ -190,7 +202,7 @@ static void objReleaseModel(World::Impl& w, int model) {
 
 static int objAddPickupFile(World::Impl& w, const std::string& id, const std::string& glbRel, double size, const char* icons) {
   std::vector<uint8_t> bytes; if (!w.fs->read(glbRel, bytes)) { logf("model not found: %s", glbRel.c_str()); return -1; }
-  uint8_t* cp = (uint8_t*)rc_alloc((int)bytes.size() + 1); memcpy(cp, bytes.data(), bytes.size());
+  rc_frame_begin(); const uint8_t* cp = putCore(bytes);   // from the map's arena mark: model loads must not pile up
   if (rc_model_parse_glb(cp, (int)bytes.size()) < 0) { logf("rc_model_parse_glb(%s): %s", glbRel.c_str(), rc_model_error()); return -1; }
   return objModelFromRecord(w, id, glbRel, size, true, false, nullptr, 0, nullptr, nullptr, nullptr, nullptr, -1, nullptr, icons);
 }
@@ -198,19 +210,19 @@ static int objAddPickupFile(World::Impl& w, const std::string& id, const std::st
 // A contributed weapon file fitted to the built-in shape of `kind` (3 plasma, 4 rocket) as the page does (weapon-fit.js): turned by rc_fit_turn(), its box measured, rc_fit_weapon(kind) -> scale, position, turn.
 static int objAddFittedWeapon(World::Impl& w, const std::string& glbRel, int kind) {
   World::Impl::Obj& o = *w.obj; std::vector<uint8_t> bytes; if (!w.fs->read(glbRel, bytes)) return -1;
-  uint8_t* cp = (uint8_t*)rc_alloc((int)bytes.size() + 1); memcpy(cp, bytes.data(), bytes.size());
+  rc_frame_begin(); const uint8_t* cp = putCore(bytes);   // from the map's arena mark: model loads must not pile up
   if (rc_model_parse_glb(cp, (int)bytes.size()) < 0) { logf("rc_model_parse_glb(%s): %s", glbRel.c_str(), rc_model_error()); return -1; }
   const double turn = rc_fit_turn(); const double* bb = rc_model_bounds(turn); if (!bb) return -1; double* fb = rc_fit_bounds(); for (int k = 0; k < 6; ++k) fb[k] = bb[k];
   const double* f = rc_fit_weapon(kind); if (!f) return -1; const double xf[5] = {turn, f[0], f[1], f[2], f[3]};   if (getenv("QRAZY_NC_DEBUGMODEL")) logf("  fit %s kind %d: turn %.3f bounds x %.1f..%.1f y %.1f..%.1f z %.1f..%.1f -> scale %.3f pos %.1f %.1f %.1f rot %.3f", glbRel.c_str(), kind, turn, bb[0], bb[3], bb[1], bb[4], bb[2], bb[5], f[0], f[1], f[2], f[3], f[4]);   // f = scale, position xyz (then rotation y, which the page's wrapper does not apply for a file)
   // rc_fit_weapon builds the built-in shape to measure it (the plasma gun's, for one) and leaves THAT in the current model record: read the file again before building from it
-  uint8_t* cp2 = (uint8_t*)rc_alloc((int)bytes.size() + 1); memcpy(cp2, bytes.data(), bytes.size()); if (rc_model_parse_glb(cp2, (int)bytes.size()) < 0) return -1;
+  rc_frame_begin(); const uint8_t* cp2 = putCore(bytes); if (rc_model_parse_glb(cp2, (int)bytes.size()) < 0) return -1;
   return objModelFromRecord(w, "gun-file-" + glbRel, glbRel, 1.0, false, true, xf);
 }
 
 // one of the core's own models (rc_model_build kind: the runway, weapons ...) in the record's own coordinates
 static int objAddCoreModel(World::Impl& w, int kind, bool gun = false, int part = 0, const char* rotorName = nullptr, double* pivotOut = nullptr, const char* meshName = nullptr, const double* tint = nullptr, int uniqueId = 0) {
   World::Impl::Obj& o = *w.obj; const std::string id = std::string(gun ? "gun-model-" : "core-model-") + std::to_string(kind) + (part ? "-part" + std::to_string(part) : std::string()) + (meshName ? std::string("-") + meshName : std::string()) + (uniqueId ? "-u" + std::to_string(uniqueId) : std::string()); auto f = o.modelByFile.find(id); if (f != o.modelByFile.end()) return f->second;
-  if (rc_model_build(kind) < 0) { logf("rc_model_build(%d): %s", kind, rc_model_error()); return -1; }
+  rc_frame_begin(); if (rc_model_build(kind) < 0) { logf("rc_model_build(%d): %s", kind, rc_model_error()); return -1; }
   if (kind == 16) {
     if (const double* bounds = rc_model_bounds(0)) memcpy(w.mapBounds, bounds, sizeof w.mapBounds);
   }
@@ -234,14 +246,20 @@ static int objAddNode(World::Impl& w, int model, double radius, int materialClas
 // through the transparent class 2. Vertices are in the sim's frame already, so the node sits at identity.
 // A small unlit model from raw arrays (the program is the core's BASIC family: a colour map when rgba is given, opaque unless `transparent`), with its own material block so its colour and opacity can change per instance.
 // Used for text boards, impact marks, sparks, beams. Returns the model index; `opacityPtr` / `diffusePtr` of the model point into the material block.
-static int objBasicModel(World::Impl& w, const std::vector<float>& pos, const std::vector<float>& uv, const std::vector<uint32_t>& idx, const uint8_t* rgba, int tw, int th, const double diffuse[3], double opacity, bool transparent) {
-  World::Impl::Obj& o = *w.obj; ObjModel m; m.size = 1; m.transparent = transparent; const size_t nv = pos.size() / 3;
-  m.prog = objProgram(w, "FAMILY_BASIC", (rgba ? o.C["FACT_MAP"] : 0u) | (transparent ? 0u : o.C["FACT_OPAQUE"]), 0, 0, w.fogMode); const Prog& P = w.progs[m.prog]; const size_t floats = P.stride / 4;
-  std::vector<float> vb(nv * floats, 0.f);
+static void objWriteBasicVertices(const Prog& P, float* vb, const float* pos, const float* uv, size_t nv) {
+  const size_t floats = P.stride / 4;
   for (size_t v = 0; v < nv; ++v) { size_t at = v * floats; for (auto& a : P.inputs) { for (int c = 0; c < a.second; ++c) { float x = 0;
-    if (a.first == "position") x = pos[v * 3 + c]; else if (a.first == "normal") x = c == 2 ? -1.f : 0.f; else if (a.first == "uv") x = uv.empty() ? 0.f : uv[v * 2 + c]; else if (a.first == "color") x = 1.f;
+    if (a.first == "position") x = pos[v * 3 + c]; else if (a.first == "normal") x = c == 2 ? -1.f : 0.f; else if (a.first == "uv" && uv) x = uv[v * 2 + c]; else if (a.first == "color") x = 1.f;
     vb[at + c] = x; } at += (size_t)a.second; } }
-  m.vb = makeBuf(w.c, vb.size() * 4, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT); memcpy(m.vb.ptr, vb.data(), vb.size() * 4);
+}
+
+static int objBasicModel(World::Impl& w, const std::vector<float>& pos, const std::vector<float>& uv, const std::vector<uint32_t>& idx, const uint8_t* rgba, int tw, int th, const double diffuse[3], double opacity, bool transparent, const Image* spriteTexture = nullptr) {
+  World::Impl::Obj& o = *w.obj; ObjModel m; m.size = 1; m.transparent = transparent; const size_t nv = pos.size() / 3;
+  const uint32_t facts = ((rgba || spriteTexture) ? o.C["FACT_MAP"] : 0u) |
+    (transparent ? 0u : o.C["FACT_OPAQUE"]) | (spriteTexture ? o.C["FACT_ATTENUATION"] : 0u);
+  m.prog = objProgram(w, spriteTexture ? "FAMILY_SPRITE" : "FAMILY_BASIC", facts, 0, 0, w.fogMode); const Prog& P = w.progs[m.prog];
+  m.vb = makeBuf(w.c, nv * P.stride, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+  objWriteBasicVertices(P, reinterpret_cast<float*>(m.vb.ptr), pos.data(), uv.empty() ? nullptr : uv.data(), nv);
   m.ib = makeBuf(w.c, idx.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT); memcpy(m.ib.ptr, idx.data(), idx.size() * 4);
   GeoPart g; g.first = 0; g.count = (uint32_t)idx.size(); if (rgba) { g.tex = makeTexture(w.c, rgba, tw, th, false); g.hasTex = true; } m.parts.push_back(std::move(g));
   const GeoPart& part = m.parts[0];
@@ -249,7 +267,7 @@ static int objBasicModel(World::Impl& w, const std::vector<float>& pos, const st
   VkDescriptorSet set; VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; ai.descriptorPool = w.pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &P.set2; NC_CK(vkAllocateDescriptorSets(w.c.dev, &ai, &set)); m.sets.push_back(set);
   std::vector<VkWriteDescriptorSet> ws; VkDescriptorBufferInfo bi[2] = {{w.matBuf.buf, matOff, 512}, {w.matBuf.buf, stageOff, 256}}; std::vector<VkDescriptorImageInfo> ii; ii.reserve(64);
   for (uint32_t b = 0; b < 2; ++b) { VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr.dstSet = set; wr.dstBinding = b; wr.descriptorCount = 1; wr.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; wr.pBufferInfo = &bi[b]; ws.push_back(wr); }
-  for (auto& u : P.slots) { if (u.block != BLK_SAMPLER) continue; const size_t first = ii.size(); const Image& tex = part.hasTex ? part.tex : o.checker; for (uint32_t k = 0; k < (u.count ? u.count : 1); ++k) ii.push_back({w.samp, tex.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+  for (auto& u : P.slots) { if (u.block != BLK_SAMPLER) continue; const size_t first = ii.size(); const Image& tex = spriteTexture ? *spriteTexture : part.hasTex ? part.tex : o.checker; for (uint32_t k = 0; k < (u.count ? u.count : 1); ++k) ii.push_back({spriteTexture ? w.sampClamp : w.samp, tex.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
     VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; wr.dstSet = set; wr.dstBinding = u.binding; wr.descriptorCount = u.count ? u.count : 1; wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr.pImageInfo = &ii[first]; ws.push_back(wr); }
   vkUpdateDescriptorSets(w.c.dev, (uint32_t)ws.size(), ws.data(), 0, nullptr);
   uint8_t* mb = w.matBuf.ptr + matOff; memset(mb, 0, 512); memset(w.matBuf.ptr + stageOff, 0, 256);

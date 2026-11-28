@@ -52,7 +52,7 @@ class World {
   void setNodePose(int handle, const double pos[3], const double quat[4], const double scale[3], bool visible);
   void setOpacity(int handle, double opacity);   // of the handle's model
   int addViewWeaponGlb(const std::vector<uint8_t>& glb, double scale);   // /custommodel: fitted by rc_fit_standard(scale)
-  int addObjectGlb(const std::vector<uint8_t>& glb, double size);   // /custompickup
+  int addObjectGlb(const std::vector<uint8_t>& glb, double size, uint32_t glow);   // /custompickup
   void setLoadOptions(int picmip, bool mapFx);   // r_picmip, r_mapFx: read by load()
   void setPicmip(int level);
   void refreshPicmip();   // render thread, after the previous frame's fence and before recording
@@ -63,11 +63,13 @@ class World {
   void setMirrors(bool on);   // r_mirrors: off = no mirror / portal passes (the surfaces draw their ordinary material)
   // Weapon effects (the sim reports them as events): impact marks (style 0 bullet, 1 rail burn, 2 rail glow, 3 scorch, 4 plasma, 5 plasma burn; radius <= 0 = the style's own), bullet sparks, an explosion's expanding sphere,
   // projectiles (weapon 5 rocket, 4 grenade, 8 plasma, 9 BFG) and the rail beam. Call fxUpdate once per frame with the frame's time step and camera.
-  void fxMark(int style, const double pos[3], const double normal[3], double radius);
+  void fxMark(int style, const double pos[3], const double normal[3], double radius, bool runway);
   void fxSparks(const double pos[3], const double normal[3]);
   void fxBlast(int weapon, const double pos[3], double radius, const double* normal = nullptr, bool ghost = false);   // normal: the surface (the plasma splash faces it; null = the camera)
   void fxProjectile(int id, int weapon, const double pos[3], const double vel[3], bool spawn);
   void fxProjectileEnd(int id);
+  static constexpr int PEER_PROJECTILE_BASE = 1000000;
+  void fxClearOwnProjectiles();
   void fxBeam(const double from[3], const double to[3]);
   void fxHook(const double from[3], const double to[3], double time, bool attached, int slot = 0);   // the hook cable from the muzzle to the hook head; slot 0 = the player's, 1.. = other players' (one cable each)
   void fxHookEnd(int slot = 0);
@@ -82,6 +84,7 @@ class World {
   int addViewWeaponFile(const std::string& glbRel, int fitKind);
   // Each frame: which weapon node is held (-1 none) and the rig numbers for rc_viewgun_place (cg_drawGun, cg_gunX/Y/Z, the walk bob scale, the switch drop 0..1, the bob 0..1, the recoil 0..1).
   void placeViewGun(int heldHandle, const double* p);
+  void setGunGlow(uint32_t mask, double time);   // the view weapons' powerup bands: 1 quad, 2 battle suit, 4 haste
   // A flat text board facing -z at (0, yCentre, z), 2 halfW x 2 halfH, textured with an RGBA bitmap, unlit and transparent (the runway's START / FINISH / checkpoint boards). Needs the objects-only scene.
   int addBoard(const uint8_t* rgba, int w, int h, double z, double yCentre, double halfW, double halfH, double yaw);
   // The scene fog of an objects-only scene, set BEFORE adding models (the program variants depend on it): mode 0 none / 1 exponential (FogExp2), colour in linear rgb, density, and the clear colour (sRGB).
@@ -99,24 +102,24 @@ class World {
                      double time, const uint8_t* poses, int nPoses, VkQueryPool timestamps);
   const WorldStats& stats() const;
   const double* mapBounds() const;   // min xyz and max xyz in scene axes
+  double farPlane() const;
   void warmPipelines();
 
   // Fit the pickup to size, or create its marker. setObject places the resulting handle each frame.
   int addPickup(uint32_t weapon, const std::string& glbRel, const char* icons, double size,
-                uint32_t marker, double radius, double stretch);
+                uint32_t marker, uint32_t glow, double radius, double stretch);
   // The !showtriggers overlay (rc_trigger_overlay): built hidden for the loaded map (the same fixes text, map name and physics the sim is loaded with) or the runway; call again after a physics mode change
   // (the old one is freed). Label images are uploaded here. showTriggerOverlay shows or hides it (the page's settings.showTriggers).
   bool buildTriggerOverlay(const std::string& fixes, const std::string& name, bool vql, bool runway);
   void showTriggerOverlay(bool on);
-  void setObject(int handle, const double pos[3], double yaw, bool visible);
+  void setObject(int handle, const double pos[3], double yaw, bool visible, double glowOffsetY = 0);
   struct Impl;   // the executor's state; public only so the translation unit's helpers can name it
  private:
   std::unique_ptr<Impl> m;
 };
 
 // A look-from camera in the game's three.js axes (yaw 0 looks along +x, 90 along -z). Perspective, vertical fov in degrees.
-CameraIn makeCamera(const double eye[3], double yawDeg, double pitchDeg, double aspect, double fovYDeg);
-CameraIn makeCameraView(const double eye[3], const double quat[4], double aspect, double fovYDeg);   // the live camera: QcCamera eye and quaternion, view matrix and clips from the core
-CameraIn makeCameraFwd(const double eye[3], const double forward[3], double aspect, double fovYDeg);
+CameraIn makeCamera(const double eye[3], double yawDeg, double pitchDeg, double aspect, double fovYDeg, double farZ);
+CameraIn makeCameraView(const double eye[3], const double quat[4], double aspect, double fovYDeg, double farZ);
 
 }  // namespace nc

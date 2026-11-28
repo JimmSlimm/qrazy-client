@@ -70,6 +70,8 @@ if(QRAZY_NATIVE_CLIENT_DIR)
   list(FILTER NC_SOURCES EXCLUDE REGEX "nc_main[.]cpp$")
   set(NC_C_SOURCES "${NC_TP}/miniz/miniz.c" "${NC_TP}/miniz/miniz_tdef.c" "${NC_TP}/miniz/miniz_tinfl.c" "${NC_TP}/miniz/miniz_zip.c" "${NC_TP}/stb/stb_vorbis.c")
   target_sources(Qrazy PRIVATE ${NC_SOURCES} ${NC_C_SOURCES})
+  include("${QRAZY_NATIVE_CLIENT_DIR}/weapon-audio-cmake.txt")
+  qrazy_native_weapon_audio(Qrazy)
   set_source_files_properties(${NC_SOURCES} ${NC_C_SOURCES} PROPERTIES COMPILE_OPTIONS "/W3;/WX-;/wd4996;/wd4244;/wd4267;/EHsc")   # /EHsc: fatal errors throw (nc::g_throwOnFatal), the host build has no exception handling by default
   target_link_options(Qrazy PRIVATE /DELAYLOAD:qrazy_core.dll)
   # the client's own fonts, HUD sheets and the licences of what it is built from ship next to the program (the game core library is bundled by src/bundle-core.cjs, see local/build-native-embedded.cmd)

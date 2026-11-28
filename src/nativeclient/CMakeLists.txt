@@ -20,6 +20,8 @@ file(GLOB NC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/nc_*.cpp")
 list(FILTER NC_SOURCES EXCLUDE REGEX "nc_main[.]cpp$")
 set(NC_C_SOURCES "${QRAZY_THIRD_PARTY}/miniz/miniz.c" "${QRAZY_THIRD_PARTY}/miniz/miniz_tdef.c" "${QRAZY_THIRD_PARTY}/miniz/miniz_tinfl.c" "${QRAZY_THIRD_PARTY}/miniz/miniz_zip.c" "${QRAZY_THIRD_PARTY}/stb/stb_vorbis.c")
 add_library(qrazy-native-runtime STATIC ${NC_SOURCES} ${NC_C_SOURCES})
+include(weapon-audio-cmake.txt)
+qrazy_native_weapon_audio(qrazy-native-runtime)
 add_executable(qrazy-native nc_main.cpp)
 target_link_libraries(qrazy-native PRIVATE qrazy-native-runtime)
 add_custom_command(TARGET qrazy-native POST_BUILD

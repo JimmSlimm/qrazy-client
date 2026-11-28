@@ -1,0 +1,18 @@
+function(qrazy_native_weapon_audio target)
+  set(source_dir "${CMAKE_CURRENT_FUNCTION_LIST_DIR}")
+  set(QRAZY_GAME_DIR "${source_dir}/../../../qlrace2" CACHE PATH "qlrace2 checkout for browser weapon audio")
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  find_program(QRAZY_NODE_EXECUTABLE NAMES node REQUIRED)
+  set(pack "${QRAZY_GAME_DIR}/assets/openarena/oa-sounds.pk3")
+  set(header "${CMAKE_CURRENT_BINARY_DIR}/nc_weapon_audio.gen.h")
+  add_custom_command(OUTPUT "${header}"
+    COMMAND "${Python3_EXECUTABLE}" "${source_dir}/gen-weapon-audio.py"
+      "${QRAZY_NODE_EXECUTABLE}" "${QRAZY_GAME_DIR}" "${pack}" "${header}"
+    DEPENDS "${source_dir}/gen-weapon-audio.py" "${source_dir}/gen-weapon-audio.cjs"
+      "${pack}" "${QRAZY_GAME_DIR}/hook-audio.js" "${QRAZY_GAME_DIR}/hook-style.js"
+      "${QRAZY_GAME_DIR}/rocket-audio.js" "${QRAZY_GAME_DIR}/rocket-audio-data.js"
+      "${QRAZY_GAME_DIR}/powerup-audio.js" "${QRAZY_GAME_DIR}/procedural-audio.js"
+    VERBATIM)
+  target_sources(${target} PRIVATE "${header}")
+  target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+endfunction()

@@ -376,7 +376,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
   platSize(hwnd, g_w, g_h);
   platAttachInput(plat, host, hostVisible);
   g_input.cacheCodes();
-  g_input.typing = false; g_input.cursor = false; g_input.paused = false; g_input.releaseAllKeys(); g_input.menuRequested = false; g_input.quitRequested = false; { std::lock_guard<std::mutex> pg(g_poseMu); g_poseValid = false; }   // process-wide input state does not carry over from the previous match
+  g_input.typing = false; g_input.cursor = false; g_input.paused = false; g_input.followingPov = false; g_input.releaseAllKeys(); g_input.menuRequested = false; g_input.quitRequested = false; { std::lock_guard<std::mutex> pg(g_poseMu); g_poseValid = false; }   // process-wide input state does not carry over from the previous match
   {   // before the sim loads (the spawn takes the start weapon): the page's latest settings message, else the defaults plus the command line's options (captures)
     std::string j; { std::lock_guard<std::mutex> g(g_pageMu); j = g_settingsJson; }
     if (!j.empty()) { g_settingsDirty = true; if (!coreSettings(j) && !g_settingsOk) coreSettings(std::string()); }   // dirty: the first frame applies the host part to this match's objects
@@ -472,7 +472,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
     if (optHasPos) memcpy(eye, optPos, sizeof eye); if (optHasYaw) yaw0 = optYaw;
   }
   // ---- the simulation
-  struct Pickup { int handle; double pos[3]; }; std::vector<Pickup> pickups;
+  struct Pickup { int handle, index; double pos[3]; }; std::vector<Pickup> pickups;
   std::map<std::string, std::vector<int>> pickupHandles;
   static_assert(sizeof(QcCameraInput) == 264 && offsetof(QcCameraInput, mode) == 184);
   static_assert(sizeof(QcCamera) == 168 && offsetof(QcCamera, gun) == 104 &&
@@ -490,6 +490,11 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
   nc::FollowClock ghostClock; QcComposeOut compose{}; QcMinimapOut mmView{}; bool mmReset = true; static float mmGhost[QC_MINIMAP_TRACK_POINTS * 2];   // the world composition: the core decides, the client draws
   std::map<int, int> ownGun; struct CustomItem { int handle; double pos[3]; }; std::vector<CustomItem> customItems;   // /custommodel (ownGun: the built-in handle a custom one replaced), /custompickup
   int followN = -1; QcPeerPose followPose; bool haveFollow = false;   // op follow: -1 playing, 0 free fly, > 0 the followed player's number
+  std::string watchedKeysSender;
+  uint32_t watchedKeys = 0;
+  unsigned watchedKeysGeneration = 0;
+  double slickCheckAt = 0;
+  bool slickBelow = false;
   std::map<int, int> gunHandle;
   std::map<std::string, RcPickupVisual> pickupVisuals;
   std::array<bool, 11> customFire{};
@@ -527,13 +532,13 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
       size_t& next = used[spot.classname];
       if (next == handles.size()) {
         const int handle = world.addPickup(row.weapon, modelFile(row.model), row.icons, row.size,
-                                           row.marker, row.radius, row.stretch);
+                                           row.marker, row.glow, row.radius, row.stretch);
         if (handle < 0) continue;
         handles.push_back(handle);
       }
       const int handle = handles[next++];
-      pickups.push_back({handle, {spot.pos[0], spot.pos[1], spot.pos[2]}});
-      world.setObject(handle, spot.pos, 0, true);
+      pickups.push_back({handle, spot.index, {spot.pos[0], spot.pos[1], spot.pos[2]}});
+      world.setObject(handle, spot.pos, 0, sim.itemVisible(spot.index));
     }
     nc::logf("pickups: %zu placed", pickups.size());
   };
@@ -584,11 +589,11 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
 
   // the pickups' motion records (qc_ses_items): the map's pickups first, then the custom ones; room for every one made now
   constexpr size_t CUSTOM_ITEMS = 24; std::vector<QcItemSpin> spins; double itemsAt = -1;
-  const auto addSpin = [&](const double p[3]) { QcItemSpin it{}; it.baseY = it.y = p[1]; it.phase = fmod(p[0] * 0.013 + p[2] * 0.017, 6.283); it.visible = 1; spins.push_back(it); };
+  const auto addSpin = [&](const double p[3], bool visible = true) { QcItemSpin it{}; it.baseY = it.y = p[1]; it.phase = fmod(p[0] * 0.013 + p[2] * 0.017, 6.283); it.visible = visible; spins.push_back(it); };
   const auto resetPickupSpins = [&] {
     spins.clear();
     spins.reserve(pickups.size() + CUSTOM_ITEMS);
-    for (const Pickup& pk : pickups) addSpin(pk.pos);
+    for (const Pickup& pk : pickups) addSpin(pk.pos, sim.itemVisible(pk.index));
     for (const CustomItem& item : customItems) addSpin(item.pos);
   };
   customItems.reserve(CUSTOM_ITEMS);
@@ -679,16 +684,29 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
     if (networkMatch) {
       hub.fact(QC_NET_WATCH_VIEW, followN < 0, g_watchPaused || suspended || g_input.typing.load());
       hub.service([&](int bits, const std::string& text) {
-        // Followed state reaches the page HUD through QC_NET_PAGE.
-        if (!(bits & QC_NET_FOLLOW_SOUND) || !sessionAudio || followN <= 0) return;
+        if (!(bits & QC_NET_FOLLOW_STATE) &&
+            (!(bits & QC_NET_FOLLOW_SOUND) || !sessionAudio || followN <= 0)) return;
         nc::J message;
-        if (nc::parseJson(text, message)) nc::watchedSound(message, followN);
+        if (!nc::parseJson(text, message)) return;
+        if (bits & QC_NET_FOLLOW_SOUND) {
+          nc::watchedSound(message, followN);
+        } else if (message.str("type") == "keys") {
+          const double mask = message.num("k", -1);
+          const std::string sender = message.str("id");
+          if (!sender.empty() && mask >= 0 && mask <= 63 && std::floor(mask) == mask) {
+            watchedKeysSender = sender;
+            watchedKeys = static_cast<uint32_t>(mask);
+            watchedKeysGeneration = hub.generation();
+          }
+        }
       });
       haveNet = hub.connected();
       if (netGeneration != hub.generation()) {
         netGeneration = hub.generation();
         resetPeerSound();
         haveFollow = false;
+        slickBelow = false;
+        slickCheckAt = 0;
         peerOptions(followN);
         if (haveNet && !host) hub.fact(QC_NET_LOADED, int(optMapName.size()), 0, 0, optMapName);
         advertiseMode();
@@ -987,7 +1005,8 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
         // after a respawn or a mode reload: view angles from the spawn, the client's own caches start over (the trail is the core's; pending effect events are dropped)
         cur = sim.player(); g_input.yaw = optHasYaw ? optYaw * M_PI / 180.0 : sim.spawnYaw(); g_input.pitch = sim.spawnPitch(); poseDirty = true;
         cameraReset = true; gunKick = 0;
-        ownHook.on = false; world.fxHookEnd();   // the cable belonged to the life that ended
+        ownHook.on = false; world.fxHookEnd();
+        world.fxClearOwnProjectiles();
         keepRunEvents(); pushRun = -1;   // the state push goes out again at once
         if (!sharedMatch) g_input.reset(nc::inputSeconds(nc::qpcNow()));
         nc::logf("%s: %.1f ms, at (%.1f %.1f %.1f)", why, double(nc::qpcNow() - r0) * 1000.0 / (double)freq, cur.pos[0], cur.pos[1], cur.pos[2]);
@@ -1000,6 +1019,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
           if (sim.frozen()) return;
           sim.restart();
         }
+        if (followN == 0) sim.setNoclip(true);
         afterRespawn(why, r0);
       };
       for (const std::string& opJson : ops) {
@@ -1013,7 +1033,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
           if (r.bits & 1) {   // the sim changed; its cues and events are drained with this frame's, as after a tick
             cur = sim.player(); poseDirty = true; pushRun = -1;
             if (sim.out()[33] != serial && r.state) {   // the player was placed (!loadpos, !goto): the view angles are the placed ones
-              g_input.yaw = r.state[29]; g_input.pitch = r.state[30]; g_input.reset(nc::inputSeconds(nc::qpcNow())); cameraReset = true; }
+              g_input.yaw = r.state[29]; g_input.pitch = r.state[30]; g_input.resetForPlacement(nc::inputSeconds(nc::qpcNow())); cameraReset = true; }
           }
           nc::logf("cmd %d -> bits %d", cmd, r.bits); if (g_pageJs) g_pageJs(commandScript(cmd, r).c_str());
         }
@@ -1032,7 +1052,9 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
             if (n == 0) { if (followN > 0 && haveFollow) { sim.restorePosition(followPose.pos[0], followPose.pos[1], followPose.pos[2], 0, 0, 0, followPose.yaw, followPose.pitch); g_input.yaw = followPose.yaw; g_input.pitch = followPose.pitch; } sim.setNoclip(true); }
             else if (followN == 0) sim.setNoclip(false);
           }
-          if (followN != n) { if (sessionAudio) nc::soundEvent(QC_SOUND_FOLLOW_END); followN = n; haveFollow = false; cameraReset = true; cur = sim.player(); poseDirty = true; pushRun = -1; if (!sharedMatch) g_input.reset(nc::inputSeconds(nc::qpcNow())); }
+          if (followN != n) { if (sessionAudio) nc::soundEvent(QC_SOUND_FOLLOW_END); followN = n; haveFollow = false; slickBelow = false; slickCheckAt = 0; cameraReset = true; cur = sim.player(); poseDirty = true; pushRun = -1; if (!sharedMatch) g_input.reset(nc::inputSeconds(nc::qpcNow())); }
+          const bool pov = n > 0;
+          if (g_input.followingPov.exchange(pov) != pov) syncCapture();
           peerOptions(n); }
         else if (op == "custommodel") { const int w = (int)j.num("weapon", 0); const nc::J* cl = j.get("clear");
           if (cl && cl->t == nc::J::Bool && cl->b) { if (w >= 1 && w <= 10) customFire[w] = false; auto f = ownGun.find(w); if (f != ownGun.end()) { if (f->second < 0) gunHandle.erase(w); else gunHandle[w] = f->second; ownGun.erase(f); } }
@@ -1040,7 +1062,8 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
         else if (op == "custompickup") { const nc::J* cl = j.get("clear");
           if (cl && cl->t == nc::J::Bool && cl->b) { const double away[3] = {0, -1e5, 0}; for (const CustomItem& c2 : customItems) world.setObject(c2.handle, away, 0, false); customItems.clear(); spins.resize(pickups.size()); }
           else if (haveWorld && customItems.size() < CUSTOM_ITEMS) { double size = j.num("size", 0); const auto visual = pickupVisuals.find(j.str("classname")); if (!(size > 0)) size = visual == pickupVisuals.end() ? 26 : visual->second.size;
-            const int h = world.addObjectGlb(nc::unbase64(j.str("glb")), size); if (h >= 0) customItems.push_back({h, {cur.pos[0] + 40 * sin(g_input.yaw), cur.pos[1] + 15, cur.pos[2] + 40 * cos(g_input.yaw)}}); if (h >= 0) addSpin(customItems.back().pos); nc::logf("custompickup: %s", h >= 0 ? "placed" : "refused"); } }
+            const uint32_t glow = visual == pickupVisuals.end() ? 0xffffffu : visual->second.glow;
+            const int h = world.addObjectGlb(nc::unbase64(j.str("glb")), size, glow); if (h >= 0) customItems.push_back({h, {cur.pos[0] + 40 * sin(g_input.yaw), cur.pos[1] + 15, cur.pos[2] + 40 * cos(g_input.yaw)}}); if (h >= 0) addSpin(customItems.back().pos); nc::logf("custompickup: %s", h >= 0 ? "placed" : "refused"); } }
         else if (op == "pose") poseNowWanted = true;   // answered after this frame's pose is published
         else if (op == "mode") {   // the held map again with the new weapon set / hook / physics: no asset or world work
           const bool oldPql = optPql, oldStrafe = optWeaponS, oldHook = optHook;
@@ -1065,7 +1088,11 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
           advertiseMode();
           syncPickups();
           resetPickupSpins();
-          qc_peer_clear_samples(); buildTriggers();
+          // A physics mode change keeps the same map and peer roster.
+          if (!networkMatch) qc_peer_clear_samples();
+          slickBelow = false;
+          slickCheckAt = 0;
+          buildTriggers();
           afterRespawn("mode reload", r0);
         }
       }
@@ -1075,7 +1102,7 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
         const std::string_view name = qc_ses_action_name(int(action.action));
         if (name.empty() || (g_pagePaused && name != "softPause" && name != "menu" && !(sharedMatch && name == "restart"))) continue;
         if (name == "restart") {
-          if (followN < 0) restartSim("respawn (key)");
+          if (followN <= 0) restartSim("respawn (key)");
         } else if (name == "menu") {
           g_input.menuRequested = true;
           g_input.quitRequested = true;
@@ -1209,8 +1236,10 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
     }
     const double composeTime = nc::inputSeconds(nc::qpcNow() - t0);
     if (haveWorld) {
+      for (size_t i = 0; i < pickups.size(); ++i)
+        spins[i].visible = sim.itemVisible(pickups[i].index);
       qc_ses_items(composeTime, itemsAt < 0 ? 0 : std::min(0.1, composeTime - itemsAt), spins.data(), (int)spins.size()); itemsAt = composeTime;
-      const auto placeItem = [&](int handle, const double pos[3], const QcItemSpin& it) { const double p[3] = {pos[0], it.y, pos[2]}; world.setObject(handle, p, it.yaw, true); };
+      const auto placeItem = [&](int handle, const double pos[3], const QcItemSpin& it) { const double p[3] = {pos[0], it.y, pos[2]}; world.setObject(handle, p, it.yaw, it.visible != 0, it.baseY - it.y); };
       for (size_t i = 0; i < pickups.size(); ++i) placeItem(pickups[i].handle, pickups[i].pos, spins[i]);
       for (size_t i = 0; i < customItems.size() && pickups.size() + i < spins.size(); ++i) placeItem(customItems[i].handle, customItems[i].pos, spins[pickups.size() + i]);
       if (optSim && poseDirty) { nPoses = sim.poses(poseBytes); poseDirty = false; }
@@ -1315,9 +1344,9 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
         fov = camera.fovY;
         const double unzoomedY = atan(tan(g_set->fov * M_PI / 360) / (double(sc.w) / sc.h)) * 360 / M_PI;
         qc_ses_zoom_projection(camera.fovY, unzoomedY);
-        cam = nc::makeCameraView(camera.eye, camera.quaternion, (double)sc.w / sc.h, camera.fovY);
+        cam = nc::makeCameraView(camera.eye, camera.quaternion, (double)sc.w / sc.h, camera.fovY, world.farPlane());
         poseReady = true;
-      } else cam = nc::makeCamera(eye, yaw0 + (optOrbit ? t * 20.0 : 0.0), pitch, (double)sc.w / sc.h, fov);
+      } else cam = nc::makeCamera(eye, yaw0 + (optOrbit ? t * 20.0 : 0.0), pitch, (double)sc.w / sc.h, fov, world.farPlane());
       if (optSim) {
         if (haveHud && !sharedMatch) {
           const bool showHistory = chatHistory || (camera.inputFlags & 1u);
@@ -1338,7 +1367,23 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
             if (joined != chatShown) { chatShown = joined; hud.setChat(joined); }
           } hud.setChatHistory(showHistory && !chatOpen);
         }
-        if (optSim && haveHud) hud.setLive(g_input.pitch * 180.0 / M_PI, sim.slick(), heldMask, optSim && g_pagePaused, sim.liquid());   // element 13 shows only the real pause
+        if (optSim && haveHud) {
+          uint32_t hudKeys = heldMask;
+          if (followN >= 0) {
+            hudKeys = following && watchedKeysGeneration == hub.generation() &&
+                      nc::isFollowedSender(followN, watchedKeysSender) ? watchedKeys : 0;
+          }
+          const double* feet = followN < 0 ? cur.pos : following && !(followPose.flags & (4 | 8)) ? followPose.pos : nullptr;
+          if (!feet) {
+            slickBelow = false;
+            slickCheckAt = 0;
+          } else if (ta >= slickCheckAt) {
+            // The native view displays the local sim's movers even in followed POV.
+            slickBelow = qc_dry_slick_below(feet) == 1;
+            slickCheckAt = ta + 0.1;
+          }
+          hud.setLive(g_input.pitch * 180.0 / M_PI, slickBelow, hudKeys, g_pagePaused, sim.liquid());
+        }
         if (haveHud) hud.setBoard(&board);
         if (haveWorld) {   // the other players and the leaderboard ghost: the core's node records for this frame's camera
           QcPeerCamera pc; for (int k = 0; k < 3; ++k) { pc.eye[k] = cam.pos[k]; pc.forward[k] = -cam.view[k * 4 + 2]; }
@@ -1390,14 +1435,14 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
             case 10: nc::fxShot(world, QC_SESFX_HOOK_LAND, e.weapon, shotMode, optRunway, hookFrom, e.pos, nullptr); break;   // HOOK_ATTACH
             case 11: ownHook.on = true; ownHook.attached = e.id == 1; ownHook.time = ta; memcpy(ownHook.pos, e.pos, sizeof ownHook.pos); break;   // HOOK_UPDATE: the head; the cable is drawn below, every frame
             case 12: ownHook.on = false; world.fxHookEnd(); break;
-            case QC_EV_RESET: ownHook.on = false; world.fxHookEnd(); break;
+            case QC_EV_RESET: ownHook.on = false; world.fxHookEnd(); world.fxClearOwnProjectiles(); break;
           } }
           if (ownHook.on) { if (followN < 0) world.fxHook(hookFrom, ownHook.pos, ownHook.time, ownHook.attached); else world.fxHookEnd(); }
           if (optFxTest && frames == 5) { const double o[3] = {0, 50, 300}; static const char* nm[6] = {"+x", "-x", "+y", "-y", "+z", "-z"}; static const double ax[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
             for (int k = 0; k < 6; ++k) { double d = -1, n[3] = {}; int fl = 0; const bool h = sim.trace(o, ax[k], d, n, fl); nc::logf("trace %s: %s dist %.1f normal %.2f %.2f %.2f", nm[k], h ? "hit" : "none", d, n[0], n[1], n[2]); } }
           if (optFxTest && frames == (optShot.empty() ? 40 : optShotFrame - 2)) {   // one of each, in front of the start: a rocket and its blast, a plasma ball, a BFG ball, a grenade, a rail beam, a plasma scorch
             const double up[3] = {0, 1, 0}, p1[3] = {-40, 30, 300}, v1[3] = {0, 0, 1}, p2[3] = {0, 30, 300}, p3[3] = {40, 30, 300}, p4[3] = {80, 30, 300}, e1[3] = {-30, 1, 400}, e2[3] = {30, 1, 400}, b0[3] = {20, 40, 20}, b1[3] = {20, 40, 700};
-            world.fxProjectile(1, 5, p1, v1, true); world.fxProjectile(2, 8, p2, v1, true); world.fxProjectile(3, 9, p3, v1, true); world.fxProjectile(4, 4, p4, v1, true); world.fxBlast(5, e1, 120); world.fxMark(3, e1, up, 100); world.fxBlast(8, e2, 60); world.fxMark(5, e2, up, 0); world.fxMark(4, e2, up, 0); world.fxBeam(b0, b1); const double h0[3] = {-15, 40, 10}, h1[3] = {-60, 60, 380}; world.fxHook(h0, h1, 0.5, true); }
+            world.fxProjectile(1, 5, p1, v1, true); world.fxProjectile(2, 8, p2, v1, true); world.fxProjectile(3, 9, p3, v1, true); world.fxProjectile(4, 4, p4, v1, true); world.fxBlast(5, e1, 120); world.fxMark(3, e1, up, 100, optRunway); world.fxBlast(8, e2, 60); world.fxMark(5, e2, up, 0, optRunway); world.fxMark(4, e2, up, 0, optRunway); world.fxBeam(b0, b1); const double h0[3] = {-15, 40, 10}, h1[3] = {-60, 60, 380}; world.fxHook(h0, h1, 0.5, true); }
           peerFx.update(world, ta, optRunway, following ? followN : 0, hookFrom);
           if (sessionAudio) {
             QcCue peerClock{};
@@ -1411,6 +1456,9 @@ int appRun(int argc, char** argv, NativeWindow host, const std::atomic<bool>* ho
           const bool attack = following ? firing : followN < 0 && (heldMask & (1u << 7));
           const auto it = gunHandle.find(held);
           world.placeViewGun(it == gunHandle.end() ? -1 : it->second, camera.gun);
+          uint32_t glow = 0;   // own powerups only (HudNumbers.puIndex: 0 quad, 1 haste, 3 battle suit)
+          if (followN < 0) for (uint32_t i = 0; i < gunState.puCount && i < 8; ++i) glow |= gunState.puIndex[i] == 0 ? 1u : gunState.puIndex[i] == 3 ? 2u : gunState.puIndex[i] == 1 ? 4u : 0u;
+          world.setGunGlow(glow, ta);
           world.spinViewRotors(cameraDelta, held == 2 && firing, held == 1 && attack);
         }
         world.record(cb, sceneFb, rw, rh, cam, t, poseBytes.data(), nPoses, usePost ? nullptr : overlay);

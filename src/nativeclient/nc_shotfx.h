@@ -13,7 +13,7 @@ inline void fxShot(World& w, int kind, int weapon, int mode, bool runway, const 
   QcFxCmd cmd[QC_FXCMD_MAX]; const int n = qc_ses_fx(&in, cmd, QC_FXCMD_MAX);
   for (int i = 0; i < n; ++i) { const QcFxCmd& c = cmd[i];
     if (c.kind == QC_FXCMD_BEAM) w.fxBeam(c.pos, c.normal);
-    else if (c.kind == QC_FXCMD_MARK) w.fxMark(c.style, c.pos, c.normal, c.radius);
+    else if (c.kind == QC_FXCMD_MARK) w.fxMark(c.style, c.pos, c.normal, c.radius, runway);
     else if (c.kind == QC_FXCMD_SPARKS) w.fxSparks(c.pos, c.normal);
   }
 }
